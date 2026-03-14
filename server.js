@@ -40,6 +40,18 @@ const adminOverrideStatuses = [
   "Withdrawn"
 ];
 
+const activeApplicationStatuses = new Set([
+  "PendingTAAdmin",
+  "PendingProfessor",
+  "Approved"
+]);
+
+const reapplyAllowedStatuses = new Set([
+  "Withdrawn",
+  "RejectedByTAAdmin",
+  "RejectedByProfessor"
+]);
+
 function nowStr() {
   const date = new Date();
   const pad = (v) => String(v).padStart(2, "0");
@@ -448,6 +460,18 @@ function applyWindowText(classRow) {
   return `${escapeHtml(classRow.apply_start_at)} 至 ${escapeHtml(classRow.apply_end_at)}`;
 }
 
+function compactApplyWindowText(classRow) {
+  if (!classRow.apply_start_at || !classRow.apply_end_at) {
+    return "未设置";
+  }
+  const start = String(classRow.apply_start_at);
+  const end = String(classRow.apply_end_at);
+  if (start.slice(0, 10) === end.slice(0, 10)) {
+    return `${start.slice(0, 10)} ${start.slice(11, 16)}-${end.slice(11, 16)}`;
+  }
+  return `${start.slice(5, 16)} - ${end.slice(5, 16)}`;
+}
+
 function isClassCapacityReached(classRow, approvedCount) {
   return Number(approvedCount || 0) >= Number(classRow?.maximum_number_of_tas_admitted || 0);
 }
@@ -680,6 +704,14 @@ function pageLayout(title, body, user, notice) {
         margin-bottom: 20px;
         box-shadow: var(--shadow);
       }
+      .card.card-soft-purple {
+        background: #eef5ff;
+        border-color: #cfe0ff;
+      }
+      .card.card-soft-red {
+        background: #f4f6f8;
+        border-color: #d8dee6;
+      }
       h1, h2, h3 { margin: 0 0 14px; }
       h2 { font-size: 22px; letter-spacing: -0.01em; }
       h3 { font-size: 18px; letter-spacing: -0.01em; }
@@ -698,12 +730,97 @@ function pageLayout(title, body, user, notice) {
         letter-spacing: 0.04em;
         background: #fafbff;
       }
+      th a {
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
+        padding: 6px 8px;
+        border-radius: 10px;
+        color: inherit;
+        font-weight: 600;
+      }
+      th a:hover {
+        background: #eef3fd;
+        text-decoration: none;
+      }
+      th a.active-sort {
+        background: #e8f0fe;
+        color: #174ea6;
+      }
       tr:hover td { background: #fafcff; }
-      tr.row-soft-purple td { background: #f3ecff; }
-      tr.row-soft-purple:hover td { background: #ede1ff; }
+      tr.row-soft-purple td { background: #eef5ff; }
+      tr.row-soft-purple:hover td { background: #e4efff; }
+      tr.row-soft-red td { background: #f4f6f8; }
+      tr.row-soft-red:hover td { background: #eceff3; }
       .table-wrap { overflow-x: auto; }
       table.wide { min-width: 1320px; }
+      table.compact-table th {
+        font-size: 11px;
+        padding: 10px 8px;
+      }
+      table.compact-table td {
+        font-size: 13px;
+        padding: 10px 8px;
+      }
       .grid { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); }
+      .class-card-grid {
+        display: grid;
+        gap: 16px;
+        grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+      }
+      .class-card {
+        padding: 16px 16px 14px;
+        border-radius: 18px;
+      }
+      .class-card h3 {
+        font-size: 16px;
+        line-height: 1.3;
+        margin-bottom: 8px;
+      }
+      .class-card p {
+        margin: 0 0 6px;
+        font-size: 12px;
+        line-height: 1.55;
+      }
+      .class-card .actions {
+        margin-top: 8px;
+      }
+      .class-card .schedule-meta {
+        font-size: 11px;
+      }
+      .class-card-meta {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px;
+        margin: 0 0 8px;
+      }
+      .class-card-meta span {
+        display: inline-flex;
+        align-items: center;
+        padding: 4px 8px;
+        border-radius: 999px;
+        background: rgba(26, 115, 232, 0.08);
+        color: #355070;
+        font-size: 11px;
+        line-height: 1.2;
+      }
+      .filters-grid {
+        display: grid;
+        gap: 12px 14px;
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        align-items: end;
+      }
+      .filters-grid .actions {
+        justify-content: flex-start;
+        align-items: center;
+      }
+      @media (max-width: 1100px) {
+        .filters-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      }
+      @media (max-width: 720px) {
+        .filters-grid { grid-template-columns: 1fr; }
+        .class-card-grid { grid-template-columns: 1fr; }
+      }
       .notice {
         max-width: 1360px;
         margin: 20px auto 0;
@@ -779,6 +896,30 @@ function pageLayout(title, body, user, notice) {
       .schedule-dialog-body {
         padding: 22px;
       }
+      .compact-stack {
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+      }
+      .compact-note {
+        margin-top: 8px;
+        font-size: 12px;
+        color: var(--muted);
+        line-height: 1.6;
+      }
+      .submit-hint {
+        display: none;
+        margin-top: 12px;
+        padding: 10px 12px;
+        border-radius: 12px;
+        background: #eef3fd;
+        color: #174ea6;
+        font-size: 13px;
+        line-height: 1.6;
+      }
+      .submit-hint.show {
+        display: block;
+      }
       .ok { color: var(--ok); }
       .bad { color: var(--bad); }
       form.inline { display: inline; }
@@ -798,6 +939,10 @@ function pageLayout(title, body, user, notice) {
         border-color: var(--accent);
         box-shadow: 0 0 0 4px rgba(26, 115, 232, 0.12);
       }
+      select {
+        appearance: none;
+        background: #f8fbff;
+      }
       input[type="checkbox"] {
         width: 18px;
         height: 18px;
@@ -807,16 +952,21 @@ function pageLayout(title, body, user, notice) {
       textarea { min-height: 100px; }
       button, .button-link {
         border: 0;
-        border-radius: 999px;
+        border-radius: 12px;
         background: var(--accent);
         color: white;
-        padding: 11px 18px;
+        padding: 10px 16px;
         cursor: pointer;
         text-decoration: none;
-        display: inline-block;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
         font-weight: 600;
+        font-size: 14px;
+        line-height: 1.2;
         letter-spacing: 0.01em;
         box-shadow: 0 1px 2px rgba(26, 115, 232, 0.3);
+        min-width: 84px;
       }
       button:hover, .button-link:hover {
         text-decoration: none;
@@ -836,6 +986,9 @@ function pageLayout(title, body, user, notice) {
       .button-link.rect,
       button.rect {
         border-radius: 12px;
+      }
+      .action-button {
+        min-width: 88px;
       }
       .actions a,
       .actions button {
@@ -908,6 +1061,20 @@ function pageLayout(title, body, user, notice) {
       document.addEventListener('click', (event) => {
         if (event.target instanceof HTMLDialogElement) {
           event.target.close();
+        }
+      });
+      document.addEventListener('submit', (event) => {
+        const form = event.target.closest('form[data-disable-on-submit]');
+        if (!form) return;
+        const submitButton = form.querySelector('button[type="submit"]');
+        if (submitButton) {
+          submitButton.disabled = true;
+          submitButton.textContent = '提交中...';
+        }
+        const hintTarget = form.getAttribute('data-submit-hint-target');
+        if (hintTarget) {
+          const hint = document.getElementById(hintTarget);
+          if (hint) hint.classList.add('show');
         }
       });
     </script>
@@ -1015,6 +1182,56 @@ function getOpenClassConflicts(db, taUserId, classId) {
   });
 }
 
+function isActiveApplicationStatus(status) {
+  return activeApplicationStatuses.has(String(status || ""));
+}
+
+function isReapplyAllowedStatus(status) {
+  return reapplyAllowedStatuses.has(String(status || ""));
+}
+
+function getLatestApplicationMap(db, taUserId) {
+  const rows = db.prepare(`
+    select *
+    from applications
+    where applier_user_id = ?
+    order by submitted_at desc, application_id desc
+  `).all(taUserId);
+  const map = new Map();
+  for (const row of rows) {
+    if (!map.has(row.class_id)) {
+      map.set(row.class_id, row);
+    }
+  }
+  return map;
+}
+
+function compactScheduleList(schedules) {
+  if (!schedules.length) {
+    return "<p class='muted'>暂无排课信息。</p>";
+  }
+  return `<div class="compact-stack">${schedules.map((row) => `
+    <div class="schedule-item">
+      <div>${escapeHtml(row.lesson_date)} ${escapeHtml(row.start_time)}-${escapeHtml(row.end_time)}</div>
+      <div class="schedule-meta">${escapeHtml(row.section)}${row.is_exam ? ` · ${escapeHtml(row.is_exam)}` : ""}</div>
+    </div>
+  `).join("")}</div>`;
+}
+
+function compactConflictList(conflicts) {
+  if (!conflicts.length) {
+    return "<p class='ok'>当前无冲突。</p>";
+  }
+  return `<div class="compact-stack">${conflicts.map(({ classRow, relatedApplication, matches }) => `
+    <div class="schedule-item">
+      <div>${escapeHtml(classRow.class_name)}</div>
+      <div class="schedule-meta">${escapeHtml(classRow.course_name)} / ${escapeHtml(classRow.teacher_name)}</div>
+      <div class="schedule-meta">我的状态：${escapeHtml(relatedApplication ? (statusLabels[relatedApplication.status] || relatedApplication.status) : "未申请")}</div>
+      <div class="schedule-meta">${matches.map(escapeHtml).join("<br>")}</div>
+    </div>
+  `).join("")}</div>`;
+}
+
 function requireRole(res, user, roles) {
   if (!user) {
     redirect(res, "/?notice=请先登录");
@@ -1079,6 +1296,25 @@ function adminOverrideStatusOptions(selectedStatus) {
   return adminOverrideStatuses
     .map((status) => `<option value="${status}" ${selectedStatus === status ? "selected" : ""}>${escapeHtml(statusLabels[status] || status)}</option>`)
     .join("");
+}
+
+function buildQueryString(params) {
+  const search = new URLSearchParams();
+  Object.entries(params).forEach(([key, value]) => {
+    if (value !== undefined && value !== null && String(value) !== "") {
+      search.set(key, String(value));
+    }
+  });
+  const result = search.toString();
+  return result ? `?${result}` : "";
+}
+
+function sortableHeader(label, field, basePath, filters, currentSortBy, currentSortOrder) {
+  const nextOrder = currentSortBy === field && currentSortOrder === "asc" ? "desc" : "asc";
+  const arrow = currentSortBy === field ? (currentSortOrder === "asc" ? " ↑" : " ↓") : "";
+  const href = `${basePath}${buildQueryString({ ...filters, sort_by: field, sort_order: nextOrder })}`;
+  const activeClass = currentSortBy === field ? "active-sort" : "";
+  return `<a class="${activeClass}" href="${href}">${escapeHtml(label)}${arrow}</a>`;
 }
 
 function normalizeExamValue(value) {
@@ -1366,7 +1602,7 @@ function upsertImportedUsers(db, importedUsers) {
   for (const item of importedUsers) {
     const existing = findUser.get(item.loginName);
     if (!existing) continue;
-    const teachesClasses = classCountByTeacher.get(existing.user_id).count;
+    const teachesClasses = classCountByTeacher.get(String(existing.user_id)).count;
     if (teachesClasses > 0 && item.role !== "Professor") {
       errors.push(`第 ${item.rowNo} 行失败：登录名 ${item.loginName} 已关联教学班，不能覆盖为非 Professor`);
     }
@@ -1395,7 +1631,7 @@ function upsertImportedUsers(db, importedUsers) {
     }
     updateUser.run(item.userName, item.email, item.password, item.role, item.isAllowedToApply, existing.user_id);
     if (item.role === "Professor") {
-      const classes = db.prepare("select class_id, teacher_user_id from classes where (',' || teacher_user_id || ',') like '%,' || ? || ',%'").all(existing.user_id);
+      const classes = db.prepare("select class_id, teacher_user_id from classes where (',' || teacher_user_id || ',') like '%,' || ? || ',%'").all(String(existing.user_id));
       const findProfessorById = db.prepare("select user_id, user_name from users where user_id = ? and role = 'Professor'");
       for (const row of classes) {
         const names = normalizeTeacherUserIds(row.teacher_user_id).map((id) => findProfessorById.get(id)?.user_name).filter(Boolean).join(" / ");
@@ -1572,7 +1808,7 @@ function scheduleLinesValue(rows) {
     .join("\n");
 }
 
-function taClassesPage(res, user, notice) {
+function taClassesPage(res, user, notice, filters = {}) {
   const db = getDb();
   const classes = db.prepare(`
     select c.*,
@@ -1581,26 +1817,112 @@ function taClassesPage(res, user, notice) {
     where c.ta_applications_allowed = 'Y'
     order by c.semester, c.course_name, c.class_name
   `).all();
-  const visibleClasses = classes.filter((row) => isClassOpenForApply(row));
+  const latestApplicationMap = getLatestApplicationMap(db, user.user_id);
+  const applyStatusFilter = String(filters.apply_status || "").trim();
+  const professorFilter = String(filters.professor_name || "").trim().toLowerCase();
+  const courseFilter = String(filters.course_name || "").trim().toLowerCase();
+  const classNameFilter = String(filters.class_name || "").trim().toLowerCase();
+  const languageFilter = String(filters.teaching_language || "").trim();
+  const visibleClasses = classes
+    .filter((row) => isClassOpenForApply(row))
+    .map((row) => {
+      const schedules = fetchSchedules(db, row.class_id);
+      const conflicts = getOpenClassConflicts(db, user.user_id, row.class_id);
+      const blockingConflicts = getAppliedConflicts(db, user.user_id, row.class_id);
+      const latestApplication = latestApplicationMap.get(row.class_id) || null;
+      const activeApplication = latestApplication && isActiveApplicationStatus(latestApplication.status) ? latestApplication : null;
+      const cardStatus = activeApplication
+        ? "已申请"
+        : (blockingConflicts.length && row.is_conflict_allowed !== "Y" ? "有冲突" : "可申请");
+      return {
+        ...row,
+        schedules,
+        conflicts,
+        latestApplication,
+        activeApplication,
+        cardStatus
+      };
+    })
+    .filter((row) => !applyStatusFilter || row.cardStatus === applyStatusFilter)
+    .filter((row) => !professorFilter || String(row.teacher_name || "").toLowerCase().includes(professorFilter))
+    .filter((row) => !courseFilter || String(row.course_name || "").toLowerCase().includes(courseFilter))
+    .filter((row) => !classNameFilter || String(row.class_name || "").toLowerCase().includes(classNameFilter))
+    .filter((row) => !languageFilter || String(row.teaching_language || "") === languageFilter);
   const body = visibleClasses.map((row) => {
-    const conflicts = getAppliedConflicts(db, user.user_id, row.class_id);
-    const label = conflicts.length ? "<span class='pill bad'>有冲突</span>" : "<span class='pill ok'>可申请</span>";
-    return `<article class="card">
+    const labelClass = row.cardStatus === "有冲突" ? "pill bad" : row.cardStatus === "已申请" ? "pill" : "pill ok";
+    const cardClass = row.cardStatus === "有冲突" ? "card-soft-red" : row.cardStatus === "已申请" ? "card-soft-purple" : "";
+    const dialogId = `ta-conflicts-${row.class_id}`;
+    const actionHint = row.activeApplication
+      ? `<p class="compact-note">已提交申请，请到“我的申请”查看；若仍处于 TAAdmin 审批前，可在“我的申请”中撤销。</p>`
+      : "";
+    return `<article class="card class-card ${cardClass}">
       <h3>${escapeHtml(row.course_name)} / ${escapeHtml(row.class_name)}</h3>
-      <p>${label} 教授：${escapeHtml(row.teacher_name)} | 学期：${escapeHtml(row.semester)}</p>
-      <p class="muted">授课语言：${escapeHtml(row.teaching_language)} | 已通过：${row.approved_count} / ${row.maximum_number_of_tas_admitted}</p>
-      <p class="muted">开放申请时间：${applyWindowText(row)}</p>
-      <div class="actions">
-        <a href="/ta/classes/${row.class_id}">查看详情</a>
-        <a href="/ta/classes/${row.class_id}?show_conflicts=1">查看冲突</a>
+      <p><span class="${labelClass}">${escapeHtml(row.cardStatus)}</span></p>
+      <div class="class-card-meta">
+        <span>${escapeHtml(row.teacher_name)}</span>
+        <span>${escapeHtml(row.teaching_language)}</span>
+        <span>${escapeHtml(row.semester)}</span>
       </div>
+      <p>已通过：${row.approved_count} / ${row.maximum_number_of_tas_admitted}</p>
+      <p class="muted">开放申请：${escapeHtml(compactApplyWindowText(row))}</p>
+      ${actionHint}
+      <div class="actions">
+        <a class="button-link action-button" href="/ta/classes/${row.class_id}">查看详情</a>
+        <button class="secondary rect action-button" type="button" data-open-schedule="${dialogId}">查看冲突</button>
+      </div>
+      <dialog class="schedule-dialog" id="${dialogId}">
+        <div class="schedule-dialog-body">
+          <div class="actions" style="justify-content:space-between; align-items:center; margin-bottom:12px;">
+            <h3 style="margin:0;">${escapeHtml(row.class_name)}：排课与冲突</h3>
+            <button class="secondary rect" type="button" data-close-schedule="${dialogId}">关闭</button>
+          </div>
+          <section style="margin-bottom:14px;">
+            <h3 style="font-size:16px; margin-bottom:10px;">排课信息</h3>
+            ${compactScheduleList(row.schedules)}
+          </section>
+          <section>
+            <h3 style="font-size:16px; margin-bottom:10px;">冲突信息</h3>
+            ${compactConflictList(row.conflicts)}
+          </section>
+        </div>
+      </dialog>
     </article>`;
   }).join("");
   db.close();
-  sendHtml(res, pageLayout("可申请教学班", body || '<section class="card">当前没有在开放申请时间内的教学班。</section>', user, notice));
+  sendHtml(res, pageLayout("可申请教学班", `
+    <section class="card">
+      <h2>筛选教学班</h2>
+      <form method="get" action="/ta/classes">
+        <div class="filters-grid">
+          <p><label>是否可申请<select name="apply_status">
+            <option value="" ${!filters.apply_status ? "selected" : ""}>全部</option>
+            <option value="可申请" ${filters.apply_status === "可申请" ? "selected" : ""}>可申请</option>
+            <option value="有冲突" ${filters.apply_status === "有冲突" ? "selected" : ""}>有冲突</option>
+            <option value="已申请" ${filters.apply_status === "已申请" ? "selected" : ""}>已申请</option>
+          </select></label></p>
+          <p><label>教授名<input name="professor_name" value="${escapeHtml(filters.professor_name || "")}" /></label></p>
+          <p><label>课程名称<input name="course_name" value="${escapeHtml(filters.course_name || "")}" /></label></p>
+          <p><label>教学班名称<input name="class_name" value="${escapeHtml(filters.class_name || "")}" /></label></p>
+          <p><label>授课语言<select name="teaching_language">
+            <option value="" ${!filters.teaching_language ? "selected" : ""}>全部</option>
+            ${["中文", "英文", "双语"].map((item) => `<option value="${item}" ${filters.teaching_language === item ? "selected" : ""}>${item}</option>`).join("")}
+          </select></label></p>
+          <div class="actions">
+            <button class="secondary action-button" type="submit">筛选</button>
+            <a class="button-link secondary action-button" href="/ta/classes">重置</a>
+          </div>
+        </div>
+      </form>
+    </section>
+    <section class="card">
+      <h2>开放教学班</h2>
+      <p class="muted">当前共匹配 <strong>${visibleClasses.length}</strong> 个教学班。浅紫色表示已申请，浅红色表示存在阻断性时间冲突。</p>
+      ${body ? `<div class="class-card-grid">${body}</div>` : `<p class="muted">当前没有符合条件的开放教学班。</p>`}
+    </section>
+  `, user, notice));
 }
 
-function taClassDetailPage(res, user, classId, notice, showConflicts) {
+function taClassDetailPage(res, user, classId, notice) {
   const db = getDb();
   const row = db.prepare("select * from classes where class_id = ?").get(classId);
   if (!row || !isClassOpenForApply(row)) {
@@ -1612,11 +1934,26 @@ function taClassDetailPage(res, user, classId, notice, showConflicts) {
   const schedules = fetchSchedules(db, classId);
   const appliedConflicts = getAppliedConflicts(db, user.user_id, classId);
   const conflicts = getOpenClassConflicts(db, user.user_id, classId);
+  const existingApplication = db.prepare(`
+    select *
+    from applications
+    where applier_user_id = ?
+      and class_id = ?
+      and status not in ('Withdrawn', 'RejectedByTAAdmin', 'RejectedByProfessor')
+    order by submitted_at desc, application_id desc
+    limit 1
+  `).get(user.user_id, classId);
   const hasBlockingConflicts = appliedConflicts.length > 0 && row.is_conflict_allowed !== "Y";
-  const canSubmit = Boolean(user.resume_path) && !hasBlockingConflicts;
+  const canSubmit = Boolean(user.resume_path) && !hasBlockingConflicts && !existingApplication;
   const resumeSection = user.resume_path
     ? `<p>个人简历：${attachmentLink(user)}</p><p class="muted">提交申请时将自动带出当前个人简历。</p>`
     : `<p class="bad">你还没有上传个人简历，请先到 <a href="/ta/profile">个人资料</a> 上传后再申请。</p>`;
+  const existingApplicationSection = existingApplication
+    ? `<div class="notice" style="margin: 0 0 16px; background: #f3ecff; border-color: #ddccff; color: #5b33a3;">
+        你已经提交过该教学班申请，当前状态为“${escapeHtml(statusLabels[existingApplication.status] || existingApplication.status)}”。为避免重复提交，当前按钮已停用。
+        ${existingApplication.status === "PendingTAAdmin" ? `在 TAAdmin 审批前，你可以进入 <a href="/ta/applications">我的申请</a> 模块撤销申请。` : `请进入 <a href="/ta/applications">我的申请</a> 模块查看当前状态。`}
+      </div>`
+    : "";
   const submitGuardSection = hasBlockingConflicts
     ? `<div class="notice" style="margin: 0 0 16px; background: #fce8e6; border-color: #f7c8c3; color: #a50e0e;">
         检测到你已申请的教学班与当前教学班存在时间冲突，且本教学班未设置为允许冲突申请，因此当前不能提交申请。
@@ -1625,13 +1962,12 @@ function taClassDetailPage(res, user, classId, notice, showConflicts) {
         appliedConflicts.map(({ app, matches }) => `<tr><td>${escapeHtml(app.class_name)}</td><td>${escapeHtml(statusLabels[app.status] || app.status)}</td><td>${escapeHtml(app.is_conflict_allowed || "N")}</td><td>${matches.map(escapeHtml).join("<br>")}</td></tr>`).join("")
       }</table>`
     : "";
-  const conflictSection = showConflicts
-    ? (conflicts.length
-      ? `<section class="card"><h3>冲突信息</h3><p class="muted">以下为当前教学班与所有开放申请中的教学班的冲突情况。</p><table><tr><th>冲突教学班</th><th>课程/教授</th><th>我的状态</th><th>冲突时间</th></tr>${
-          conflicts.map(({ classRow, relatedApplication, matches }) => `<tr><td>${escapeHtml(classRow.class_name)}</td><td>${escapeHtml(classRow.course_name)} / ${escapeHtml(classRow.teacher_name)}</td><td>${escapeHtml(relatedApplication ? (statusLabels[relatedApplication.status] || relatedApplication.status) : "未申请")}</td><td>${matches.map(escapeHtml).join("<br>")}</td></tr>`).join("")
-        }</table></section>`
-      : `<section class="card"><h3>冲突信息</h3><p class="ok">当前无冲突。</p></section>`)
-    : "";
+  const conflictSection = `
+      <div style="margin: 0 0 16px;">
+        <h3 style="margin-bottom:8px;">冲突信息</h3>
+        <p class="muted">以下展示当前教学班与所有开放教学班的冲突情况。</p>
+        ${compactConflictList(conflicts)}
+      </div>`;
   db.close();
   sendHtml(res, pageLayout("教学班详情", `
     <section class="card">
@@ -1649,16 +1985,18 @@ function taClassDetailPage(res, user, classId, notice, showConflicts) {
       <h3>排课信息</h3>
       ${schedulesTable(schedules)}
     </section>
-    ${conflictSection}
     <section class="card">
       <h3>提交申请</h3>
+      ${existingApplicationSection}
       ${resumeSection}
+      ${conflictSection}
       ${submitGuardSection}
-      <form method="post" action="/ta/applications">
+      <form method="post" action="/ta/applications" data-disable-on-submit="1" data-submit-hint-target="ta-submit-hint">
         <input type="hidden" name="class_id" value="${row.class_id}" />
         <p><label>申请原因<textarea name="application_reason" required></textarea></label></p>
         <button type="submit" ${canSubmit ? "" : "disabled"}>提交申请</button>
       </form>
+      <div class="submit-hint" id="ta-submit-hint">申请正在提交。提交后按钮会暂时停用，避免重复提交。在 TAAdmin 审批前，你可以进入“我的申请”模块撤销申请。</div>
     </section>
   `, user, notice));
 }
@@ -1681,7 +2019,13 @@ async function createApplication(req, res, user) {
     db.close();
     return redirect(res, "/ta/classes?notice=教学班当前未开放申请，或不在申请时间内");
   }
-  const exists = db.prepare("select 1 from applications where applier_user_id = ? and class_id = ?").get(user.user_id, classId);
+  const exists = db.prepare(`
+    select 1
+    from applications
+    where applier_user_id = ?
+      and class_id = ?
+      and status not in ('Withdrawn', 'RejectedByTAAdmin', 'RejectedByProfessor')
+  `).get(user.user_id, classId);
   if (exists) {
     db.close();
     return redirect(res, `/ta/classes/${classId}?notice=不可重复申请`);
@@ -1693,7 +2037,7 @@ async function createApplication(req, res, user) {
   const conflicts = getAppliedConflicts(db, user.user_id, classId);
   if (conflicts.length && classRow.is_conflict_allowed !== "Y") {
     db.close();
-    return redirect(res, `/ta/classes/${classId}?show_conflicts=1&notice=存在时间冲突，无法申请`);
+    return redirect(res, `/ta/classes/${classId}?notice=存在时间冲突，无法申请`);
   }
   const insertResult = db.prepare(`
     insert into applications (
@@ -1795,8 +2139,8 @@ function taApplicationsPage(res, user, notice) {
     <td>${escapeHtml(app.ta_comment || "")}</td>
     <td>${escapeHtml(app.prof_comment || "")}</td>
     <td class="actions">
-      <a href="/ta/applications/${app.application_id}">详情</a>
-      ${app.status === "PendingTAAdmin" ? `<form class="inline" method="post" action="/ta/applications/${app.application_id}/withdraw"><button class="secondary" type="submit">撤销</button></form>` : ""}
+      <a class="button-link secondary action-button" href="/ta/applications/${app.application_id}">详情</a>
+      ${app.status === "PendingTAAdmin" ? `<form class="inline" method="post" action="/ta/applications/${app.application_id}/withdraw" onsubmit="return confirm('确认撤销这条申请吗？撤销后需要重新提交申请。');"><button class="danger action-button" type="submit">撤销</button></form>` : ""}
     </td>
   </tr>`).join("");
   sendHtml(res, pageLayout("我的申请", `<section class="card"><h2>我的申请</h2><table><tr><th>教学班</th><th>申请时间</th><th>状态</th><th>TAAdmin 备注</th><th>Professor 备注</th><th>操作</th></tr>${rows}</table></section>`, user, notice));
@@ -1822,7 +2166,7 @@ function taApplicationDetailPage(res, user, applicationId, notice) {
       <p>简历：${attachmentLink(app)}</p>
       <p>TAAdmin 备注：${escapeHtml(app.ta_comment || "")}</p>
       <p>Professor 备注：${escapeHtml(app.prof_comment || "")}</p>
-      ${app.status === "PendingTAAdmin" ? `<form method="post" action="/ta/applications/${applicationId}/withdraw"><button class="secondary" type="submit">撤销申请</button></form>` : ""}
+      ${app.status === "PendingTAAdmin" ? `<form method="post" action="/ta/applications/${applicationId}/withdraw" onsubmit="return confirm('确认撤销这条申请吗？撤销后需要重新提交申请。');"><button class="danger action-button" type="submit">撤销申请</button></form>` : ""}
     </section>
     <section class="card">
       <h3>审批日志</h3>
@@ -2143,7 +2487,7 @@ function professorPendingPage(res, user, notice) {
         where a.class_id = c.class_id and a.status = 'PendingProfessor'
       )
     order by c.semester, c.course_name, c.class_name
-  `).all(user.user_id);
+  `).all(String(user.user_id));
   const schedulesByClass = new Map();
   const allSchedules = db.prepare(`
     select class_id, lesson_date, start_time, end_time, section, is_exam
@@ -2154,7 +2498,7 @@ function professorPendingPage(res, user, notice) {
       where (',' || c.teacher_user_id || ',') like '%,' || ? || ',%'
     )
     order by lesson_date, start_time
-  `).all(user.user_id);
+  `).all(String(user.user_id));
   for (const schedule of allSchedules) {
     if (!schedulesByClass.has(schedule.class_id)) {
       schedulesByClass.set(schedule.class_id, []);
@@ -2182,7 +2526,7 @@ function professorPendingPage(res, user, notice) {
 
 function professorClassReviewPage(res, user, classId, notice) {
   const db = getDb();
-  const classRow = db.prepare("select * from classes where class_id = ? and (',' || teacher_user_id || ',') like '%,' || ? || ',%'").get(classId, user.user_id);
+  const classRow = db.prepare("select * from classes where class_id = ? and (',' || teacher_user_id || ',') like '%,' || ? || ',%'").get(classId, String(user.user_id));
   if (!classRow) {
     db.close();
     res.writeHead(404, { "Content-Type": "text/html; charset=utf-8" });
@@ -2223,7 +2567,7 @@ function professorClassReviewPage(res, user, classId, notice) {
 
 function professorDetailPage(res, user, applicationId, notice) {
   const db = getDb();
-  const app = db.prepare("select * from applications where application_id = ? and (',' || teacher_user_id || ',') like '%,' || ? || ',%'").get(applicationId, user.user_id);
+  const app = db.prepare("select * from applications where application_id = ? and (',' || teacher_user_id || ',') like '%,' || ? || ',%'").get(applicationId, String(user.user_id));
   if (!app) {
     db.close();
     res.writeHead(404, { "Content-Type": "text/html; charset=utf-8" });
@@ -2269,7 +2613,7 @@ async function professorApprove(req, res, user, applicationId) {
   const result = String(body.result || "Rejected");
   const comments = String(body.comments || "").trim();
   const db = getDb();
-  const app = db.prepare("select * from applications where application_id = ? and (',' || teacher_user_id || ',') like '%,' || ? || ',%'").get(applicationId, user.user_id);
+  const app = db.prepare("select * from applications where application_id = ? and (',' || teacher_user_id || ',') like '%,' || ? || ',%'").get(applicationId, String(user.user_id));
   if (!app || app.status !== "PendingProfessor") {
     db.close();
     return redirect(res, "/professor/pending?notice=申请已被处理");
@@ -2358,16 +2702,21 @@ function resolveProfessorSelection(db, rawValue) {
   };
 }
 
-function courseClassesPage(res, user, notice, statusFilter) {
+function courseClassesPage(res, user, notice, filters = {}) {
   const db = getDb();
+  const classCodeFilter = String(filters.class_code || "").trim().toLowerCase();
+  const classNameFilter = String(filters.class_name || "").trim().toLowerCase();
+  const teacherFilter = String(filters.teacher_name || "").trim().toLowerCase();
+  const statusFilter = String(filters.status_filter || "").trim();
+  const taFullFilter = String(filters.ta_full || "").trim();
+  const sortBy = String(filters.sort_by || "class_code");
+  const sortOrder = String(filters.sort_order || "asc").toLowerCase() === "desc" ? "desc" : "asc";
   const rowsRaw = db.prepare(`
     select c.*,
       (select count(*) from applications a where a.class_id = c.class_id) as application_count,
       (select count(*) from applications a where a.class_id = c.class_id and a.status = 'Approved') as approved_count
     from classes c
-    order by c.semester, c.course_name, c.class_name
   `).all();
-  const rows = statusFilter ? rowsRaw.filter((row) => classOpenStatus(row) === statusFilter) : rowsRaw;
   const schedulesByClass = new Map();
   const allSchedules = db.prepare(`
     select class_id, lesson_date, start_time, end_time, section, is_exam
@@ -2380,9 +2729,44 @@ function courseClassesPage(res, user, notice, statusFilter) {
     }
     schedulesByClass.get(schedule.class_id).push(schedule);
   }
+  const sortValueMap = {
+    class_code: (row) => String(row.class_code || "").toLowerCase(),
+    class_name: (row) => String(row.class_name || "").toLowerCase(),
+    teacher_name: (row) => String(row.teacher_name || "").toLowerCase(),
+    ta_full: (row) => (Number(row.approved_count || 0) >= Number(row.maximum_number_of_tas_admitted || 0) ? 1 : 0),
+    status_filter: (row) => String(classOpenStatus(row)),
+    approved_count: (row) => Number(row.approved_count || 0),
+    application_count: (row) => Number(row.application_count || 0)
+  };
+  const rows = rowsRaw
+    .filter((row) => !classCodeFilter || String(row.class_code || "").toLowerCase().includes(classCodeFilter))
+    .filter((row) => !classNameFilter || String(row.class_name || "").toLowerCase().includes(classNameFilter))
+    .filter((row) => !teacherFilter || String(row.teacher_name || "").toLowerCase().includes(teacherFilter))
+    .filter((row) => !statusFilter || classOpenStatus(row) === statusFilter)
+    .filter((row) => {
+      const isFull = Number(row.approved_count || 0) >= Number(row.maximum_number_of_tas_admitted || 0);
+      if (!taFullFilter) return true;
+      return taFullFilter === "Y" ? isFull : !isFull;
+    })
+    .sort((a, b) => {
+      const getter = sortValueMap[sortBy] || sortValueMap.class_code;
+      const av = getter(a);
+      const bv = getter(b);
+      if (av < bv) return sortOrder === "asc" ? -1 : 1;
+      if (av > bv) return sortOrder === "asc" ? 1 : -1;
+      return String(a.class_code || "").localeCompare(String(b.class_code || ""), "zh-Hans-CN");
+    });
+  const headerFilters = {
+    class_code: filters.class_code || "",
+    class_name: filters.class_name || "",
+    teacher_name: filters.teacher_name || "",
+    ta_full: filters.ta_full || "",
+    status_filter: filters.status_filter || ""
+  };
   const tableRows = rows.map((row) => {
     const scheduleRows = schedulesByClass.get(row.class_id) || [];
-    return `<tr>
+    const isFull = Number(row.approved_count || 0) >= Number(row.maximum_number_of_tas_admitted || 0);
+    return `<tr class="${isFull ? "row-soft-purple" : ""}">
     <td><input type="checkbox" class="class-select" value="${row.class_id}" /></td>
     <td>${escapeHtml(row.class_code)}</td>
     <td>${escapeHtml(row.class_abbr || "")}</td>
@@ -2391,6 +2775,7 @@ function courseClassesPage(res, user, notice, statusFilter) {
     <td>${escapeHtml(row.teacher_name)}</td>
     <td>${escapeHtml(row.semester)}</td>
     <td>${escapeHtml(classOpenStatusLabel(row))}</td>
+    <td>${isFull ? "已满" : "-"}</td>
     <td>${scheduleRows.length}</td>
     <td>${scheduleSummary(scheduleRows, `course-${row.class_id}`)}</td>
     <td>${row.approved_count} / ${row.maximum_number_of_tas_admitted}</td>
@@ -2399,9 +2784,9 @@ function courseClassesPage(res, user, notice, statusFilter) {
     <td>${escapeHtml(row.is_conflict_allowed || "N")}</td>
     <td>
       <div class="actions">
-        <a class="button-link secondary" href="/course/classes/${row.class_id}">修改教学班</a>
-        <a class="button-link secondary" href="/course/classes/${row.class_id}/applications">查看申请</a>
-        <a class="button-link danger" href="/course/classes/${row.class_id}/delete">删除教学班</a>
+        <a class="button-link secondary action-button" href="/course/classes/${row.class_id}">修改</a>
+        <a class="button-link secondary action-button" href="/course/classes/${row.class_id}/applications">查看</a>
+        <a class="button-link danger action-button" href="/course/classes/${row.class_id}/delete">删除</a>
       </div>
     </td>
   </tr>`;
@@ -2427,7 +2812,15 @@ function courseClassesPage(res, user, notice, statusFilter) {
     <section class="card">
       <h2>筛选教学班</h2>
       <form method="get" action="/course/classes">
-        <div class="grid">
+        <div class="filters-grid">
+          <p><label>教学班代码<input name="class_code" value="${escapeHtml(filters.class_code || "")}" /></label></p>
+          <p><label>教学班名称<input name="class_name" value="${escapeHtml(filters.class_name || "")}" /></label></p>
+          <p><label>教授<input name="teacher_name" value="${escapeHtml(filters.teacher_name || "")}" /></label></p>
+          <p><label>TA已满<select name="ta_full">
+            <option value="" ${!filters.ta_full ? "selected" : ""}>全部</option>
+            <option value="Y" ${filters.ta_full === "Y" ? "selected" : ""}>已满</option>
+            <option value="N" ${filters.ta_full === "N" ? "selected" : ""}>未满</option>
+          </select></label></p>
           <p><label>开放状态<select name="status_filter">
             <option value="" ${!statusFilter ? "selected" : ""}>全部</option>
             <option value="open" ${statusFilter === "open" ? "selected" : ""}>开放中</option>
@@ -2436,40 +2829,50 @@ function courseClassesPage(res, user, notice, statusFilter) {
             <option value="closed" ${statusFilter === "closed" ? "selected" : ""}>已关闭</option>
             <option value="unset" ${statusFilter === "unset" ? "selected" : ""}>未设置</option>
           </select></label></p>
+          <div class="actions">
+            <button class="secondary action-button" type="submit">筛选</button>
+            <a class="button-link secondary action-button" href="/course/classes">重置</a>
+          </div>
         </div>
-        <button type="submit">筛选</button>
       </form>
     </section>
     <section class="card">
-      <h2>批量开关申请权限</h2>
-      <form method="post" action="/course/classes/batch-toggle" onsubmit="return submitSelectedClasses(this);">
-        <input type="hidden" name="class_refs" />
-        <div class="grid">
-          <p><label>申请权限<select name="ta_allowed"><option value="Y">开启</option><option value="N">关闭</option></select></label></p>
+      <details>
+        <summary style="cursor:pointer; font-weight:600; color:#174ea6;">展开批量操作</summary>
+        <div style="margin-top:16px; display:grid; gap:16px;">
+          <section class="card" style="margin:0; box-shadow:none;">
+            <h3>批量开关申请权限</h3>
+            <form method="post" action="/course/classes/batch-toggle" onsubmit="return submitSelectedClasses(this);">
+              <input type="hidden" name="class_refs" />
+              <div class="grid">
+                <p><label>申请权限<select name="ta_allowed"><option value="Y">开启</option><option value="N">关闭</option></select></label></p>
+              </div>
+              <button class="secondary action-button" type="submit">更新</button>
+            </form>
+            <p class="muted">基于当前勾选的教学班执行。只更新是否允许申请，不修改申请时间窗。</p>
+          </section>
+          <section class="card" style="margin:0; box-shadow:none;">
+            <h3>批量设置开放申请时间</h3>
+            <form method="post" action="/course/classes/batch-window" onsubmit="return submitSelectedClasses(this);">
+              <input type="hidden" name="class_refs" />
+              <div class="grid">
+                <p><label>开放开始时间<input name="apply_start_at" type="datetime-local" required /></label></p>
+                <p><label>开放结束时间<input name="apply_end_at" type="datetime-local" required /></label></p>
+              </div>
+              <button class="secondary action-button" type="submit">设置</button>
+            </form>
+            <p class="muted">基于当前勾选的教学班执行。</p>
+          </section>
+          <section class="card" style="margin:0; box-shadow:none;">
+            <h3>批量删除教学班</h3>
+            <form method="post" action="/course/classes/batch-delete" onsubmit="return submitSelectedClasses(this);">
+              <input type="hidden" name="class_refs" />
+              <button class="secondary action-button" type="submit">删除</button>
+            </form>
+            <p class="muted">基于当前勾选的教学班执行，会先进入确认页，再统一删除关联排课、申请、审批记录和附件。</p>
+          </section>
         </div>
-        <button type="submit">批量更新</button>
-      </form>
-      <p class="muted">基于当前勾选的教学班执行。只更新是否允许申请，不修改申请时间窗。</p>
-    </section>
-    <section class="card">
-      <h2>批量设置开放申请时间</h2>
-      <form method="post" action="/course/classes/batch-window" onsubmit="return submitSelectedClasses(this);">
-        <input type="hidden" name="class_refs" />
-        <div class="grid">
-          <p><label>开放开始时间<input name="apply_start_at" type="datetime-local" required /></label></p>
-          <p><label>开放结束时间<input name="apply_end_at" type="datetime-local" required /></label></p>
-        </div>
-        <button type="submit">批量设置</button>
-      </form>
-      <p class="muted">基于当前勾选的教学班执行。</p>
-    </section>
-    <section class="card">
-      <h2>批量删除教学班</h2>
-      <form method="post" action="/course/classes/batch-delete" onsubmit="return submitSelectedClasses(this);">
-        <input type="hidden" name="class_refs" />
-        <button class="secondary" type="submit">进入批量删除确认</button>
-      </form>
-      <p class="muted">基于当前勾选的教学班执行，会先进入确认页，再统一删除关联排课、申请、审批记录和附件。</p>
+      </details>
     </section>
     <section class="card">
       <h2>新增教学班</h2>
@@ -2503,7 +2906,7 @@ function courseClassesPage(res, user, notice, statusFilter) {
         <span class="muted">已选 <strong id="selected-class-count">0</strong> 个教学班</span>
       </div>
       <div class="table-wrap">
-        <table class="wide"><tr><th style="width:56px;">选择</th><th style="width:116px;">代码</th><th style="width:110px;">缩写</th><th style="width:136px;">课程名</th><th style="width:156px;">教学班</th><th style="width:170px;">教授</th><th style="width:100px;">学期</th><th style="width:110px;">开放状态</th><th style="width:72px;">排课数</th><th style="min-width:240px;">排课安排</th><th style="width:118px;">已通过/上限</th><th style="width:84px;">申请数</th><th style="width:88px;">开放申请</th><th style="width:100px;">允许冲突</th><th style="width:300px;">单条操作</th></tr>${tableRows}</table>
+        <table class="wide compact-table"><tr><th style="width:56px;">选择</th><th style="width:100px;">${sortableHeader("教学班代码", "class_code", "/course/classes", headerFilters, sortBy, sortOrder)}</th><th style="width:92px;">缩写</th><th style="width:124px;">课程名</th><th style="width:138px;">${sortableHeader("教学班名称", "class_name", "/course/classes", headerFilters, sortBy, sortOrder)}</th><th style="width:160px;">${sortableHeader("教授", "teacher_name", "/course/classes", headerFilters, sortBy, sortOrder)}</th><th style="width:96px;">学期</th><th style="width:108px;">${sortableHeader("开放状态", "status_filter", "/course/classes", headerFilters, sortBy, sortOrder)}</th><th style="width:84px;">${sortableHeader("TA已满", "ta_full", "/course/classes", headerFilters, sortBy, sortOrder)}</th><th style="width:68px;">排课数</th><th style="min-width:220px;">排课安排</th><th style="width:118px;">${sortableHeader("已通过/上限", "approved_count", "/course/classes", headerFilters, sortBy, sortOrder)}</th><th style="width:84px;">${sortableHeader("申请数", "application_count", "/course/classes", headerFilters, sortBy, sortOrder)}</th><th style="width:88px;">开放申请</th><th style="width:96px;">允许冲突</th><th style="width:260px;">单条操作</th></tr>${tableRows}</table>
       </div>
     </section>
     <script>
@@ -3189,26 +3592,60 @@ async function batchDeleteClassesConfirmPage(req, res, user, notice) {
   `, user, notice));
 }
 
-function courseUsersPage(res, user, notice) {
+function courseUsersPage(res, user, notice, filters = {}) {
   const db = getDb();
-  const users = db.prepare(`
+  const roleFilter = String(filters.role || "").trim();
+  const userNameFilter = String(filters.user_name || "").trim().toLowerCase();
+  const loginNameFilter = String(filters.login_name || "").trim().toLowerCase();
+  const emailFilter = String(filters.email || "").trim().toLowerCase();
+  const taAllowedFilter = String(filters.is_allowed_to_apply || "").trim();
+  const sortBy = String(filters.sort_by || "user_name");
+  const sortOrder = String(filters.sort_order || "asc").toLowerCase() === "desc" ? "desc" : "asc";
+  const usersRaw = db.prepare(`
     select u.*,
       (select count(*) from applications a where a.applier_user_id = u.user_id) as application_count,
       (select count(*) from classes c where (',' || c.teacher_user_id || ',') like '%,' || u.user_id || ',%') as class_count
     from users u
-    order by
-      case u.role
-        when 'CourseAdmin' then 1
-        when 'TAAdmin' then 2
-        when 'Professor' then 3
-        when 'TA' then 4
-        else 9
-      end,
-      u.user_name
   `).all();
   db.close();
-  const rows = users.map((row) => `<tr>
-    <td>${row.user_id}</td>
+  const roleWeight = (role) => ({
+    CourseAdmin: 1,
+    TAAdmin: 2,
+    Professor: 3,
+    TA: 4
+  }[role] || 9);
+  const sortValueMap = {
+    user_name: (row) => String(row.user_name || "").toLowerCase(),
+    login_name: (row) => String(row.login_name || "").toLowerCase(),
+    email: (row) => String(row.email || "").toLowerCase(),
+    role: (row) => roleWeight(row.role),
+    is_allowed_to_apply: (row) => String(row.is_allowed_to_apply || ""),
+    application_count: (row) => Number(row.application_count || 0),
+    class_count: (row) => Number(row.class_count || 0)
+  };
+  const users = usersRaw
+    .filter((row) => !roleFilter || row.role === roleFilter)
+    .filter((row) => !userNameFilter || String(row.user_name || "").toLowerCase().includes(userNameFilter))
+    .filter((row) => !loginNameFilter || String(row.login_name || "").toLowerCase().includes(loginNameFilter))
+    .filter((row) => !emailFilter || String(row.email || "").toLowerCase().includes(emailFilter))
+    .filter((row) => !taAllowedFilter || String(row.is_allowed_to_apply || "") === taAllowedFilter)
+    .sort((a, b) => {
+      const getter = sortValueMap[sortBy] || sortValueMap.user_name;
+      const av = getter(a);
+      const bv = getter(b);
+      if (av < bv) return sortOrder === "asc" ? -1 : 1;
+      if (av > bv) return sortOrder === "asc" ? 1 : -1;
+      return String(a.user_name || "").localeCompare(String(b.user_name || ""), "zh-Hans-CN");
+    });
+  const headerFilters = {
+    user_name: filters.user_name || "",
+    login_name: filters.login_name || "",
+    email: filters.email || "",
+    role: filters.role || "",
+    is_allowed_to_apply: filters.is_allowed_to_apply || ""
+  };
+  const rows = users.map((row, index) => `<tr>
+    <td>${index + 1}</td>
     <td>${escapeHtml(row.user_name)}</td>
     <td>${escapeHtml(row.login_name)}</td>
     <td>${escapeHtml(row.email)}</td>
@@ -3218,9 +3655,9 @@ function courseUsersPage(res, user, notice) {
     <td>${row.class_count}</td>
     <td>
       <div class="actions">
-        <a class="button-link secondary" href="/course/users/${row.user_id}">编辑人员</a>
+        <a class="button-link secondary action-button" href="/course/users/${row.user_id}">编辑</a>
         <form class="inline" method="post" action="/course/users/${row.user_id}/delete">
-          <button class="danger" type="submit">删除人员</button>
+          <button class="danger action-button" type="submit">删除</button>
         </form>
       </div>
     </td>
@@ -3256,9 +3693,45 @@ function courseUsersPage(res, user, notice) {
       </form>
     </section>
     <section class="card">
+      <h2>筛选人员</h2>
+      <form method="get" action="/course/users">
+        <div class="filters-grid">
+          <p><label>姓名<input name="user_name" value="${escapeHtml(filters.user_name || "")}" /></label></p>
+          <p><label>登录名<input name="login_name" value="${escapeHtml(filters.login_name || "")}" /></label></p>
+          <p><label>邮箱<input name="email" value="${escapeHtml(filters.email || "")}" /></label></p>
+          <p><label>角色<select name="role">
+            <option value="" ${!filters.role ? "selected" : ""}>全部</option>
+            <option value="TA" ${filters.role === "TA" ? "selected" : ""}>TA</option>
+            <option value="TAAdmin" ${filters.role === "TAAdmin" ? "selected" : ""}>TAAdmin</option>
+            <option value="Professor" ${filters.role === "Professor" ? "selected" : ""}>Professor</option>
+            <option value="CourseAdmin" ${filters.role === "CourseAdmin" ? "selected" : ""}>CourseAdmin</option>
+          </select></label></p>
+          <p><label>允许申请<select name="is_allowed_to_apply">
+            <option value="" ${!filters.is_allowed_to_apply ? "selected" : ""}>全部</option>
+            <option value="Y" ${filters.is_allowed_to_apply === "Y" ? "selected" : ""}>Y</option>
+            <option value="N" ${filters.is_allowed_to_apply === "N" ? "selected" : ""}>N</option>
+          </select></label></p>
+          <div class="actions">
+            <button class="secondary action-button" type="submit">筛选</button>
+            <a class="button-link secondary action-button" href="/course/users">重置</a>
+          </div>
+        </div>
+      </form>
+    </section>
+    <section class="card">
       <h2>人员列表</h2>
       <table>
-        <tr><th>ID</th><th>姓名</th><th>登录名</th><th>邮箱</th><th>角色</th><th>允许申请</th><th>申请数</th><th>授课班级</th><th>操作</th></tr>
+        <tr>
+          <th>序号</th>
+          <th>${sortableHeader("姓名", "user_name", "/course/users", headerFilters, sortBy, sortOrder)}</th>
+          <th>${sortableHeader("登录名", "login_name", "/course/users", headerFilters, sortBy, sortOrder)}</th>
+          <th>${sortableHeader("邮箱", "email", "/course/users", headerFilters, sortBy, sortOrder)}</th>
+          <th>${sortableHeader("角色", "role", "/course/users", headerFilters, sortBy, sortOrder)}</th>
+          <th>${sortableHeader("允许申请", "is_allowed_to_apply", "/course/users", headerFilters, sortBy, sortOrder)}</th>
+          <th>${sortableHeader("申请数", "application_count", "/course/users", headerFilters, sortBy, sortOrder)}</th>
+          <th>${sortableHeader("授课班级", "class_count", "/course/users", headerFilters, sortBy, sortOrder)}</th>
+          <th>操作</th>
+        </tr>
         ${rows}
       </table>
     </section>
@@ -3274,7 +3747,7 @@ function courseUserDetailPage(res, user, userId, notice) {
     res.end(pageLayout("未找到", '<section class="card">人员不存在。</section>', user, notice));
     return;
   }
-  const classes = db.prepare("select class_code, class_name from classes where (',' || teacher_user_id || ',') like '%,' || ? || ',%' order by class_name").all(userId);
+  const classes = db.prepare("select class_code, class_name from classes where (',' || teacher_user_id || ',') like '%,' || ? || ',%' order by class_name").all(String(userId));
   const applications = db.prepare("select application_id, class_name, status from applications where applier_user_id = ? order by application_id desc").all(userId);
   db.close();
   const classList = classes.length
@@ -3395,7 +3868,7 @@ async function updateCourseUser(req, res, userId) {
     db.close();
     return redirect(res, "/course/users?notice=人员不存在");
   }
-  const teachesClasses = db.prepare("select count(*) as count from classes where (',' || teacher_user_id || ',') like '%,' || ? || ',%'").get(userId).count;
+  const teachesClasses = db.prepare("select count(*) as count from classes where (',' || teacher_user_id || ',') like '%,' || ? || ',%'").get(String(userId)).count;
   if (teachesClasses > 0 && role !== "Professor") {
     db.close();
     return redirect(res, `/course/users/${userId}?notice=该用户已关联教学班，不能改为非 Professor`);
@@ -3415,7 +3888,7 @@ async function updateCourseUser(req, res, userId) {
       userId
     );
     if (role === "Professor") {
-      const classes = db.prepare("select class_id, teacher_user_id from classes where (',' || teacher_user_id || ',') like '%,' || ? || ',%'").all(userId);
+      const classes = db.prepare("select class_id, teacher_user_id from classes where (',' || teacher_user_id || ',') like '%,' || ? || ',%'").all(String(userId));
       const findProfessor = db.prepare("select user_id, user_name from users where user_id = ? and role = 'Professor'");
       for (const row of classes) {
         const ids = normalizeTeacherUserIds(row.teacher_user_id);
@@ -3438,8 +3911,8 @@ function deleteCourseUser(res, userId) {
     db.close();
     return redirect(res, "/course/users?notice=人员不存在");
   }
-  const applicationCount = db.prepare("select count(*) as count from applications where applier_user_id = ? or (',' || teacher_user_id || ',') like '%,' || ? || ',%'").get(userId, userId).count;
-  const classCount = db.prepare("select count(*) as count from classes where (',' || teacher_user_id || ',') like '%,' || ? || ',%'").get(userId).count;
+  const applicationCount = db.prepare("select count(*) as count from applications where applier_user_id = ? or (',' || teacher_user_id || ',') like '%,' || ? || ',%'").get(userId, String(userId)).count;
+  const classCount = db.prepare("select count(*) as count from classes where (',' || teacher_user_id || ',') like '%,' || ? || ',%'").get(String(userId)).count;
   const approvalCount = db.prepare("select count(*) as count from approval_logs where approver_user_id = ?").get(userId).count;
   if (applicationCount > 0 || classCount > 0 || approvalCount > 0) {
     db.close();
@@ -3866,7 +4339,13 @@ async function handleRequest(req, res) {
 
   if (pathname === "/ta/classes") {
     if (!requireRole(res, user, ["TA"])) return;
-    return taClassesPage(res, user, notice);
+    return taClassesPage(res, user, notice, {
+      apply_status: url.searchParams.get("apply_status") || "",
+      professor_name: url.searchParams.get("professor_name") || "",
+      course_name: url.searchParams.get("course_name") || "",
+      class_name: url.searchParams.get("class_name") || "",
+      teaching_language: url.searchParams.get("teaching_language") || ""
+    });
   }
   if (pathname === "/ta/profile") {
     if (!requireRole(res, user, ["TA"])) return;
@@ -3878,7 +4357,7 @@ async function handleRequest(req, res) {
   }
   if (/^\/ta\/classes\/\d+$/.test(pathname)) {
     if (!requireRole(res, user, ["TA"])) return;
-    return taClassDetailPage(res, user, Number(pathname.split("/").pop()), notice, url.searchParams.get("show_conflicts") === "1");
+    return taClassDetailPage(res, user, Number(pathname.split("/").pop()), notice);
   }
   if (pathname === "/ta/applications" && req.method === "POST") {
     if (!requireRole(res, user, ["TA"])) return;
@@ -3971,7 +4450,15 @@ async function handleRequest(req, res) {
 
   if (pathname === "/course/classes") {
     if (!requireRole(res, user, ["CourseAdmin"])) return;
-    return courseClassesPage(res, user, notice, url.searchParams.get("status_filter") || "");
+    return courseClassesPage(res, user, notice, {
+      class_code: url.searchParams.get("class_code") || "",
+      class_name: url.searchParams.get("class_name") || "",
+      teacher_name: url.searchParams.get("teacher_name") || "",
+      ta_full: url.searchParams.get("ta_full") || "",
+      status_filter: url.searchParams.get("status_filter") || "",
+      sort_by: url.searchParams.get("sort_by") || "class_code",
+      sort_order: url.searchParams.get("sort_order") || "asc"
+    });
   }
   if (/^\/course\/applications\/\d+\/override-status$/.test(pathname) && req.method === "POST") {
     if (!requireRole(res, user, ["CourseAdmin"])) return;
@@ -4091,7 +4578,15 @@ async function handleRequest(req, res) {
   }
   if (pathname === "/course/users") {
     if (!requireRole(res, user, ["CourseAdmin"])) return;
-    return courseUsersPage(res, user, notice);
+    return courseUsersPage(res, user, notice, {
+      user_name: url.searchParams.get("user_name") || "",
+      login_name: url.searchParams.get("login_name") || "",
+      email: url.searchParams.get("email") || "",
+      role: url.searchParams.get("role") || "",
+      is_allowed_to_apply: url.searchParams.get("is_allowed_to_apply") || "",
+      sort_by: url.searchParams.get("sort_by") || "user_name",
+      sort_order: url.searchParams.get("sort_order") || "asc"
+    });
   }
   if (pathname === "/course/users/import/template") {
     if (!requireRole(res, user, ["CourseAdmin"])) return;
