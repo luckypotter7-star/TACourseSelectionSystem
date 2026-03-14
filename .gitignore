@@ -1,0 +1,11 @@
+ta_system.db
+ta_system_node.db
+server-error.log
+*.cookies
+.DS_Store
+node_modules/
+node-v22.22.1-darwin-arm64/
+node-v22.22.1-darwin-arm64.tar.xz
+uploads/
+screenshots/
+doc_updates/
