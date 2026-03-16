@@ -6,10 +6,17 @@ const { URL } = require("node:url");
 const querystring = require("node:querystring");
 const { DatabaseSync } = require("node:sqlite");
 const XLSX = require("xlsx");
+let nodemailer = null;
+try {
+  nodemailer = require("nodemailer");
+} catch (_error) {
+  nodemailer = null;
+}
 
 const BASE_DIR = __dirname;
 const DB_PATH = path.join(BASE_DIR, "ta_system_node.db");
 const UPLOAD_DIR = path.join(BASE_DIR, "uploads");
+const LOCAL_ENV_PATH = path.join(BASE_DIR, ".env.local");
 const PORT = 3000;
 const sessions = new Map();
 const importReports = new Map();
@@ -51,6 +58,27 @@ const reapplyAllowedStatuses = new Set([
   "RejectedByTAAdmin",
   "RejectedByProfessor"
 ]);
+
+function loadLocalEnv(filePath) {
+  if (!fs.existsSync(filePath)) return;
+  const content = fs.readFileSync(filePath, "utf8");
+  for (const line of content.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) continue;
+    const index = trimmed.indexOf("=");
+    if (index <= 0) continue;
+    const key = trimmed.slice(0, index).trim();
+    let value = trimmed.slice(index + 1).trim();
+    if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+      value = value.slice(1, -1);
+    }
+    if (!(key in process.env)) {
+      process.env[key] = value;
+    }
+  }
+}
+
+loadLocalEnv(LOCAL_ENV_PATH);
 
 function nowStr() {
   const date = new Date();
@@ -113,6 +141,8 @@ function initDb() {
       maximum_number_of_tas_admitted integer not null default 1,
       ta_applications_allowed text not null default 'Y',
       is_conflict_allowed text not null default 'N',
+      published_to_professor text not null default 'N',
+      professor_notified_at text,
       apply_start_at text,
       apply_end_at text,
       semester text not null
@@ -205,6 +235,12 @@ function initDb() {
   if (!classColumns.some((column) => column.name === "is_conflict_allowed")) {
     db.exec("alter table classes add column is_conflict_allowed text not null default 'N'");
   }
+  if (!classColumns.some((column) => column.name === "published_to_professor")) {
+    db.exec("alter table classes add column published_to_professor text not null default 'N'");
+  }
+  if (!classColumns.some((column) => column.name === "professor_notified_at")) {
+    db.exec("alter table classes add column professor_notified_at text");
+  }
   db.exec(`
     update classes
     set apply_start_at = coalesce(apply_start_at, '2026-03-01 00:00'),
@@ -215,6 +251,11 @@ function initDb() {
     update classes
     set is_conflict_allowed = coalesce(is_conflict_allowed, 'N')
     where is_conflict_allowed is null
+  `);
+  db.exec(`
+    update classes
+    set published_to_professor = coalesce(published_to_professor, 'N')
+    where published_to_professor is null
   `);
   db.exec(`
     update classes
@@ -517,6 +558,15 @@ function parseBatchClassRefs(value) {
   ));
 }
 
+function parseIdList(value) {
+  return Array.from(new Set(
+    String(value || "")
+      .split(/[\s,，]+/)
+      .map((item) => Number(item.trim()))
+      .filter((item) => Number.isInteger(item) && item > 0)
+  ));
+}
+
 function loadClassRowsByRefs(db, refs) {
   const selectById = db.prepare("select * from classes where class_id = ?");
   const selectByCode = db.prepare("select * from classes where class_code = ?");
@@ -604,6 +654,80 @@ function buildProfessorEmailDraft(professor, selectedClasses, accessLink) {
     subject: "TA申请前置审核已完成",
     body
   };
+}
+
+function createMailer() {
+  if (!nodemailer) {
+    throw new Error("尚未安装 nodemailer，暂时无法直接发送邮件");
+  }
+  const smtpHost = String(process.env.SMTP_HOST || "").trim();
+  const smtpPort = Number(process.env.SMTP_PORT || 465);
+  const smtpUser = String(process.env.SMTP_USER || "").trim();
+  const smtpPass = String(process.env.SMTP_PASS || "").trim();
+  const smtpSecure = String(process.env.SMTP_SECURE || "true").trim() !== "false";
+  if (smtpHost && smtpUser && smtpPass) {
+    return nodemailer.createTransport({
+      host: smtpHost,
+      port: smtpPort,
+      secure: smtpSecure,
+      auth: {
+        user: smtpUser,
+        pass: smtpPass
+      }
+    });
+  }
+  if (String(process.env.MAIL_USE_SENDMAIL || "").trim().toUpperCase() !== "Y") {
+    throw new Error("未配置 SMTP。请在项目根目录创建 .env.local 并填写 SMTP_HOST、SMTP_PORT、SMTP_USER、SMTP_PASS、SMTP_FROM");
+  }
+  return nodemailer.createTransport({
+    sendmail: true,
+    newline: "unix",
+    path: "/usr/sbin/sendmail"
+  });
+}
+
+async function sendProfessorNotificationEmails(db, classes, taAdmin, baseUrl) {
+  const grouped = new Map();
+  const findProfessor = db.prepare("select user_id, user_name, email from users where user_id = ? and role = 'Professor'");
+  for (const classRow of classes) {
+    for (const professorId of normalizeTeacherUserIds(classRow.teacher_user_id)) {
+      const professor = findProfessor.get(professorId);
+      if (!professor || !professor.email) continue;
+      if (!grouped.has(professor.user_id)) {
+        grouped.set(professor.user_id, { professor, classes: [] });
+      }
+      grouped.get(professor.user_id).classes.push(classRow);
+    }
+  }
+  if (!grouped.size) {
+    throw new Error("所选教学班未匹配到可用的 Professor 邮箱");
+  }
+  const transporter = createMailer();
+  const fromAddress = String(process.env.SMTP_FROM || process.env.SMTP_USER || "").trim();
+  if (!fromAddress && String(process.env.SMTP_HOST || "").trim()) {
+    throw new Error("已配置 SMTP，但缺少 SMTP_FROM 发件人地址");
+  }
+  for (const { professor, classes: selectedClasses } of grouped.values()) {
+    const token = createLoginToken(db, professor.user_id, "/professor/pending");
+    const accessLink = `${baseUrl}/magic-login?token=${token}`;
+    const emailDraft = buildProfessorEmailDraft(professor, selectedClasses, accessLink);
+    const message = {
+      to: emailDraft.to,
+      subject: emailDraft.subject,
+      text: emailDraft.body
+    };
+    if (fromAddress) {
+      message.from = fromAddress;
+    }
+    if (taAdmin?.email) {
+      message.cc = taAdmin.email;
+    }
+    await transporter.sendMail(message);
+  }
+  const classIds = classes.map((row) => row.class_id);
+  for (const classId of classIds) {
+    db.prepare("update classes set published_to_professor = 'Y', professor_notified_at = ? where class_id = ?").run(nowStr(), classId);
+  }
 }
 
 function pageLayout(title, body, user, notice) {
@@ -716,6 +840,9 @@ function pageLayout(title, body, user, notice) {
       h2 { font-size: 22px; letter-spacing: -0.01em; }
       h3 { font-size: 18px; letter-spacing: -0.01em; }
       table { width: 100%; border-collapse: collapse; background: var(--panel); }
+      table.fixed-layout {
+        table-layout: fixed;
+      }
       th, td {
         border-bottom: 1px solid var(--line);
         padding: 12px 10px;
@@ -761,6 +888,11 @@ function pageLayout(title, body, user, notice) {
       table.compact-table td {
         font-size: 13px;
         padding: 10px 8px;
+      }
+      table.fixed-layout th,
+      table.fixed-layout td {
+        overflow: hidden;
+        text-overflow: ellipsis;
       }
       .grid { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); }
       .class-card-grid {
@@ -1764,10 +1896,11 @@ function upsertImportedClasses(db, importedClasses) {
   return { createdCount, updatedCount, details };
 }
 
-function scheduleSummary(rows, key) {
+function scheduleSummary(rows, key, options = {}) {
   if (!rows.length) {
     return "<span class='muted'>暂无排课</span>";
   }
+  const showPreview = options.showPreview !== false;
   const renderItem = (row) => `
     <div class="schedule-item">
       <div>${escapeHtml(row.lesson_date)} ${escapeHtml(row.start_time)}-${escapeHtml(row.end_time)}</div>
@@ -1780,12 +1913,13 @@ function scheduleSummary(rows, key) {
   const dialogId = `schedule-dialog-${escapeHtml(String(key || crypto.randomBytes(4).toString("hex")))}`;
   return `
     <div class="schedule-summary">
+      ${showPreview ? `
       <div class="schedule-preview">
         <div class="schedule-item">
           <div>${previewText}</div>
           <div class="schedule-meta">${extraCount > 0 ? `另有 ${extraCount} 条排课` : `${escapeHtml(rows[0].section)}${rows[0].is_exam ? ` · ${escapeHtml(rows[0].is_exam)}` : ""}`}</div>
         </div>
-      </div>
+      </div>` : ""}
       <div class="actions">
         <button class="secondary rect" type="button" data-open-schedule="${dialogId}">查看排课</button>
       </div>
@@ -2056,6 +2190,7 @@ async function createApplication(req, res, user) {
     user.resume_path,
     nowStr()
   );
+  db.prepare("update classes set published_to_professor = 'N', professor_notified_at = null where class_id = ?").run(classId);
   const applicationId = insertResult.lastInsertRowid;
   const taAdmins = db.prepare("select user_id from users where role = 'TAAdmin'").all();
   for (const admin of taAdmins) {
@@ -2191,12 +2326,99 @@ function withdrawApplication(res, user, applicationId) {
   redirect(res, "/ta/applications?notice=申请已撤销");
 }
 
-function taAdminPendingPage(res, user, notice) {
+function taAdminPendingPage(res, user, notice, filters = {}) {
   const db = getDb();
-  const apps = db.prepare("select * from applications where status = 'PendingTAAdmin' order by submitted_at").all();
+  const studentFilter = String(filters.applier_name || "").trim().toLowerCase();
+  const classFilter = String(filters.class_name || "").trim().toLowerCase();
+  const teacherFilter = String(filters.teacher_name || "").trim().toLowerCase();
+  const apps = db.prepare("select * from applications where status = 'PendingTAAdmin' order by submitted_at").all()
+    .filter((app) => !studentFilter || String(app.applier_name || "").toLowerCase().includes(studentFilter))
+    .filter((app) => !classFilter || String(app.class_name || "").toLowerCase().includes(classFilter))
+    .filter((app) => !teacherFilter || String(app.teacher_name || "").toLowerCase().includes(teacherFilter));
   db.close();
-  const rows = apps.map((app) => `<tr><td>${escapeHtml(app.applier_name)}</td><td>${escapeHtml(app.class_name)}</td><td>${escapeHtml(app.submitted_at)}</td><td>${escapeHtml(app.application_reason)}</td><td><a href="/admin/ta/pending/${app.application_id}">详情</a></td></tr>`).join("");
-  sendHtml(res, pageLayout("待初审申请", `<section class="card"><h2>待 TAAdmin 审批</h2><table><tr><th>申请人</th><th>教学班</th><th>申请时间</th><th>申请原因</th><th>操作</th></tr>${rows}</table></section>`, user, notice));
+  const rows = apps.map((app) => `<tr>
+    <td><input class="pending-app-select" type="checkbox" value="${app.application_id}" /></td>
+    <td>${escapeHtml(app.applier_name)}</td>
+    <td>${escapeHtml(app.class_name)}</td>
+    <td>${escapeHtml(app.teacher_name)}</td>
+    <td>${escapeHtml(app.submitted_at)}</td>
+    <td>${escapeHtml(app.application_reason)}</td>
+    <td><a class="button-link secondary action-button" href="/admin/ta/pending/${app.application_id}">详情</a></td>
+  </tr>`).join("");
+  sendHtml(res, pageLayout("待初审申请", `
+    <section class="card">
+      <h2>筛选待审批申请</h2>
+      <form method="get" action="/admin/ta/pending">
+        <div class="filters-grid">
+          <p><label>申请学生<input name="applier_name" value="${escapeHtml(filters.applier_name || "")}" /></label></p>
+          <p><label>教学班<input name="class_name" value="${escapeHtml(filters.class_name || "")}" /></label></p>
+          <p><label>教授<input name="teacher_name" value="${escapeHtml(filters.teacher_name || "")}" /></label></p>
+          <div class="actions">
+            <button class="secondary action-button" type="submit">筛选</button>
+            <a class="button-link secondary action-button" href="/admin/ta/pending">重置</a>
+          </div>
+        </div>
+      </form>
+    </section>
+    <section class="card">
+      <h2>批量审批</h2>
+      <form method="post" action="/admin/ta/pending/batch-approve" onsubmit="return submitSelectedPendingApplications(this);">
+        <input type="hidden" name="application_ids" value="" />
+        <div class="grid">
+          <p><label>审批结果
+            <select name="result">
+              <option value="Approved">通过</option>
+              <option value="Rejected">拒绝</option>
+            </select>
+          </label></p>
+          <p><label>审批备注<textarea name="comments"></textarea></label></p>
+        </div>
+        <div class="actions">
+          <button type="submit">批量审批</button>
+          <span class="muted">当前已选 <strong id="selected-pending-count">0</strong> 条申请</span>
+        </div>
+      </form>
+    </section>
+    <section class="card">
+      <h2>待 TAAdmin 审批</h2>
+      <div class="actions" style="margin-bottom:12px;">
+        <label><input type="checkbox" id="select-all-pending-apps" /> 全选当前列表</label>
+      </div>
+      <table><tr><th style="width:56px;">选择</th><th>申请人</th><th>教学班</th><th>教授</th><th>申请时间</th><th>申请原因</th><th>操作</th></tr>${rows}</table>
+    </section>
+    <script>
+      (() => {
+        const checkboxes = Array.from(document.querySelectorAll('.pending-app-select'));
+        const selectAll = document.getElementById('select-all-pending-apps');
+        const countNode = document.getElementById('selected-pending-count');
+        const refresh = () => {
+          const checked = checkboxes.filter((item) => item.checked);
+          if (countNode) countNode.textContent = String(checked.length);
+          if (selectAll) {
+            selectAll.checked = checked.length > 0 && checked.length === checkboxes.length;
+            selectAll.indeterminate = checked.length > 0 && checked.length < checkboxes.length;
+          }
+        };
+        if (selectAll) {
+          selectAll.addEventListener('change', () => {
+            checkboxes.forEach((item) => { item.checked = selectAll.checked; });
+            refresh();
+          });
+        }
+        checkboxes.forEach((item) => item.addEventListener('change', refresh));
+        window.submitSelectedPendingApplications = (form) => {
+          const selected = checkboxes.filter((item) => item.checked).map((item) => item.value);
+          if (!selected.length) {
+            window.alert('请先勾选至少一条申请');
+            return false;
+          }
+          form.querySelector('input[name="application_ids"]').value = selected.join(',');
+          return true;
+        };
+        refresh();
+      })();
+    </script>
+  `, user, notice));
 }
 
 function taAdminDetailPage(res, user, applicationId, notice) {
@@ -2244,17 +2466,7 @@ function taAdminDetailPage(res, user, applicationId, notice) {
 
 function applyTaAdminDecision(db, approver, app, result, comments) {
   const actedAt = nowStr();
-  const classRow = db.prepare("select * from classes where class_id = ?").get(app.class_id);
-  if (!classRow) {
-    throw new Error("教学班不存在");
-  }
-  if (result === "Approved") {
-    const approvedCount = db.prepare("select count(*) as count from applications where class_id = ? and status = 'Approved'").get(app.class_id).count;
-    if (approvedCount >= classRow.maximum_number_of_tas_admitted) {
-      throw new Error("该教学班 TA 名额已满");
-    }
-  }
-  const nextStatus = result === "Approved" ? "Approved" : "RejectedByTAAdmin";
+  const nextStatus = result === "Approved" ? "PendingProfessor" : "RejectedByTAAdmin";
   db.prepare(`
     update applications
     set status = ?, ta_comment = ?, ta_acted_at = ?
@@ -2265,29 +2477,7 @@ function applyTaAdminDecision(db, approver, app, result, comments) {
     values (?, 'TAAdmin', ?, ?, ?, ?, ?)
   `).run(app.application_id, approver.user_id, approver.user_name, result, comments, actedAt);
   if (result === "Approved") {
-    createNotification(db, app.applier_user_id, "TA 审批通过", `你的申请《${app.class_name}》已通过 TAAdmin 审批。`, `/ta/applications/${app.application_id}`);
-    if (classRow.maximum_number_of_tas_admitted === 1) {
-      const others = db.prepare(`
-        select * from applications
-        where class_id = ?
-          and application_id != ?
-          and status = 'PendingTAAdmin'
-      `).all(app.class_id, app.application_id);
-      for (const other of others) {
-        const autoReason = "该课程TA已满";
-        db.prepare(`
-          update applications
-          set status = 'RejectedByTAAdmin', ta_comment = ?, ta_acted_at = ?
-          where application_id = ?
-        `).run(autoReason, actedAt, other.application_id);
-        db.prepare(`
-          insert into approval_logs (application_id, approval_stage, approver_user_id, approver_name, result, comments, acted_at)
-          values (?, 'TAAdmin', ?, ?, 'Rejected', ?, ?)
-        `).run(other.application_id, approver.user_id, approver.user_name, autoReason, actedAt);
-        createNotification(db, other.applier_user_id, "TA 申请被拒绝", `你的申请《${other.class_name}》因课程 TA 名额已满被自动拒绝。`, `/ta/applications/${other.application_id}`);
-      }
-    }
-    syncClassApplyAvailabilityByCapacity(db, app.class_id);
+    createNotification(db, app.applier_user_id, "TA 预审通过", `你的申请《${app.class_name}》已通过 TAAdmin 预审，待发布给 Professor 后进入最终审核。`, `/ta/applications/${app.application_id}`);
   } else {
     createNotification(db, app.applier_user_id, "TA 审批未通过", `你的申请《${app.class_name}》被 TAAdmin 拒绝。`, `/ta/applications/${app.application_id}`);
   }
@@ -2311,6 +2501,39 @@ async function taAdminApprove(req, res, user, applicationId) {
   }
   db.close();
   redirect(res, "/admin/ta/pending?notice=审批已完成");
+}
+
+async function taAdminBatchApprove(req, res, user) {
+  const body = await readBody(req);
+  const applicationIds = parseIdList(body.application_ids);
+  const result = String(body.result || "Rejected");
+  const comments = String(body.comments || "").trim();
+  if (!applicationIds.length) {
+    return redirect(res, "/admin/ta/pending?notice=请先勾选至少一条申请");
+  }
+  const db = getDb();
+  const selectApp = db.prepare("select * from applications where application_id = ?");
+  let processed = 0;
+  let skipped = 0;
+  try {
+    db.exec("BEGIN");
+    for (const applicationId of applicationIds) {
+      const app = selectApp.get(applicationId);
+      if (!app || app.status !== "PendingTAAdmin") {
+        skipped += 1;
+        continue;
+      }
+      applyTaAdminDecision(db, user, app, result, comments);
+      processed += 1;
+    }
+    db.exec("COMMIT");
+  } catch (error) {
+    db.exec("ROLLBACK");
+    db.close();
+    return redirect(res, `/admin/ta/pending?notice=${error.message}`);
+  }
+  db.close();
+  redirect(res, `/admin/ta/pending?notice=批量审批完成：成功 ${processed} 条，跳过 ${skipped} 条`);
 }
 
 function adminOverrideSection(actionPath, currentStatus) {
@@ -2482,6 +2705,7 @@ function professorPendingPage(res, user, notice) {
       (select count(*) from applications a where a.class_id = c.class_id and a.status = 'Approved') as approved_count
     from classes c
     where (',' || c.teacher_user_id || ',') like '%,' || ? || ',%'
+      and c.published_to_professor = 'Y'
       and exists (
         select 1 from applications a
         where a.class_id = c.class_id and a.status = 'PendingProfessor'
@@ -2527,6 +2751,12 @@ function professorPendingPage(res, user, notice) {
 function professorClassReviewPage(res, user, classId, notice) {
   const db = getDb();
   const classRow = db.prepare("select * from classes where class_id = ? and (',' || teacher_user_id || ',') like '%,' || ? || ',%'").get(classId, String(user.user_id));
+  if (classRow && classRow.published_to_professor !== "Y") {
+    db.close();
+    res.writeHead(404, { "Content-Type": "text/html; charset=utf-8" });
+    res.end(pageLayout("未找到", '<section class="card">教学班尚未发布至 Professor。</section>', user, notice));
+    return;
+  }
   if (!classRow) {
     db.close();
     res.writeHead(404, { "Content-Type": "text/html; charset=utf-8" });
@@ -2567,7 +2797,14 @@ function professorClassReviewPage(res, user, classId, notice) {
 
 function professorDetailPage(res, user, applicationId, notice) {
   const db = getDb();
-  const app = db.prepare("select * from applications where application_id = ? and (',' || teacher_user_id || ',') like '%,' || ? || ',%'").get(applicationId, String(user.user_id));
+  const app = db.prepare(`
+    select a.*
+    from applications a
+    left join classes c on c.class_id = a.class_id
+    where a.application_id = ?
+      and (',' || a.teacher_user_id || ',') like '%,' || ? || ',%'
+      and c.published_to_professor = 'Y'
+  `).get(applicationId, String(user.user_id));
   if (!app) {
     db.close();
     res.writeHead(404, { "Content-Type": "text/html; charset=utf-8" });
@@ -2613,7 +2850,14 @@ async function professorApprove(req, res, user, applicationId) {
   const result = String(body.result || "Rejected");
   const comments = String(body.comments || "").trim();
   const db = getDb();
-  const app = db.prepare("select * from applications where application_id = ? and (',' || teacher_user_id || ',') like '%,' || ? || ',%'").get(applicationId, String(user.user_id));
+  const app = db.prepare(`
+    select a.*
+    from applications a
+    left join classes c on c.class_id = a.class_id
+    where a.application_id = ?
+      and (',' || a.teacher_user_id || ',') like '%,' || ? || ',%'
+      and c.published_to_professor = 'Y'
+  `).get(applicationId, String(user.user_id));
   if (!app || app.status !== "PendingProfessor") {
     db.close();
     return redirect(res, "/professor/pending?notice=申请已被处理");
@@ -2777,7 +3021,7 @@ function courseClassesPage(res, user, notice, filters = {}) {
     <td>${escapeHtml(classOpenStatusLabel(row))}</td>
     <td>${isFull ? "已满" : "-"}</td>
     <td>${scheduleRows.length}</td>
-    <td>${scheduleSummary(scheduleRows, `course-${row.class_id}`)}</td>
+    <td>${scheduleSummary(scheduleRows, `course-${row.class_id}`, { showPreview: false })}</td>
     <td>${row.approved_count} / ${row.maximum_number_of_tas_admitted}</td>
     <td>${row.application_count}</td>
     <td>${escapeHtml(row.ta_applications_allowed)}</td>
@@ -2906,7 +3150,26 @@ function courseClassesPage(res, user, notice, filters = {}) {
         <span class="muted">已选 <strong id="selected-class-count">0</strong> 个教学班</span>
       </div>
       <div class="table-wrap">
-        <table class="wide compact-table"><tr><th style="width:56px;">选择</th><th style="width:100px;">${sortableHeader("教学班代码", "class_code", "/course/classes", headerFilters, sortBy, sortOrder)}</th><th style="width:92px;">缩写</th><th style="width:124px;">课程名</th><th style="width:138px;">${sortableHeader("教学班名称", "class_name", "/course/classes", headerFilters, sortBy, sortOrder)}</th><th style="width:160px;">${sortableHeader("教授", "teacher_name", "/course/classes", headerFilters, sortBy, sortOrder)}</th><th style="width:96px;">学期</th><th style="width:108px;">${sortableHeader("开放状态", "status_filter", "/course/classes", headerFilters, sortBy, sortOrder)}</th><th style="width:84px;">${sortableHeader("TA已满", "ta_full", "/course/classes", headerFilters, sortBy, sortOrder)}</th><th style="width:68px;">排课数</th><th style="min-width:220px;">排课安排</th><th style="width:118px;">${sortableHeader("已通过/上限", "approved_count", "/course/classes", headerFilters, sortBy, sortOrder)}</th><th style="width:84px;">${sortableHeader("申请数", "application_count", "/course/classes", headerFilters, sortBy, sortOrder)}</th><th style="width:88px;">开放申请</th><th style="width:96px;">允许冲突</th><th style="width:260px;">单条操作</th></tr>${tableRows}</table>
+        <table class="wide compact-table fixed-layout">
+          <colgroup>
+            <col style="width:56px;" />
+            <col style="width:120px;" />
+            <col style="width:96px;" />
+            <col style="width:140px;" />
+            <col style="width:180px;" />
+            <col style="width:160px;" />
+            <col style="width:96px;" />
+            <col style="width:96px;" />
+            <col style="width:84px;" />
+            <col style="width:68px;" />
+            <col style="width:108px;" />
+            <col style="width:112px;" />
+            <col style="width:84px;" />
+            <col style="width:88px;" />
+            <col style="width:96px;" />
+            <col style="width:260px;" />
+          </colgroup>
+          <tr><th>选择</th><th>${sortableHeader("教学班代码", "class_code", "/course/classes", headerFilters, sortBy, sortOrder)}</th><th>缩写</th><th>课程名</th><th>${sortableHeader("教学班名称", "class_name", "/course/classes", headerFilters, sortBy, sortOrder)}</th><th>${sortableHeader("教授", "teacher_name", "/course/classes", headerFilters, sortBy, sortOrder)}</th><th>学期</th><th>${sortableHeader("开放状态", "status_filter", "/course/classes", headerFilters, sortBy, sortOrder)}</th><th>${sortableHeader("TA已满", "ta_full", "/course/classes", headerFilters, sortBy, sortOrder)}</th><th>排课数</th><th>排课安排</th><th>${sortableHeader("已通过/上限", "approved_count", "/course/classes", headerFilters, sortBy, sortOrder)}</th><th>${sortableHeader("申请数", "application_count", "/course/classes", headerFilters, sortBy, sortOrder)}</th><th>开放申请</th><th>允许冲突</th><th>单条操作</th></tr>${tableRows}</table>
       </div>
     </section>
     <script>
@@ -2944,9 +3207,17 @@ function courseClassesPage(res, user, notice, filters = {}) {
   `, user, notice));
 }
 
-function taAdminAllApplicationsPage(res, user, notice) {
+function taAdminAllApplicationsPage(res, user, notice, filters = {}) {
   const db = getDb();
-  const rows = db.prepare("select * from applications order by submitted_at desc").all();
+  const studentFilter = String(filters.applier_name || "").trim().toLowerCase();
+  const classFilter = String(filters.class_name || "").trim().toLowerCase();
+  const teacherFilter = String(filters.teacher_name || "").trim().toLowerCase();
+  const statusFilter = String(filters.status || "").trim();
+  const rows = db.prepare("select * from applications order by submitted_at desc").all()
+    .filter((app) => !studentFilter || String(app.applier_name || "").toLowerCase().includes(studentFilter))
+    .filter((app) => !classFilter || String(app.class_name || "").toLowerCase().includes(classFilter))
+    .filter((app) => !teacherFilter || String(app.teacher_name || "").toLowerCase().includes(teacherFilter))
+    .filter((app) => !statusFilter || String(app.status || "") === statusFilter);
   db.close();
   const tableRows = rows.map((app) => `<tr>
     <td>${app.application_id}</td>
@@ -2959,6 +3230,24 @@ function taAdminAllApplicationsPage(res, user, notice) {
     <td><a href="/admin/ta/pending/${app.application_id}">详情</a></td>
   </tr>`).join("");
   sendHtml(res, pageLayout("全部申请", `
+    <section class="card">
+      <h2>筛选全部申请</h2>
+      <form method="get" action="/admin/ta/applications">
+        <div class="filters-grid">
+          <p><label>申请学生<input name="applier_name" value="${escapeHtml(filters.applier_name || "")}" /></label></p>
+          <p><label>教学班<input name="class_name" value="${escapeHtml(filters.class_name || "")}" /></label></p>
+          <p><label>教授<input name="teacher_name" value="${escapeHtml(filters.teacher_name || "")}" /></label></p>
+          <p><label>状态<select name="status">
+            <option value="" ${!filters.status ? "selected" : ""}>全部</option>
+            ${Object.entries(statusLabels).map(([key, label]) => `<option value="${key}" ${filters.status === key ? "selected" : ""}>${escapeHtml(label)}</option>`).join("")}
+          </select></label></p>
+          <div class="actions">
+            <button class="secondary action-button" type="submit">筛选</button>
+            <a class="button-link secondary action-button" href="/admin/ta/applications">重置</a>
+          </div>
+        </div>
+      </form>
+    </section>
     <section class="card">
       <h2>全部 TA 申请</h2>
       <table><tr><th>ID</th><th>申请人</th><th>教学班</th><th>教授</th><th>申请时间</th><th>状态</th><th>简历</th><th>操作</th></tr>${tableRows}</table>
@@ -3128,12 +3417,17 @@ function usersImportResultPage(res, user, reportId, notice) {
   `, user, notice));
 }
 
-function taAdminAllClassesPage(res, user, notice, professorFilter, classNameFilter) {
+function taAdminAllClassesPage(res, user, notice, filters = {}) {
   const db = getDb();
-  let rowsRaw = db.prepare(`
+  const professorFilter = String(filters.professor_name || "").trim().toLowerCase();
+  const classNameFilter = String(filters.class_name || "").trim().toLowerCase();
+  const taFullFilter = String(filters.ta_full || "").trim();
+  const hasPendingFilter = String(filters.has_pending || "").trim();
+  const rowsRaw = db.prepare(`
     select c.*,
       (select count(*) from applications a where a.class_id = c.class_id) as application_count,
       (select count(*) from applications a where a.class_id = c.class_id and a.status = 'PendingTAAdmin') as pending_taadmin_count,
+      (select count(*) from applications a where a.class_id = c.class_id and a.status = 'PendingProfessor') as pending_professor_count,
       (select count(*) from applications a where a.class_id = c.class_id and a.status = 'Approved') as approved_count
     from classes c
     order by c.semester, c.course_name, c.class_name
@@ -3143,13 +3437,22 @@ function taAdminAllClassesPage(res, user, notice, professorFilter, classNameFilt
       db.prepare("update classes set ta_applications_allowed = 'N' where class_id = ?").run(row.class_id);
       row.ta_applications_allowed = "N";
     }
+    if (Number(row.pending_taadmin_count || 0) > 0 && row.published_to_professor === "Y") {
+      db.prepare("update classes set published_to_professor = 'N', professor_notified_at = null where class_id = ?").run(row.class_id);
+      row.published_to_professor = "N";
+      row.professor_notified_at = null;
+    }
   }
   const professors = db.prepare("select user_id, email from users where role = 'Professor'").all();
   const professorEmailMap = new Map(professors.map((row) => [row.user_id, row.email]));
   const rows = rowsRaw.filter((row) => {
-    const matchesProfessor = !professorFilter || String(row.teacher_name || "").toLowerCase().includes(professorFilter.toLowerCase());
-    const matchesClassName = !classNameFilter || String(row.class_name || "").toLowerCase().includes(classNameFilter.toLowerCase());
-    return matchesProfessor && matchesClassName;
+    const matchesProfessor = !professorFilter || String(row.teacher_name || "").toLowerCase().includes(professorFilter);
+    const matchesClassName = !classNameFilter || String(row.class_name || "").toLowerCase().includes(classNameFilter);
+    const isFull = isClassCapacityReached(row, row.approved_count);
+    const matchesTaFull = !taFullFilter || (taFullFilter === "Y" ? isFull : !isFull);
+    const hasPending = Number(row.pending_taadmin_count || 0) > 0;
+    const matchesPending = !hasPendingFilter || (hasPendingFilter === "Y" ? hasPending : !hasPending);
+    return matchesProfessor && matchesClassName && matchesTaFull && matchesPending;
   }).map((row) => ({
     ...row,
     professor_emails: normalizeTeacherUserIds(row.teacher_user_id).map((id) => professorEmailMap.get(id)).filter(Boolean).join(",")
@@ -3178,37 +3481,65 @@ function taAdminAllClassesPage(res, user, notice, professorFilter, classNameFilt
       <td>${escapeHtml(row.class_name)}</td>
       <td>${escapeHtml(row.teacher_name)}</td>
       <td>${escapeHtml(row.semester)}</td>
-      <td>${applyWindowText(row)}</td>
+      <td>${classOpenStatusLabel(row)}</td>
+      <td>${isFull ? "已满" : "-"}</td>
       <td>${scheduleRows.length}</td>
-      <td>${scheduleSummary(scheduleRows, `taadmin-${row.class_id}`)}</td>
+      <td>${scheduleSummary(scheduleRows, `taadmin-${row.class_id}`, { showPreview: false })}</td>
       <td>${row.approved_count} / ${row.maximum_number_of_tas_admitted}</td>
       <td>${row.application_count}</td>
       <td>${row.pending_taadmin_count}</td>
+      <td>${row.published_to_professor === "Y" ? "已发送" : "否"}</td>
       <td>${escapeHtml(row.ta_applications_allowed)}</td>
       <td>${escapeHtml(row.is_conflict_allowed || "N")}</td>
-      <td><a class="button-link secondary rect" href="/admin/ta/classes/${row.class_id}/applications">查看并审核</a></td>
+      <td><a class="button-link secondary rect action-button" href="/admin/ta/classes/${row.class_id}/applications">审核</a></td>
     </tr>`;
   }).join("");
   sendHtml(res, pageLayout("全部教学班", `
     <section class="card">
       <h2>筛选教学班</h2>
       <form method="get" action="/admin/ta/classes">
-        <div class="grid">
-          <p><label>教授名<input name="professor_name" value="${escapeHtml(professorFilter || "")}" /></label></p>
-          <p><label>教学班名称<input name="class_name" value="${escapeHtml(classNameFilter || "")}" /></label></p>
+        <div class="filters-grid">
+          <p><label>教授名<input name="professor_name" value="${escapeHtml(filters.professor_name || "")}" /></label></p>
+          <p><label>教学班名称<input name="class_name" value="${escapeHtml(filters.class_name || "")}" /></label></p>
+          <p><label>TA 已满<select name="ta_full">
+            <option value="" ${!filters.ta_full ? "selected" : ""}>全部</option>
+            <option value="Y" ${filters.ta_full === "Y" ? "selected" : ""}>已满</option>
+            <option value="N" ${filters.ta_full === "N" ? "selected" : ""}>未满</option>
+          </select></label></p>
+          <p><label>有待TAAdmin申请<select name="has_pending">
+            <option value="" ${!filters.has_pending ? "selected" : ""}>全部</option>
+            <option value="Y" ${filters.has_pending === "Y" ? "selected" : ""}>有</option>
+            <option value="N" ${filters.has_pending === "N" ? "selected" : ""}>无</option>
+          </select></label></p>
         </div>
         <div class="actions">
-          <button type="submit">筛选</button>
-          <a class="button-link secondary rect" href="/admin/ta/classes">重置</a>
+          <button class="secondary action-button" type="submit">筛选</button>
+          <a class="button-link secondary rect action-button" href="/admin/ta/classes">重置</a>
         </div>
       </form>
     </section>
     <section class="card">
-      <h2>邮件提醒 Professor</h2>
+      <h2>发布至教授</h2>
       <form method="post" action="/admin/ta/classes/email-preview" onsubmit="return submitSelectedTaClasses(this);">
         <input type="hidden" name="class_refs" />
-        <p class="muted">勾选一个或多个教学班后，生成发给 Professor 的邮件预览。邮件正文会列出所选教学班。</p>
-        <button type="submit">生成邮件</button>
+        <p class="muted">勾选一个或多个教学班后，先生成发给 Professor 的邮件预览。检查无误后，可在预览页点击“发送邮件”。系统会按教授分别发送，并 CC 当前 TAAdmin。</p>
+        <div class="actions">
+          <button type="submit">生成邮件预览</button>
+        </div>
+      </form>
+      <form method="post" action="/admin/ta/classes/batch-publish" onsubmit="return submitSelectedTaClasses(this);" style="margin-top:16px;">
+        <input type="hidden" name="class_refs" />
+        <div class="grid">
+          <p><label>发布至教授
+            <select name="published_to_professor">
+              <option value="Y">已发送</option>
+              <option value="N">未通知</option>
+            </select>
+          </label></p>
+        </div>
+        <div class="actions">
+          <button class="secondary rect" type="submit">批量修改发布状态</button>
+        </div>
       </form>
     </section>
     <section class="card">
@@ -3217,7 +3548,30 @@ function taAdminAllClassesPage(res, user, notice, professorFilter, classNameFilt
         <label><input type="checkbox" id="select-all-ta-classes" /> 全选当前列表</label>
         <span class="muted">已选 <strong id="selected-ta-class-count">0</strong> 个教学班</span>
       </div>
-      <table><tr><th>选择</th><th>代码</th><th>缩写</th><th>课程名</th><th>教学班</th><th>教授</th><th>学期</th><th>开放时间</th><th>排课数</th><th>排课明细</th><th>已通过/上限</th><th>申请数</th><th>待TAAdmin审批申请数</th><th>开放申请</th><th>允许冲突</th><th>操作</th></tr>${tableRows}</table>
+      <div class="table-wrap">
+        <table class="wide compact-table fixed-layout">
+          <colgroup>
+            <col style="width:56px;" />
+            <col style="width:120px;" />
+            <col style="width:96px;" />
+            <col style="width:140px;" />
+            <col style="width:180px;" />
+            <col style="width:160px;" />
+            <col style="width:96px;" />
+            <col style="width:96px;" />
+            <col style="width:84px;" />
+            <col style="width:68px;" />
+            <col style="width:108px;" />
+            <col style="width:112px;" />
+            <col style="width:84px;" />
+            <col style="width:110px;" />
+            <col style="width:96px;" />
+            <col style="width:88px;" />
+            <col style="width:96px;" />
+            <col style="width:96px;" />
+          </colgroup>
+          <tr><th>选择</th><th>代码</th><th>缩写</th><th>课程名</th><th>教学班</th><th>教授</th><th>学期</th><th>开放状态</th><th>TA已满</th><th>排课数</th><th>排课安排</th><th>已通过/上限</th><th>申请数</th><th>待TAAdmin审批</th><th>发布至教授</th><th>开放申请</th><th>允许冲突</th><th>操作</th></tr>${tableRows}</table>
+      </div>
     </section>
     <script>
       (() => {
@@ -3284,13 +3638,12 @@ async function taAdminProfessorEmailPreview(req, res, user, notice) {
     const token = createLoginToken(db, professor.user_id, "/professor/pending");
     const accessLink = `${baseUrl}/magic-login?token=${token}`;
     const emailDraft = buildProfessorEmailDraft(professor, classes, accessLink);
-    const mailtoHref = `mailto:${professor.email}?subject=${encodeURIComponent(emailDraft.subject)}&body=${encodeURIComponent(emailDraft.body)}`;
     return `
       <section class="card">
         <h3>${escapeHtml(professor.user_name)}</h3>
         <p>收件人：${escapeHtml(emailDraft.to)}</p>
+        <p>抄送：${escapeHtml(user.email || "未设置")}</p>
         <p>主题：${escapeHtml(emailDraft.subject)}</p>
-        <p><a class="button-link rect" href="${mailtoHref}">打开邮件客户端发送</a></p>
         <pre style="white-space:pre-wrap;">${escapeHtml(emailDraft.body)}</pre>
       </section>
     `;
@@ -3299,7 +3652,14 @@ async function taAdminProfessorEmailPreview(req, res, user, notice) {
   sendHtml(res, pageLayout("邮件预览", `
     <section class="card">
       <h2>Professor 邮件预览</h2>
-      <p class="muted">系统会按教授分别生成专属邮件和免登录审核链接。请勿转发邮件内容和链接。</p>
+      <p class="muted">系统会按教授分别生成专属邮件和免登录审核链接，并 CC 当前 TAAdmin。请勿转发邮件内容和链接。</p>
+      <form method="post" action="/admin/ta/classes/send-email">
+        <input type="hidden" name="class_refs" value="${escapeHtml(selectedClasses.map((row) => row.class_id).join(","))}" />
+        <div class="actions">
+          <button type="submit">发送邮件</button>
+          <a class="button-link secondary" href="/admin/ta/classes">返回全部教学班</a>
+        </div>
+      </form>
     </section>
     ${draftCards || `<section class="card"><p class="muted">所选教学班未匹配到可用的 Professor 邮箱。</p></section>`}
     <section class="card">
@@ -3307,6 +3667,50 @@ async function taAdminProfessorEmailPreview(req, res, user, notice) {
       <table><tr><th>代码</th><th>课程名</th><th>教学班</th><th>教授</th></tr>${classRows}</table>
     </section>
   `, user, notice));
+}
+
+async function taAdminSendProfessorEmails(req, res, user) {
+  const body = await readBody(req);
+  const refs = parseBatchClassRefs(body.class_refs);
+  if (!refs.length) {
+    return redirect(res, "/admin/ta/classes?notice=请先勾选至少一个教学班");
+  }
+  const db = getDb();
+  const selectedClasses = loadClassRowsByRefs(db, refs);
+  if (!selectedClasses.length) {
+    db.close();
+    return redirect(res, "/admin/ta/classes?notice=未匹配到任何教学班");
+  }
+  const baseUrl = `http://${req.headers.host || `127.0.0.1:${PORT}`}`;
+  try {
+    await sendProfessorNotificationEmails(db, selectedClasses, user, baseUrl);
+  } catch (error) {
+    db.close();
+    return redirect(res, `/admin/ta/classes?notice=${error.message}`);
+  }
+  db.close();
+  redirect(res, "/admin/ta/classes?notice=邮件已发送，教学班已发布至 Professor");
+}
+
+async function batchUpdateProfessorPublishStatus(req, res) {
+  const body = await readBody(req);
+  const refs = parseBatchClassRefs(body.class_refs);
+  const nextValue = String(body.published_to_professor || "N").trim() === "Y" ? "Y" : "N";
+  if (!refs.length) {
+    return redirect(res, "/admin/ta/classes?notice=请先勾选至少一个教学班");
+  }
+  const db = getDb();
+  const selectedClasses = loadClassRowsByRefs(db, refs);
+  if (!selectedClasses.length) {
+    db.close();
+    return redirect(res, "/admin/ta/classes?notice=未匹配到任何教学班");
+  }
+  const updateStmt = db.prepare("update classes set published_to_professor = ?, professor_notified_at = ? where class_id = ?");
+  for (const row of selectedClasses) {
+    updateStmt.run(nextValue, nextValue === "Y" ? nowStr() : null, row.class_id);
+  }
+  db.close();
+  redirect(res, `/admin/ta/classes?notice=已批量更新 ${selectedClasses.length} 个教学班的发布状态`);
 }
 
 function taAdminClassApplicationsPage(res, user, classId, notice) {
@@ -4378,11 +4782,24 @@ async function handleRequest(req, res) {
 
   if (pathname === "/admin/ta/pending") {
     if (!requireRole(res, user, ["TAAdmin"])) return;
-    return taAdminPendingPage(res, user, notice);
+    return taAdminPendingPage(res, user, notice, {
+      applier_name: url.searchParams.get("applier_name") || "",
+      class_name: url.searchParams.get("class_name") || "",
+      teacher_name: url.searchParams.get("teacher_name") || ""
+    });
   }
   if (pathname === "/admin/ta/applications") {
     if (!requireRole(res, user, ["TAAdmin"])) return;
-    return taAdminAllApplicationsPage(res, user, notice);
+    return taAdminAllApplicationsPage(res, user, notice, {
+      applier_name: url.searchParams.get("applier_name") || "",
+      class_name: url.searchParams.get("class_name") || "",
+      teacher_name: url.searchParams.get("teacher_name") || "",
+      status: url.searchParams.get("status") || ""
+    });
+  }
+  if (pathname === "/admin/ta/pending/batch-approve" && req.method === "POST") {
+    if (!requireRole(res, user, ["TAAdmin"])) return;
+    return taAdminBatchApprove(req, res, user);
   }
   if (/^\/admin\/ta\/applications\/\d+\/override-status$/.test(pathname) && req.method === "POST") {
     if (!requireRole(res, user, ["TAAdmin"])) return;
@@ -4390,13 +4807,12 @@ async function handleRequest(req, res) {
   }
   if (pathname === "/admin/ta/classes") {
     if (!requireRole(res, user, ["TAAdmin"])) return;
-    return taAdminAllClassesPage(
-      res,
-      user,
-      notice,
-      url.searchParams.get("professor_name") || "",
-      url.searchParams.get("class_name") || ""
-    );
+    return taAdminAllClassesPage(res, user, notice, {
+      professor_name: url.searchParams.get("professor_name") || "",
+      class_name: url.searchParams.get("class_name") || "",
+      ta_full: url.searchParams.get("ta_full") || "",
+      has_pending: url.searchParams.get("has_pending") || ""
+    });
   }
   if (/^\/admin\/ta\/classes\/\d+\/applications$/.test(pathname)) {
     if (!requireRole(res, user, ["TAAdmin"])) return;
@@ -4405,6 +4821,14 @@ async function handleRequest(req, res) {
   if (pathname === "/admin/ta/classes/email-preview" && req.method === "POST") {
     if (!requireRole(res, user, ["TAAdmin"])) return;
     return taAdminProfessorEmailPreview(req, res, user, notice);
+  }
+  if (pathname === "/admin/ta/classes/send-email" && req.method === "POST") {
+    if (!requireRole(res, user, ["TAAdmin"])) return;
+    return taAdminSendProfessorEmails(req, res, user);
+  }
+  if (pathname === "/admin/ta/classes/batch-publish" && req.method === "POST") {
+    if (!requireRole(res, user, ["TAAdmin"])) return;
+    return batchUpdateProfessorPublishStatus(req, res);
   }
   if (/^\/admin\/ta\/classes\/\d+\/applications\/approve$/.test(pathname) && req.method === "POST") {
     if (!requireRole(res, user, ["TAAdmin"])) return;

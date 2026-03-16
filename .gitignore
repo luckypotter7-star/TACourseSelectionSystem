@@ -9,3 +9,4 @@ node-v22.22.1-darwin-arm64.tar.xz
 uploads/
 screenshots/
 doc_updates/
+.env.local
