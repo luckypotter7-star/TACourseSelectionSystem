@@ -8,6 +8,7 @@
   },
   "dependencies": {
     "nodemailer": "^8.0.2",
+    "puppeteer-core": "^24.39.1",
     "xlsx": "^0.18.5"
   }
 }
