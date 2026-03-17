@@ -18,6 +18,7 @@ const DB_PATH = path.join(BASE_DIR, "ta_system_node.db");
 const UPLOAD_DIR = path.join(BASE_DIR, "uploads");
 const LOCAL_ENV_PATH = path.join(BASE_DIR, ".env.local");
 const PORT = 3000;
+const HOST = process.env.HOST || "127.0.0.1";
 const sessions = new Map();
 const importReports = new Map();
 const MAX_UPLOAD_SIZE = 5 * 1024 * 1024;
@@ -752,6 +753,7 @@ function pageLayout(title, body, user, notice) {
   <html lang="zh-CN">
   <head>
     <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
     <title>${escapeHtml(title)}</title>
     <style>
       :root {
@@ -803,6 +805,7 @@ function pageLayout(title, body, user, notice) {
         flex-wrap: wrap;
         justify-content: flex-end;
         gap: 10px;
+        min-width: 0;
       }
       .nav-links a {
         padding: 10px 14px;
@@ -810,6 +813,7 @@ function pageLayout(title, body, user, notice) {
         color: #174ea6;
         background: transparent;
         font-weight: 500;
+        white-space: nowrap;
       }
       .nav-links a:hover {
         background: var(--accent-soft);
@@ -879,7 +883,11 @@ function pageLayout(title, body, user, notice) {
       tr.row-soft-purple:hover td { background: #e4efff; }
       tr.row-soft-red td { background: #f4f6f8; }
       tr.row-soft-red:hover td { background: #eceff3; }
-      .table-wrap { overflow-x: auto; }
+      .table-wrap {
+        overflow-x: auto;
+        -webkit-overflow-scrolling: touch;
+        scrollbar-gutter: stable both-edges;
+      }
       table.wide { min-width: 1320px; }
       table.compact-table th {
         font-size: 11px;
@@ -898,10 +906,10 @@ function pageLayout(title, body, user, notice) {
       .class-card-grid {
         display: grid;
         gap: 16px;
-        grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+        grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
       }
       .class-card {
-        padding: 16px 16px 14px;
+        padding: 14px 14px 12px;
         border-radius: 18px;
       }
       .class-card h3 {
@@ -1019,6 +1027,7 @@ function pageLayout(title, body, user, notice) {
         border-radius: 24px;
         padding: 0;
         width: min(720px, calc(100vw - 32px));
+        max-height: min(88vh, 900px);
         box-shadow: 0 20px 60px rgba(32, 33, 36, 0.24);
       }
       .schedule-dialog::backdrop {
@@ -1027,6 +1036,8 @@ function pageLayout(title, body, user, notice) {
       }
       .schedule-dialog-body {
         padding: 22px;
+        overflow-y: auto;
+        max-height: min(88vh, 900px);
       }
       .compact-stack {
         display: flex;
@@ -1127,6 +1138,60 @@ function pageLayout(title, body, user, notice) {
         white-space: nowrap;
       }
       .actions { display: flex; gap: 8px; flex-wrap: wrap; }
+      .mobile-only { display: none; }
+      .desktop-only { display: block; }
+      .mobile-card-list {
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+      }
+      .mobile-data-card {
+        border: 1px solid var(--line);
+        border-radius: 18px;
+        background: #fff;
+        padding: 14px;
+        box-shadow: 0 1px 2px rgba(60, 64, 67, 0.08);
+      }
+      .mobile-data-card h3 {
+        margin: 0 0 10px;
+        font-size: 16px;
+        line-height: 1.35;
+      }
+      .mobile-data-card .mobile-meta {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px;
+        margin-bottom: 10px;
+      }
+      .mobile-data-card .mobile-meta span {
+        display: inline-flex;
+        align-items: center;
+        padding: 4px 8px;
+        border-radius: 999px;
+        background: #eef3fd;
+        color: #355070;
+        font-size: 11px;
+      }
+      .mobile-data-list {
+        display: grid;
+        gap: 8px;
+      }
+      .mobile-data-row {
+        display: grid;
+        grid-template-columns: 88px minmax(0, 1fr);
+        gap: 10px;
+        align-items: start;
+      }
+      .mobile-data-label {
+        color: var(--muted);
+        font-size: 12px;
+        line-height: 1.5;
+      }
+      .mobile-data-value {
+        font-size: 13px;
+        line-height: 1.55;
+        word-break: break-word;
+      }
       .split { display: grid; grid-template-columns: 2fr 1fr; gap: 18px; }
       .hero {
         display: grid;
@@ -1140,6 +1205,22 @@ function pageLayout(title, body, user, notice) {
         flex-direction: column;
         justify-content: center;
         background: linear-gradient(135deg, #e8f0fe, #f8fbff 58%, #e6f4ea);
+      }
+      .hero-panel .hero-pills {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        margin-top: 8px;
+      }
+      .hero-panel .hero-pills span {
+        display: inline-flex;
+        align-items: center;
+        padding: 6px 10px;
+        border-radius: 999px;
+        background: rgba(255, 255, 255, 0.7);
+        color: #355070;
+        font-size: 12px;
+        font-weight: 600;
       }
       .hero-panel h2 {
         font-size: 34px;
@@ -1162,6 +1243,152 @@ function pageLayout(title, body, user, notice) {
         main { padding-left: 18px; padding-right: 18px; }
         .split, .hero { grid-template-columns: 1fr; }
         .hero-panel, .login-card { min-height: auto; }
+        .nav-links {
+          width: 100%;
+          flex-wrap: nowrap;
+          overflow-x: auto;
+          padding-bottom: 4px;
+          justify-content: flex-start;
+        }
+        .nav-links::-webkit-scrollbar {
+          height: 6px;
+        }
+        .nav-links::-webkit-scrollbar-thumb {
+          background: #d6dfef;
+          border-radius: 999px;
+        }
+        .card {
+          padding: 18px;
+          border-radius: 20px;
+        }
+        .table-wrap {
+          margin-left: -6px;
+          margin-right: -6px;
+          padding-left: 6px;
+          padding-right: 6px;
+        }
+        table.compact-table th {
+          font-size: 10px;
+          padding: 9px 7px;
+        }
+        table.compact-table td {
+          font-size: 12px;
+          padding: 9px 7px;
+        }
+        button, .button-link {
+          min-width: 76px;
+          padding: 10px 14px;
+          font-size: 13px;
+        }
+      }
+      @media (max-width: 720px) {
+        body {
+          font-size: 14px;
+        }
+        .topbar {
+          padding: 14px 14px 12px;
+          gap: 12px;
+        }
+        .brand h1 {
+          font-size: 20px;
+        }
+        .brand p {
+          font-size: 12px;
+        }
+        main {
+          padding: 16px 14px 32px;
+        }
+        .notice {
+          margin-top: 12px;
+          border-radius: 14px;
+          padding: 12px 14px;
+        }
+        .card {
+          padding: 16px;
+          border-radius: 18px;
+          margin-bottom: 14px;
+        }
+        h2 {
+          font-size: 20px;
+        }
+        h3 {
+          font-size: 17px;
+        }
+        .grid {
+          grid-template-columns: 1fr;
+        }
+        .class-card-grid {
+          grid-template-columns: 1fr;
+          gap: 12px;
+        }
+        .hero-panel .hero-pills span {
+          font-size: 11px;
+          padding: 5px 8px;
+        }
+        .class-card {
+          padding: 14px 14px 12px;
+        }
+        .class-card h3 {
+          font-size: 15px;
+        }
+        .class-card p {
+          font-size: 12px;
+          margin-bottom: 5px;
+        }
+        .class-card-meta {
+          gap: 5px;
+          margin-bottom: 6px;
+        }
+        .class-card-meta span {
+          font-size: 10px;
+          padding: 4px 7px;
+        }
+        label {
+          font-size: 13px;
+        }
+        input, select, textarea {
+          padding: 11px 12px;
+          border-radius: 12px;
+        }
+        .actions {
+          width: 100%;
+          gap: 8px;
+        }
+        .actions a,
+        .actions button {
+          flex: 1 1 auto;
+        }
+        .schedule-dialog {
+          width: calc(100vw - 16px);
+          border-radius: 18px;
+        }
+        .schedule-dialog-body {
+          padding: 16px;
+        }
+        .desktop-only {
+          display: none !important;
+        }
+        .mobile-only {
+          display: block;
+        }
+        .mobile-data-card {
+          padding: 12px;
+          border-radius: 16px;
+        }
+        .mobile-data-card h3 {
+          font-size: 15px;
+          margin-bottom: 8px;
+        }
+        .mobile-data-row {
+          grid-template-columns: 72px minmax(0, 1fr);
+          gap: 8px;
+        }
+        .mobile-data-label {
+          font-size: 11px;
+        }
+        .mobile-data-value {
+          font-size: 12px;
+        }
       }
     </style>
   </head>
@@ -1221,6 +1448,12 @@ function loginPage(res, notice) {
         <h2>TA选课申请系统</h2>
         <p>系统覆盖 TA 申请、TAAdmin 初审、Professor 终审、教学班开放时间控制，以及课程与人员管理。</p>
         <p>当前版本已支持多条排课记录、附件上传、站内通知、批量设置和批量删除等核心流程。</p>
+        <div class="hero-pills">
+          <span>TA 申请</span>
+          <span>TAAdmin 审核</span>
+          <span>Professor 终审</span>
+          <span>手机端可用</span>
+        </div>
       </section>
       <section class="card login-card">
         <h2>登录</h2>
@@ -2278,7 +2511,44 @@ function taApplicationsPage(res, user, notice) {
       ${app.status === "PendingTAAdmin" ? `<form class="inline" method="post" action="/ta/applications/${app.application_id}/withdraw" onsubmit="return confirm('确认撤销这条申请吗？撤销后需要重新提交申请。');"><button class="danger action-button" type="submit">撤销</button></form>` : ""}
     </td>
   </tr>`).join("");
-  sendHtml(res, pageLayout("我的申请", `<section class="card"><h2>我的申请</h2><table><tr><th>教学班</th><th>申请时间</th><th>状态</th><th>TAAdmin 备注</th><th>Professor 备注</th><th>操作</th></tr>${rows}</table></section>`, user, notice));
+  const cards = apps.map((app) => `
+    <article class="mobile-data-card">
+      <h3>${escapeHtml(app.class_name)}</h3>
+      <div class="mobile-meta">
+        <span>${escapeHtml(statusLabels[app.status])}</span>
+        <span>${escapeHtml(app.submitted_at)}</span>
+      </div>
+      <div class="mobile-data-list">
+        <div class="mobile-data-row">
+          <div class="mobile-data-label">TA备注</div>
+          <div class="mobile-data-value">${escapeHtml(app.ta_comment || "-")}</div>
+        </div>
+        <div class="mobile-data-row">
+          <div class="mobile-data-label">教授备注</div>
+          <div class="mobile-data-value">${escapeHtml(app.prof_comment || "-")}</div>
+        </div>
+      </div>
+      <div class="actions" style="margin-top:12px;">
+        <a class="button-link secondary action-button" href="/ta/applications/${app.application_id}">详情</a>
+        ${app.status === "PendingTAAdmin" ? `<form class="inline" method="post" action="/ta/applications/${app.application_id}/withdraw" onsubmit="return confirm('确认撤销这条申请吗？撤销后需要重新提交申请。');"><button class="danger action-button" type="submit">撤销</button></form>` : ""}
+      </div>
+    </article>
+  `).join("");
+  sendHtml(res, pageLayout("我的申请", `
+    <section class="card">
+      <h2>我的申请</h2>
+      <div class="desktop-only">
+        <div class="table-wrap">
+          <table>
+            <tr><th>教学班</th><th>申请时间</th><th>状态</th><th>TAAdmin 备注</th><th>Professor 备注</th><th>操作</th></tr>${rows}
+          </table>
+        </div>
+      </div>
+      <div class="mobile-only">
+        ${cards ? `<div class="mobile-card-list">${cards}</div>` : `<p class="muted">你还没有提交过申请。</p>`}
+      </div>
+    </section>
+  `, user, notice));
 }
 
 function taApplicationDetailPage(res, user, applicationId, notice) {
@@ -2735,7 +3005,11 @@ function professorPendingPage(res, user, notice) {
       const remaining = Math.max(0, Number(row.maximum_number_of_tas_admitted) - Number(row.approved_count));
       return `<section class="card">
         <h2>${escapeHtml(row.course_name)} / ${escapeHtml(row.class_name)}</h2>
-        <p><span class="pill">${escapeHtml(row.semester)}</span> 教授：${escapeHtml(row.teacher_name)}</p>
+        <div class="class-card-meta">
+          <span>${escapeHtml(row.semester)}</span>
+          <span>${escapeHtml(row.teacher_name)}</span>
+          <span>待审核 ${row.pending_count}</span>
+        </div>
         <p class="muted">当前共有 <strong>${row.application_count}</strong> 份申请，其中待审核 <strong>${row.pending_count}</strong> 份，已通过 <strong>${row.approved_count}</strong> / ${row.maximum_number_of_tas_admitted}，剩余名额 <strong>${remaining}</strong> 个。</p>
         <p class="muted">当你继续通过申请并达到该教学班 TA 上限时，系统会自动拒绝该教学班其余待审核申请，拒绝理由为“该课程TA已满”。</p>
         ${scheduleSummary(schedulesByClass.get(row.class_id) || [], `professor-${row.class_id}`)}
@@ -2775,10 +3049,31 @@ function professorClassReviewPage(res, user, classId, notice) {
     <td>${escapeHtml(app.ta_comment || "")}</td>
     <td><a href="/professor/pending/${app.application_id}">查看申请</a></td>
   </tr>`).join("");
+  const cards = apps.map((app) => `
+    <article class="mobile-data-card">
+      <h3>${escapeHtml(app.applier_name)}</h3>
+      <div class="mobile-meta">
+        <span>${escapeHtml(statusLabels[app.status] || app.status)}</span>
+        <span>${escapeHtml(app.submitted_at)}</span>
+      </div>
+      <div class="mobile-data-list">
+        <div class="mobile-data-row">
+          <div class="mobile-data-label">TA备注</div>
+          <div class="mobile-data-value">${escapeHtml(app.ta_comment || "-")}</div>
+        </div>
+      </div>
+      <div class="actions" style="margin-top:12px;">
+        <a class="button-link secondary action-button" href="/professor/pending/${app.application_id}">查看申请</a>
+      </div>
+    </article>
+  `).join("");
   sendHtml(res, pageLayout("教学班审核", `
     <section class="card">
       <h2>${escapeHtml(classRow.course_name)} / ${escapeHtml(classRow.class_name)}</h2>
-      <p><span class="pill">${escapeHtml(classRow.semester)}</span> 教授：${escapeHtml(classRow.teacher_name)}</p>
+      <div class="class-card-meta">
+        <span>${escapeHtml(classRow.semester)}</span>
+        <span>${escapeHtml(classRow.teacher_name)}</span>
+      </div>
       <p class="muted">当前已通过 <strong>${approvedCount}</strong> / ${classRow.maximum_number_of_tas_admitted}，剩余名额 <strong>${remaining}</strong> 个。</p>
       <div class="notice" style="margin:16px 0 0;">
         当你继续通过申请并达到该教学班 TA 上限时，系统会自动拒绝该教学班其余待审核申请，拒绝理由为“该课程TA已满”。
@@ -2790,7 +3085,14 @@ function professorClassReviewPage(res, user, classId, notice) {
     </section>
     <section class="card">
       <h3>该教学班全部申请</h3>
-      <table><tr><th>申请人</th><th>申请时间</th><th>状态</th><th>TAAdmin 备注</th><th>操作</th></tr>${rows}</table>
+      <div class="desktop-only">
+        <div class="table-wrap">
+          <table><tr><th>申请人</th><th>申请时间</th><th>状态</th><th>TAAdmin 备注</th><th>操作</th></tr>${rows}</table>
+        </div>
+      </div>
+      <div class="mobile-only">
+        ${cards ? `<div class="mobile-card-list">${cards}</div>` : `<p class="muted">当前没有申请记录。</p>`}
+      </div>
     </section>
   `, user, notice));
 }
@@ -3035,6 +3337,52 @@ function courseClassesPage(res, user, notice, filters = {}) {
     </td>
   </tr>`;
   }).join("");
+  const mobileCards = rows.map((row) => {
+    const scheduleRows = schedulesByClass.get(row.class_id) || [];
+    const isFull = Number(row.approved_count || 0) >= Number(row.maximum_number_of_tas_admitted || 0);
+    return `
+      <article class="mobile-data-card ${isFull ? "card-soft-purple" : ""}">
+        <div class="actions" style="justify-content:space-between; align-items:center; margin-bottom:10px;">
+          <label><input type="checkbox" class="class-select" value="${row.class_id}" /> 选择</label>
+          <span class="pill">${isFull ? "TA已满" : escapeHtml(classOpenStatusLabel(row))}</span>
+        </div>
+        <h3>${escapeHtml(row.course_name)} / ${escapeHtml(row.class_name)}</h3>
+        <div class="mobile-meta">
+          <span>${escapeHtml(row.class_code)}</span>
+          ${row.class_abbr ? `<span>${escapeHtml(row.class_abbr)}</span>` : ""}
+          <span>${escapeHtml(row.semester)}</span>
+        </div>
+        <div class="mobile-data-list">
+          <div class="mobile-data-row">
+            <div class="mobile-data-label">教授</div>
+            <div class="mobile-data-value">${escapeHtml(row.teacher_name)}</div>
+          </div>
+          <div class="mobile-data-row">
+            <div class="mobile-data-label">已通过</div>
+            <div class="mobile-data-value">${row.approved_count} / ${row.maximum_number_of_tas_admitted}</div>
+          </div>
+          <div class="mobile-data-row">
+            <div class="mobile-data-label">申请数</div>
+            <div class="mobile-data-value">${row.application_count}</div>
+          </div>
+          <div class="mobile-data-row">
+            <div class="mobile-data-label">开放申请</div>
+            <div class="mobile-data-value">${escapeHtml(row.ta_applications_allowed)} / 允许冲突 ${escapeHtml(row.is_conflict_allowed || "N")}</div>
+          </div>
+          <div class="mobile-data-row">
+            <div class="mobile-data-label">排课安排</div>
+            <div class="mobile-data-value">${scheduleRows.length} 条</div>
+          </div>
+        </div>
+        <div class="actions" style="margin-top:12px;">
+          ${scheduleSummary(scheduleRows, `course-mobile-${row.class_id}`, { showPreview: false })}
+          <a class="button-link secondary action-button" href="/course/classes/${row.class_id}">修改</a>
+          <a class="button-link secondary action-button" href="/course/classes/${row.class_id}/applications">查看</a>
+          <a class="button-link danger action-button" href="/course/classes/${row.class_id}/delete">删除</a>
+        </div>
+      </article>
+    `;
+  }).join("");
   db.close();
   sendHtml(res, pageLayout("教学班管理", `
     <section class="card">
@@ -3149,27 +3497,33 @@ function courseClassesPage(res, user, notice, filters = {}) {
         <label><input type="checkbox" id="select-all-classes" /> 全选当前列表</label>
         <span class="muted">已选 <strong id="selected-class-count">0</strong> 个教学班</span>
       </div>
-      <div class="table-wrap">
-        <table class="wide compact-table fixed-layout">
-          <colgroup>
-            <col style="width:56px;" />
-            <col style="width:120px;" />
-            <col style="width:96px;" />
-            <col style="width:140px;" />
-            <col style="width:180px;" />
-            <col style="width:160px;" />
-            <col style="width:96px;" />
-            <col style="width:96px;" />
-            <col style="width:84px;" />
-            <col style="width:68px;" />
-            <col style="width:108px;" />
-            <col style="width:112px;" />
-            <col style="width:84px;" />
-            <col style="width:88px;" />
-            <col style="width:96px;" />
-            <col style="width:260px;" />
-          </colgroup>
-          <tr><th>选择</th><th>${sortableHeader("教学班代码", "class_code", "/course/classes", headerFilters, sortBy, sortOrder)}</th><th>缩写</th><th>课程名</th><th>${sortableHeader("教学班名称", "class_name", "/course/classes", headerFilters, sortBy, sortOrder)}</th><th>${sortableHeader("教授", "teacher_name", "/course/classes", headerFilters, sortBy, sortOrder)}</th><th>学期</th><th>${sortableHeader("开放状态", "status_filter", "/course/classes", headerFilters, sortBy, sortOrder)}</th><th>${sortableHeader("TA已满", "ta_full", "/course/classes", headerFilters, sortBy, sortOrder)}</th><th>排课数</th><th>排课安排</th><th>${sortableHeader("已通过/上限", "approved_count", "/course/classes", headerFilters, sortBy, sortOrder)}</th><th>${sortableHeader("申请数", "application_count", "/course/classes", headerFilters, sortBy, sortOrder)}</th><th>开放申请</th><th>允许冲突</th><th>单条操作</th></tr>${tableRows}</table>
+      <div class="desktop-only">
+        <div class="table-wrap">
+          <table class="wide compact-table fixed-layout">
+            <colgroup>
+              <col style="width:56px;" />
+              <col style="width:120px;" />
+              <col style="width:96px;" />
+              <col style="width:140px;" />
+              <col style="width:180px;" />
+              <col style="width:160px;" />
+              <col style="width:96px;" />
+              <col style="width:96px;" />
+              <col style="width:84px;" />
+              <col style="width:68px;" />
+              <col style="width:108px;" />
+              <col style="width:112px;" />
+              <col style="width:84px;" />
+              <col style="width:88px;" />
+              <col style="width:96px;" />
+              <col style="width:260px;" />
+            </colgroup>
+            <tr><th>选择</th><th>${sortableHeader("教学班代码", "class_code", "/course/classes", headerFilters, sortBy, sortOrder)}</th><th>缩写</th><th>课程名</th><th>${sortableHeader("教学班名称", "class_name", "/course/classes", headerFilters, sortBy, sortOrder)}</th><th>${sortableHeader("教授", "teacher_name", "/course/classes", headerFilters, sortBy, sortOrder)}</th><th>学期</th><th>${sortableHeader("开放状态", "status_filter", "/course/classes", headerFilters, sortBy, sortOrder)}</th><th>${sortableHeader("TA已满", "ta_full", "/course/classes", headerFilters, sortBy, sortOrder)}</th><th>排课数</th><th>排课安排</th><th>${sortableHeader("已通过/上限", "approved_count", "/course/classes", headerFilters, sortBy, sortOrder)}</th><th>${sortableHeader("申请数", "application_count", "/course/classes", headerFilters, sortBy, sortOrder)}</th><th>开放申请</th><th>允许冲突</th><th>单条操作</th></tr>${tableRows}
+          </table>
+        </div>
+      </div>
+      <div class="mobile-only">
+        ${mobileCards ? `<div class="mobile-card-list">${mobileCards}</div>` : `<p class="muted">当前没有符合条件的教学班。</p>`}
       </div>
     </section>
     <script>
@@ -3494,6 +3848,58 @@ function taAdminAllClassesPage(res, user, notice, filters = {}) {
       <td><a class="button-link secondary rect action-button" href="/admin/ta/classes/${row.class_id}/applications">审核</a></td>
     </tr>`;
   }).join("");
+  const mobileCards = rows.map((row) => {
+    const scheduleRows = schedulesByClass.get(row.class_id) || [];
+    const isFull = isClassCapacityReached(row, row.approved_count);
+    return `
+      <article class="mobile-data-card ${isFull ? "card-soft-purple" : ""}">
+        <div class="actions" style="justify-content:space-between; align-items:center; margin-bottom:10px;">
+          <label><input type="checkbox" class="ta-class-select" value="${row.class_id}" /> 选择</label>
+          <span class="pill">${row.published_to_professor === "Y" ? "已发送" : "未发送"}</span>
+        </div>
+        <h3>${escapeHtml(row.course_name)} / ${escapeHtml(row.class_name)}</h3>
+        <div class="mobile-meta">
+          <span>${escapeHtml(row.teacher_name)}</span>
+          <span>${escapeHtml(row.semester)}</span>
+          <span>${isFull ? "TA已满" : "未满"}</span>
+        </div>
+        <div class="mobile-data-list">
+          <div class="mobile-data-row">
+            <div class="mobile-data-label">教学班代码</div>
+            <div class="mobile-data-value">${escapeHtml(row.class_code)}${row.class_abbr ? ` / ${escapeHtml(row.class_abbr)}` : ""}</div>
+          </div>
+          <div class="mobile-data-row">
+            <div class="mobile-data-label">开放状态</div>
+            <div class="mobile-data-value">${escapeHtml(classOpenStatusLabel(row))}</div>
+          </div>
+          <div class="mobile-data-row">
+            <div class="mobile-data-label">已通过/上限</div>
+            <div class="mobile-data-value">${row.approved_count} / ${row.maximum_number_of_tas_admitted}</div>
+          </div>
+          <div class="mobile-data-row">
+            <div class="mobile-data-label">申请情况</div>
+            <div class="mobile-data-value">总申请 ${row.application_count}，待TAAdmin ${row.pending_taadmin_count}</div>
+          </div>
+          <div class="mobile-data-row">
+            <div class="mobile-data-label">发布至教授</div>
+            <div class="mobile-data-value">${row.published_to_professor === "Y" ? "已发送" : "否"}</div>
+          </div>
+          <div class="mobile-data-row">
+            <div class="mobile-data-label">开放申请</div>
+            <div class="mobile-data-value">${escapeHtml(row.ta_applications_allowed)} / 允许冲突 ${escapeHtml(row.is_conflict_allowed || "N")}</div>
+          </div>
+          <div class="mobile-data-row">
+            <div class="mobile-data-label">排课安排</div>
+            <div class="mobile-data-value">${scheduleRows.length} 条</div>
+          </div>
+        </div>
+        <div class="actions" style="margin-top:12px;">
+          ${scheduleSummary(scheduleRows, `taadmin-mobile-${row.class_id}`, { showPreview: false })}
+          <a class="button-link secondary rect action-button" href="/admin/ta/classes/${row.class_id}/applications">审核</a>
+        </div>
+      </article>
+    `;
+  }).join("");
   sendHtml(res, pageLayout("全部教学班", `
     <section class="card">
       <h2>筛选教学班</h2>
@@ -3548,29 +3954,35 @@ function taAdminAllClassesPage(res, user, notice, filters = {}) {
         <label><input type="checkbox" id="select-all-ta-classes" /> 全选当前列表</label>
         <span class="muted">已选 <strong id="selected-ta-class-count">0</strong> 个教学班</span>
       </div>
-      <div class="table-wrap">
-        <table class="wide compact-table fixed-layout">
-          <colgroup>
-            <col style="width:56px;" />
-            <col style="width:120px;" />
-            <col style="width:96px;" />
-            <col style="width:140px;" />
-            <col style="width:180px;" />
-            <col style="width:160px;" />
-            <col style="width:96px;" />
-            <col style="width:96px;" />
-            <col style="width:84px;" />
-            <col style="width:68px;" />
-            <col style="width:108px;" />
-            <col style="width:112px;" />
-            <col style="width:84px;" />
-            <col style="width:110px;" />
-            <col style="width:96px;" />
-            <col style="width:88px;" />
-            <col style="width:96px;" />
-            <col style="width:96px;" />
-          </colgroup>
-          <tr><th>选择</th><th>代码</th><th>缩写</th><th>课程名</th><th>教学班</th><th>教授</th><th>学期</th><th>开放状态</th><th>TA已满</th><th>排课数</th><th>排课安排</th><th>已通过/上限</th><th>申请数</th><th>待TAAdmin审批</th><th>发布至教授</th><th>开放申请</th><th>允许冲突</th><th>操作</th></tr>${tableRows}</table>
+      <div class="desktop-only">
+        <div class="table-wrap">
+          <table class="wide compact-table fixed-layout">
+            <colgroup>
+              <col style="width:56px;" />
+              <col style="width:120px;" />
+              <col style="width:96px;" />
+              <col style="width:140px;" />
+              <col style="width:180px;" />
+              <col style="width:160px;" />
+              <col style="width:96px;" />
+              <col style="width:96px;" />
+              <col style="width:84px;" />
+              <col style="width:68px;" />
+              <col style="width:108px;" />
+              <col style="width:112px;" />
+              <col style="width:84px;" />
+              <col style="width:110px;" />
+              <col style="width:96px;" />
+              <col style="width:88px;" />
+              <col style="width:96px;" />
+              <col style="width:96px;" />
+            </colgroup>
+            <tr><th>选择</th><th>代码</th><th>缩写</th><th>课程名</th><th>教学班</th><th>教授</th><th>学期</th><th>开放状态</th><th>TA已满</th><th>排课数</th><th>排课安排</th><th>已通过/上限</th><th>申请数</th><th>待TAAdmin审批</th><th>发布至教授</th><th>开放申请</th><th>允许冲突</th><th>操作</th></tr>${tableRows}
+          </table>
+        </div>
+      </div>
+      <div class="mobile-only">
+        ${mobileCards ? `<div class="mobile-card-list">${mobileCards}</div>` : `<p class="muted">当前没有符合条件的教学班。</p>`}
       </div>
     </section>
     <script>
@@ -5081,9 +5493,9 @@ const server = http.createServer((req, res) => {
 });
 
 if (require.main === module) {
-  server.listen(PORT, "127.0.0.1", () => {
-    console.log(`TA system MVP running at http://127.0.0.1:${PORT}`);
-  });
+server.listen(PORT, HOST, () => {
+  console.log(`TA system MVP running at http://${HOST}:${PORT}`);
+});
 }
 
 module.exports = { initDb, handleRequest, server };
