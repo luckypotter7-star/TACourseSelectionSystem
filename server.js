@@ -2,6 +2,7 @@ const http = require("node:http");
 const fs = require("node:fs");
 const path = require("node:path");
 const crypto = require("node:crypto");
+const os = require("node:os");
 const { URL } = require("node:url");
 const querystring = require("node:querystring");
 const { DatabaseSync } = require("node:sqlite");
@@ -16,9 +17,12 @@ try {
 const BASE_DIR = __dirname;
 const DB_PATH = path.join(BASE_DIR, "ta_system_node.db");
 const UPLOAD_DIR = path.join(BASE_DIR, "uploads");
+const ASSET_DIR = path.join(BASE_DIR, "assets");
 const LOCAL_ENV_PATH = path.join(BASE_DIR, ".env.local");
 const PORT = 3000;
 const HOST = process.env.HOST || "127.0.0.1";
+const SAIF_LOGO_HORIZONTAL = `/assets/${encodeURIComponent("学院logo金色版2-英文横版.png")}`;
+const SAIF_LOGO_VERTICAL = `/assets/${encodeURIComponent("学院logo金色版7-原竖版.png")}`;
 const sessions = new Map();
 const importReports = new Map();
 const MAX_UPLOAD_SIZE = 5 * 1024 * 1024;
@@ -646,6 +650,37 @@ function createLoginToken(db, userId, targetPath) {
   return token;
 }
 
+function detectLanIpAddress() {
+  const interfaces = os.networkInterfaces();
+  const candidates = [];
+  for (const items of Object.values(interfaces)) {
+    for (const item of items || []) {
+      if (!item || item.family !== "IPv4" || item.internal) continue;
+      candidates.push(item.address);
+    }
+  }
+  const privateCandidate = candidates.find((address) =>
+    address.startsWith("10.") ||
+    address.startsWith("192.168.") ||
+    /^172\.(1[6-9]|2\d|3[0-1])\./.test(address)
+  );
+  return privateCandidate || candidates[0] || "127.0.0.1";
+}
+
+function getExternalBaseUrl(req) {
+  const configuredBaseUrl = String(process.env.PUBLIC_BASE_URL || "").trim();
+  if (configuredBaseUrl) {
+    return configuredBaseUrl.replace(/\/+$/, "");
+  }
+  const forwardedProto = String(req.headers["x-forwarded-proto"] || "").split(",")[0].trim();
+  const protocol = forwardedProto || "http";
+  const hostHeader = String(req.headers["x-forwarded-host"] || req.headers.host || "").split(",")[0].trim();
+  if (hostHeader && !/^0\.0\.0\.0(?::|$)/.test(hostHeader) && !/^127\.0\.0\.1(?::|$)/.test(hostHeader) && !/^localhost(?::|$)/i.test(hostHeader)) {
+    return `${protocol}://${hostHeader}`;
+  }
+  return `${protocol}://${detectLanIpAddress()}:${PORT}`;
+}
+
 function buildProfessorEmailDraft(professor, selectedClasses, accessLink) {
   const greeting = `${professor.user_name}教授您好`;
   const classLines = selectedClasses.map((row) => `- ${row.course_name} / ${row.class_name}（${row.class_code}）`).join("\n");
@@ -757,26 +792,32 @@ function pageLayout(title, body, user, notice) {
     <title>${escapeHtml(title)}</title>
     <style>
       :root {
-        --bg: #f6f8fc;
+        --bg: #f7f4ef;
         --panel: #ffffff;
-        --panel-soft: #f8fafd;
-        --ink: #202124;
-        --muted: #5f6368;
-        --line: #dfe3eb;
-        --accent: #1a73e8;
-        --accent-soft: #e8f0fe;
-        --ok: #137333;
-        --bad: #c5221f;
-        --shadow: 0 1px 2px rgba(60, 64, 67, 0.1), 0 2px 6px rgba(60, 64, 67, 0.15);
+        --panel-soft: #f8f5f0;
+        --ink: #2b2620;
+        --muted: #6e665c;
+        --line: #ddd5ca;
+        --accent: #1a2287;
+        --accent-soft: #ebe9fb;
+        --brand-red: #c8161e;
+        --brand-red-soft: #f7d8da;
+        --brand-gold: #d2aa6e;
+        --brand-gold-soft: #f5ebdc;
+        --brand-light-gray: #bbb0a3;
+        --brand-dark-gray: #887f6f;
+        --ok: #1a2287;
+        --bad: #c8161e;
+        --shadow: 0 2px 6px rgba(68, 52, 36, 0.08), 0 8px 24px rgba(68, 52, 36, 0.1);
       }
       * { box-sizing: border-box; }
       body {
         margin: 0;
         font-family: "Google Sans", "Noto Sans SC", "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
         background:
-          radial-gradient(circle at top left, rgba(26, 115, 232, 0.08), transparent 24%),
-          radial-gradient(circle at top right, rgba(52, 168, 83, 0.08), transparent 20%),
-          linear-gradient(180deg, #f8fbff, var(--bg));
+          radial-gradient(circle at top left, rgba(26, 34, 135, 0.08), transparent 26%),
+          radial-gradient(circle at top right, rgba(210, 170, 110, 0.14), transparent 22%),
+          linear-gradient(180deg, #fbf8f3, var(--bg));
         color: var(--ink);
       }
       a { color: var(--accent); text-decoration: none; }
@@ -786,8 +827,8 @@ function pageLayout(title, body, user, notice) {
         top: 0;
         z-index: 10;
         backdrop-filter: blur(16px);
-        background: rgba(246, 248, 252, 0.9);
-        border-bottom: 1px solid rgba(223, 227, 235, 0.9);
+        background: rgba(251, 248, 243, 0.92);
+        border-bottom: 1px solid rgba(221, 213, 202, 0.95);
       }
       .topbar {
         max-width: 1360px;
@@ -798,8 +839,32 @@ function pageLayout(title, body, user, notice) {
         align-items: center;
         gap: 20px;
       }
-      .brand h1 { margin: 0; font-size: 24px; font-weight: 700; letter-spacing: -0.02em; }
-      .brand p { margin: 6px 0 0; color: var(--muted); font-size: 13px; }
+      .brand {
+        display: flex;
+        align-items: center;
+        gap: 16px;
+        min-width: 0;
+      }
+      .brand-logo {
+        display: block;
+        width: 340px;
+        max-width: min(44vw, 340px);
+        height: auto;
+      }
+      .brand-text {
+        min-width: 0;
+      }
+      .brand-text h1 {
+        margin: 0;
+        font-size: 24px;
+        font-weight: 700;
+        letter-spacing: -0.02em;
+      }
+      .brand-text p {
+        margin: 6px 0 0;
+        color: var(--muted);
+        font-size: 13px;
+      }
       .nav-links {
         display: flex;
         flex-wrap: wrap;
@@ -810,7 +875,7 @@ function pageLayout(title, body, user, notice) {
       .nav-links a {
         padding: 10px 14px;
         border-radius: 999px;
-        color: #174ea6;
+        color: var(--accent);
         background: transparent;
         font-weight: 500;
         white-space: nowrap;
@@ -818,6 +883,11 @@ function pageLayout(title, body, user, notice) {
       .nav-links a:hover {
         background: var(--accent-soft);
         text-decoration: none;
+      }
+      .nav-links a.active,
+      .nav-links a[aria-current="page"] {
+        background: linear-gradient(180deg, rgba(210, 170, 110, 0.22), rgba(210, 170, 110, 0.12));
+        color: var(--accent);
       }
       main {
         max-width: 1360px;
@@ -833,12 +903,16 @@ function pageLayout(title, body, user, notice) {
         box-shadow: var(--shadow);
       }
       .card.card-soft-purple {
-        background: #eef5ff;
-        border-color: #cfe0ff;
+        background: #edf2ff;
+        border-color: #cfd6fb;
       }
       .card.card-soft-red {
-        background: #f4f6f8;
-        border-color: #d8dee6;
+        background: #f6f1ec;
+        border-color: #ddd4ca;
+      }
+      .card.card-brand {
+        background: linear-gradient(180deg, rgba(255, 255, 255, 0.98), rgba(248, 245, 240, 0.94));
+        border-color: #e6d7bf;
       }
       h1, h2, h3 { margin: 0 0 14px; }
       h2 { font-size: 22px; letter-spacing: -0.01em; }
@@ -859,7 +933,8 @@ function pageLayout(title, body, user, notice) {
         font-weight: 600;
         text-transform: uppercase;
         letter-spacing: 0.04em;
-        background: #fafbff;
+        background: linear-gradient(180deg, #f8efe4, #f6f0e8);
+        border-bottom-color: #d8c9b1;
       }
       th a {
         display: inline-flex;
@@ -875,14 +950,14 @@ function pageLayout(title, body, user, notice) {
         text-decoration: none;
       }
       th a.active-sort {
-        background: #e8f0fe;
-        color: #174ea6;
+        background: var(--accent-soft);
+        color: var(--accent);
       }
-      tr:hover td { background: #fafcff; }
-      tr.row-soft-purple td { background: #eef5ff; }
-      tr.row-soft-purple:hover td { background: #e4efff; }
-      tr.row-soft-red td { background: #f4f6f8; }
-      tr.row-soft-red:hover td { background: #eceff3; }
+      tr:hover td { background: #fcfaf5; }
+      tr.row-soft-purple td { background: #edf2ff; }
+      tr.row-soft-purple:hover td { background: #e3ebff; }
+      tr.row-soft-red td { background: #f6f1ec; }
+      tr.row-soft-red:hover td { background: #efe6de; }
       .table-wrap {
         overflow-x: auto;
         -webkit-overflow-scrolling: touch;
@@ -950,6 +1025,12 @@ function pageLayout(title, body, user, notice) {
         grid-template-columns: repeat(4, minmax(0, 1fr));
         align-items: end;
       }
+      .filters-shell {
+        padding: 18px;
+        border-radius: 18px;
+        background: linear-gradient(180deg, #fcfaf6, #f7f1e8);
+        border: 1px solid #e4d5bd;
+      }
       .filters-grid .actions {
         justify-content: flex-start;
         align-items: center;
@@ -966,10 +1047,13 @@ function pageLayout(title, body, user, notice) {
         margin: 20px auto 0;
         padding: 14px 16px;
         border-radius: 16px;
-        background: #e8f0fe;
-        border: 1px solid #d2e3fc;
-        color: #174ea6;
+        background: linear-gradient(180deg, #f4efe7, #fbf8f3);
+        border: 1px solid #dcccb3;
+        color: #6a532d;
         box-shadow: var(--shadow);
+      }
+      .notice strong {
+        color: var(--accent);
       }
       .muted { color: var(--muted); }
       .field-order {
@@ -990,9 +1074,25 @@ function pageLayout(title, body, user, notice) {
         padding: 6px 12px;
         border-radius: 999px;
         background: var(--accent-soft);
-        color: #174ea6;
+        color: var(--accent);
         font-size: 13px;
         font-weight: 600;
+      }
+      .pill.ok {
+        background: rgba(26, 34, 135, 0.1);
+        color: var(--accent);
+      }
+      .pill.bad {
+        background: rgba(200, 22, 30, 0.12);
+        color: var(--brand-red);
+      }
+      .pill.gold {
+        background: rgba(210, 170, 110, 0.2);
+        color: #8a5f22;
+      }
+      .pill.muted {
+        background: rgba(136, 127, 111, 0.14);
+        color: #6e665c;
       }
       .schedule-summary {
         display: flex;
@@ -1014,8 +1114,8 @@ function pageLayout(title, body, user, notice) {
       .schedule-item {
         padding: 8px 10px;
         border-radius: 12px;
-        background: #f8fbff;
-        border: 1px solid #e3ebf8;
+        background: #fcfaf5;
+        border: 1px solid #e9dece;
         line-height: 1.5;
       }
       .schedule-meta {
@@ -1055,8 +1155,8 @@ function pageLayout(title, body, user, notice) {
         margin-top: 12px;
         padding: 10px 12px;
         border-radius: 12px;
-        background: #eef3fd;
-        color: #174ea6;
+        background: #efe8dc;
+        color: #7d5726;
         font-size: 13px;
         line-height: 1.6;
       }
@@ -1071,7 +1171,7 @@ function pageLayout(title, body, user, notice) {
         width: 100%;
         margin-top: 8px;
         padding: 12px 14px;
-        border: 1px solid #c7cdd4;
+        border: 1px solid #cbbfad;
         border-radius: 14px;
         background: #fff;
         color: var(--ink);
@@ -1084,7 +1184,7 @@ function pageLayout(title, body, user, notice) {
       }
       select {
         appearance: none;
-        background: #f8fbff;
+        background: #faf7f2;
       }
       input[type="checkbox"] {
         width: 18px;
@@ -1116,15 +1216,24 @@ function pageLayout(title, body, user, notice) {
         filter: brightness(0.98);
       }
       button.secondary {
-        background: #eef3fd;
-        color: #174ea6;
+        background: #f5ebdc;
+        color: #7d5726;
         box-shadow: none;
       }
       .button-link.danger,
       button.danger {
-        background: #fce8e6;
-        color: #c5221f;
+        background: #f7d8da;
+        color: var(--brand-red);
         box-shadow: none;
+      }
+      .button-link.text-link,
+      button.text-link {
+        background: transparent;
+        color: var(--accent);
+        box-shadow: none;
+        padding-left: 0;
+        padding-right: 0;
+        min-width: auto;
       }
       .button-link.rect,
       button.rect {
@@ -1138,6 +1247,16 @@ function pageLayout(title, body, user, notice) {
         white-space: nowrap;
       }
       .actions { display: flex; gap: 8px; flex-wrap: wrap; }
+      .table-action-cell {
+        vertical-align: middle;
+        text-align: center;
+      }
+      .table-action-cell .table-action-inner {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        min-height: 100%;
+      }
       .mobile-only { display: none; }
       .desktop-only { display: block; }
       .mobile-card-list {
@@ -1199,12 +1318,58 @@ function pageLayout(title, body, user, notice) {
         gap: 24px;
         align-items: stretch;
       }
+      .feature-card {
+        position: relative;
+        overflow: hidden;
+      }
+      .feature-card::before {
+        content: "";
+        position: absolute;
+        inset: 0 auto 0 0;
+        width: 4px;
+        background: linear-gradient(180deg, var(--brand-red), var(--brand-gold));
+      }
+      .feature-card h3 {
+        margin-bottom: 10px;
+      }
+      .feature-card p {
+        color: var(--muted);
+        margin: 0 0 16px;
+        line-height: 1.65;
+      }
+      .feature-card .actions {
+        margin-top: auto;
+      }
       .hero-panel {
         min-height: 420px;
         display: flex;
         flex-direction: column;
         justify-content: center;
-        background: linear-gradient(135deg, #e8f0fe, #f8fbff 58%, #e6f4ea);
+        background:
+          linear-gradient(135deg, rgba(26, 34, 135, 0.95), rgba(26, 34, 135, 0.82) 48%, rgba(200, 22, 30, 0.78)),
+          linear-gradient(160deg, var(--brand-gold-soft), #fff);
+        color: #fff;
+      }
+      .hero-panel::before {
+        content: "";
+        position: absolute;
+        inset: 0;
+        background:
+          radial-gradient(circle at 18% 22%, rgba(255,255,255,0.16), transparent 22%),
+          radial-gradient(circle at 80% 14%, rgba(255,255,255,0.1), transparent 18%),
+          linear-gradient(135deg, transparent 0 58%, rgba(255,255,255,0.06) 58% 72%, transparent 72%);
+        pointer-events: none;
+      }
+      .hero-panel > * {
+        position: relative;
+        z-index: 1;
+      }
+      .hero-logo {
+        width: min(320px, 62%);
+        max-width: 100%;
+        height: auto;
+        margin: 0 0 20px;
+        filter: drop-shadow(0 10px 24px rgba(0, 0, 0, 0.18));
       }
       .hero-panel .hero-pills {
         display: flex;
@@ -1217,10 +1382,11 @@ function pageLayout(title, body, user, notice) {
         align-items: center;
         padding: 6px 10px;
         border-radius: 999px;
-        background: rgba(255, 255, 255, 0.7);
-        color: #355070;
+        background: rgba(255, 255, 255, 0.16);
+        color: #fff;
         font-size: 12px;
         font-weight: 600;
+        border: 1px solid rgba(255,255,255,0.18);
       }
       .hero-panel h2 {
         font-size: 34px;
@@ -1229,7 +1395,7 @@ function pageLayout(title, body, user, notice) {
       }
       .hero-panel p {
         margin: 0 0 12px;
-        color: #475467;
+        color: rgba(255, 255, 255, 0.9);
         line-height: 1.7;
       }
       .login-card {
@@ -1237,6 +1403,7 @@ function pageLayout(title, body, user, notice) {
         flex-direction: column;
         justify-content: center;
         min-height: 420px;
+        background: linear-gradient(180deg, #ffffff, #fbf8f3);
       }
       @media (max-width: 900px) {
         .topbar { padding-left: 18px; padding-right: 18px; align-items: flex-start; flex-direction: column; }
@@ -1289,6 +1456,14 @@ function pageLayout(title, body, user, notice) {
           padding: 14px 14px 12px;
           gap: 12px;
         }
+        .brand {
+          width: 100%;
+          align-items: flex-start;
+        }
+        .brand-logo {
+          width: 240px;
+          max-width: 56vw;
+        }
         .brand h1 {
           font-size: 20px;
         }
@@ -1321,12 +1496,19 @@ function pageLayout(title, body, user, notice) {
           grid-template-columns: 1fr;
           gap: 12px;
         }
+        .hero-logo {
+          width: min(220px, 76%);
+          margin-bottom: 16px;
+        }
         .hero-panel .hero-pills span {
           font-size: 11px;
           padding: 5px 8px;
         }
         .class-card {
           padding: 14px 14px 12px;
+        }
+        .feature-card::before {
+          width: 3px;
         }
         .class-card h3 {
           font-size: 15px;
@@ -1349,6 +1531,11 @@ function pageLayout(title, body, user, notice) {
         input, select, textarea {
           padding: 11px 12px;
           border-radius: 12px;
+        }
+        .login-card input,
+        .login-card select,
+        .login-card textarea {
+          font-size: 16px;
         }
         .actions {
           width: 100%;
@@ -1396,8 +1583,11 @@ function pageLayout(title, body, user, notice) {
     <header>
       <div class="topbar">
         <div class="brand">
-          <h1>TA 选课系统</h1>
-          <p>${user ? `当前角色：${escapeHtml(user.role)} · ${escapeHtml(user.user_name)}` : "Teaching Assistant Course Assignment Platform"}</p>
+          <img class="brand-logo" src="${SAIF_LOGO_HORIZONTAL}" alt="SAIF Logo">
+          <div class="brand-text">
+            <h1>TA 选课系统</h1>
+            <p>${user ? `当前角色：${escapeHtml(user.role)} · ${escapeHtml(user.user_name)}` : "上海高级金融学院 Teaching Assistant Course Assignment Platform"}</p>
+          </div>
         </div>
         ${nav}
       </div>
@@ -1445,6 +1635,7 @@ function loginPage(res, notice) {
   const body = `
     <div class="hero">
       <section class="card hero-panel">
+        <img class="hero-logo" src="${SAIF_LOGO_VERTICAL}" alt="SAIF Logo">
         <h2>TA选课申请系统</h2>
         <p>系统覆盖 TA 申请、TAAdmin 初审、Professor 终审、教学班开放时间控制，以及课程与人员管理。</p>
         <p>当前版本已支持多条排课记录、附件上传、站内通知、批量设置和批量删除等核心流程。</p>
@@ -1614,32 +1805,32 @@ function homePage(res, user, notice) {
     return loginPage(res, notice);
   }
   let body = `
-    <section class="card">
+    <section class="card card-brand">
       <h2>当前用户</h2>
-      <p><span class="pill">${escapeHtml(user.role)}</span> ${escapeHtml(user.user_name)}</p>
-      <p class="muted">当前实现的是 Node + SQLite 的服务端渲染 MVP。</p>
+      <p><span class="pill gold">${escapeHtml(user.role)}</span> ${escapeHtml(user.user_name)}</p>
+      <p class="muted">当前系统已接入 TA 申请、TAAdmin 审核、Professor 终审、教学班与人员管理，并支持邮件通知、导入和手机端访问。</p>
     </section>
   `;
   if (user.role === "TA") {
     body += `<section class="grid">
-      <article class="card"><h3>可申请教学班</h3><p>浏览开放课程并提交申请。</p><a href="/ta/classes">进入</a></article>
-      <article class="card"><h3>我的申请</h3><p>查看状态并在初审前撤销。</p><a href="/ta/applications">进入</a></article>
-      <article class="card"><h3>个人资料</h3><p>维护个人简历，申请时自动带出。</p><a href="/ta/profile">进入</a></article>
+      <article class="card card-brand feature-card"><h3>可申请教学班</h3><p>浏览开放教学班、查看冲突情况并提交申请。</p><div class="actions"><a class="button-link" href="/ta/classes">进入</a></div></article>
+      <article class="card card-brand feature-card"><h3>我的申请</h3><p>查看申请状态，并在 TAAdmin 审批前撤销申请。</p><div class="actions"><a class="button-link" href="/ta/applications">进入</a></div></article>
+      <article class="card card-brand feature-card"><h3>个人资料</h3><p>维护个人简历，申请时自动带出最新简历。</p><div class="actions"><a class="button-link" href="/ta/profile">进入</a></div></article>
     </section>`;
   } else if (user.role === "TAAdmin") {
     body += `<section class="grid">
-      <article class="card"><h3>待初审申请</h3><p>处理 TA 初审。</p><a href="/admin/ta/pending">进入</a></article>
-      <article class="card"><h3>全部申请</h3><p>查看所有 TA 申请状态。</p><a href="/admin/ta/applications">进入</a></article>
-      <article class="card"><h3>全部教学班</h3><p>查看所有教学班和排课安排。</p><a href="/admin/ta/classes">进入</a></article>
-      <article class="card"><h3>TA 管理</h3><p>维护申请资格。</p><a href="/admin/ta/users">进入</a></article>
+      <article class="card card-brand feature-card"><h3>待初审申请</h3><p>集中处理当前待 TAAdmin 审批的学生申请。</p><div class="actions"><a class="button-link" href="/admin/ta/pending">进入</a></div></article>
+      <article class="card card-brand feature-card"><h3>全部申请</h3><p>查看所有 TA 申请状态并追踪历史审批情况。</p><div class="actions"><a class="button-link" href="/admin/ta/applications">进入</a></div></article>
+      <article class="card card-brand feature-card"><h3>全部教学班</h3><p>按教学班查看申请、发布至教授并发送邮件。</p><div class="actions"><a class="button-link" href="/admin/ta/classes">进入</a></div></article>
+      <article class="card card-brand feature-card"><h3>TA 管理</h3><p>查看 TA 名单并维护 TA 申请资格。</p><div class="actions"><a class="button-link" href="/admin/ta/users">进入</a></div></article>
     </section>`;
   } else if (user.role === "Professor") {
-    body += `<section class="card"><h3>待教授审批</h3><p>处理终审。</p><a href="/professor/pending">进入</a></section>`;
+    body += `<section class="grid"><article class="card card-brand feature-card"><h3>待教授审批</h3><p>按教学班查看待终审申请，并在达到名额上限时自动完成其余申请处理。</p><div class="actions"><a class="button-link" href="/professor/pending">进入</a></div></article></section>`;
   } else if (user.role === "CourseAdmin") {
     body += `<section class="grid">
-      <article class="card"><h3>全部申请</h3><p>查看所有 TA 申请状态。</p><a href="/course/applications">进入</a></article>
-      <article class="card"><h3>教学班管理</h3><p>维护教学班与排课。</p><a href="/course/classes">进入</a></article>
-      <article class="card"><h3>人员管理</h3><p>新增、编辑和删除系统人员。</p><a href="/course/users">进入</a></article>
+      <article class="card card-brand feature-card"><h3>全部申请</h3><p>查看全量申请并在必要时进行管理性状态调整。</p><div class="actions"><a class="button-link" href="/course/applications">进入</a></div></article>
+      <article class="card card-brand feature-card"><h3>教学班管理</h3><p>维护教学班、排课、导入和批量操作。</p><div class="actions"><a class="button-link" href="/course/classes">进入</a></div></article>
+      <article class="card card-brand feature-card"><h3>人员管理</h3><p>新增、编辑、导入和维护系统角色人员。</p><div class="actions"><a class="button-link" href="/course/users">进入</a></div></article>
     </section>`;
   }
   sendHtml(res, pageLayout("首页", body, user, notice));
@@ -2260,6 +2451,7 @@ function taClassesPage(res, user, notice, filters = {}) {
     <section class="card">
       <h2>筛选教学班</h2>
       <form method="get" action="/ta/classes">
+        <div class="filters-shell">
         <div class="filters-grid">
           <p><label>是否可申请<select name="apply_status">
             <option value="" ${!filters.apply_status ? "selected" : ""}>全部</option>
@@ -2278,6 +2470,7 @@ function taClassesPage(res, user, notice, filters = {}) {
             <button class="secondary action-button" type="submit">筛选</button>
             <a class="button-link secondary action-button" href="/ta/classes">重置</a>
           </div>
+        </div>
         </div>
       </form>
     </section>
@@ -2506,10 +2699,10 @@ function taApplicationsPage(res, user, notice) {
     <td>${escapeHtml(statusLabels[app.status])}</td>
     <td>${escapeHtml(app.ta_comment || "")}</td>
     <td>${escapeHtml(app.prof_comment || "")}</td>
-    <td class="actions">
+    <td class="table-action-cell"><div class="table-action-inner">
       <a class="button-link secondary action-button" href="/ta/applications/${app.application_id}">详情</a>
       ${app.status === "PendingTAAdmin" ? `<form class="inline" method="post" action="/ta/applications/${app.application_id}/withdraw" onsubmit="return confirm('确认撤销这条申请吗？撤销后需要重新提交申请。');"><button class="danger action-button" type="submit">撤销</button></form>` : ""}
-    </td>
+    </div></td>
   </tr>`).join("");
   const cards = apps.map((app) => `
     <article class="mobile-data-card">
@@ -2613,12 +2806,13 @@ function taAdminPendingPage(res, user, notice, filters = {}) {
     <td>${escapeHtml(app.teacher_name)}</td>
     <td>${escapeHtml(app.submitted_at)}</td>
     <td>${escapeHtml(app.application_reason)}</td>
-    <td><a class="button-link secondary action-button" href="/admin/ta/pending/${app.application_id}">详情</a></td>
+    <td class="table-action-cell"><div class="table-action-inner"><a class="button-link secondary action-button" href="/admin/ta/pending/${app.application_id}">详情</a></div></td>
   </tr>`).join("");
   sendHtml(res, pageLayout("待初审申请", `
     <section class="card">
       <h2>筛选待审批申请</h2>
       <form method="get" action="/admin/ta/pending">
+        <div class="filters-shell">
         <div class="filters-grid">
           <p><label>申请学生<input name="applier_name" value="${escapeHtml(filters.applier_name || "")}" /></label></p>
           <p><label>教学班<input name="class_name" value="${escapeHtml(filters.class_name || "")}" /></label></p>
@@ -2627,6 +2821,7 @@ function taAdminPendingPage(res, user, notice, filters = {}) {
             <button class="secondary action-button" type="submit">筛选</button>
             <a class="button-link secondary action-button" href="/admin/ta/pending">重置</a>
           </div>
+        </div>
         </div>
       </form>
     </section>
@@ -2922,7 +3117,7 @@ function taUsersPage(res, user, notice) {
     <td>${escapeHtml(row.is_allowed_to_apply)}</td>
     <td>${row.application_count}</td>
     <td>${row.approved_count}</td>
-    <td><form class="inline" method="post" action="/admin/ta/users/${row.user_id}/toggle"><button type="submit">${row.is_allowed_to_apply === "Y" ? "关闭资格" : "开启资格"}</button></form></td>
+    <td class="table-action-cell"><div class="table-action-inner"><form class="inline" method="post" action="/admin/ta/users/${row.user_id}/toggle"><button type="submit">${row.is_allowed_to_apply === "Y" ? "关闭资格" : "开启资格"}</button></form></div></td>
   </tr>`).join("");
   sendHtml(res, pageLayout("TA 管理", `<section class="card"><h2>TA 管理</h2><table><tr><th>姓名</th><th>账号</th><th>邮箱</th><th>允许申请</th><th>申请数</th><th>已通过</th><th>操作</th></tr>${htmlRows}</table></section>`, user, notice));
 }
@@ -2937,7 +3132,7 @@ function notificationsPage(res, user, notice) {
     <td>${escapeHtml(row.content)}</td>
     <td>${escapeHtml(row.created_at)}</td>
     <td>${row.is_read === "Y" ? "已读" : "未读"}</td>
-    <td class="actions">${row.target_path ? `<a href="${escapeHtml(row.target_path)}">查看</a>` : ""}${row.is_read === "N" ? `<form class="inline" method="post" action="/notifications/${row.notification_id}/read"><button type="submit">标为已读</button></form>` : ""}</td>
+    <td class="table-action-cell"><div class="table-action-inner">${row.target_path ? `<a class="button-link secondary action-button" href="${escapeHtml(row.target_path)}">查看</a>` : ""}${row.is_read === "N" ? `<form class="inline" method="post" action="/notifications/${row.notification_id}/read"><button class="secondary action-button" type="submit">标为已读</button></form>` : ""}</div></td>
   </tr>`).join("");
   sendHtml(res, pageLayout("通知中心", `
     <section class="card">
@@ -3047,7 +3242,7 @@ function professorClassReviewPage(res, user, classId, notice) {
     <td>${escapeHtml(app.submitted_at)}</td>
     <td>${escapeHtml(statusLabels[app.status] || app.status)}</td>
     <td>${escapeHtml(app.ta_comment || "")}</td>
-    <td><a href="/professor/pending/${app.application_id}">查看申请</a></td>
+    <td class="table-action-cell"><div class="table-action-inner"><a class="button-link secondary action-button" href="/professor/pending/${app.application_id}">查看申请</a></div></td>
   </tr>`).join("");
   const cards = apps.map((app) => `
     <article class="mobile-data-card">
@@ -3404,6 +3599,7 @@ function courseClassesPage(res, user, notice, filters = {}) {
     <section class="card">
       <h2>筛选教学班</h2>
       <form method="get" action="/course/classes">
+        <div class="filters-shell">
         <div class="filters-grid">
           <p><label>教学班代码<input name="class_code" value="${escapeHtml(filters.class_code || "")}" /></label></p>
           <p><label>教学班名称<input name="class_name" value="${escapeHtml(filters.class_name || "")}" /></label></p>
@@ -3425,6 +3621,7 @@ function courseClassesPage(res, user, notice, filters = {}) {
             <button class="secondary action-button" type="submit">筛选</button>
             <a class="button-link secondary action-button" href="/course/classes">重置</a>
           </div>
+        </div>
         </div>
       </form>
     </section>
@@ -3581,12 +3778,13 @@ function taAdminAllApplicationsPage(res, user, notice, filters = {}) {
     <td>${escapeHtml(app.submitted_at)}</td>
     <td>${escapeHtml(statusLabels[app.status] || app.status)}</td>
     <td>${attachmentLink(app)}</td>
-    <td><a href="/admin/ta/pending/${app.application_id}">详情</a></td>
+    <td class="table-action-cell"><div class="table-action-inner"><a class="button-link secondary action-button" href="/admin/ta/pending/${app.application_id}">详情</a></div></td>
   </tr>`).join("");
   sendHtml(res, pageLayout("全部申请", `
     <section class="card">
       <h2>筛选全部申请</h2>
       <form method="get" action="/admin/ta/applications">
+        <div class="filters-shell">
         <div class="filters-grid">
           <p><label>申请学生<input name="applier_name" value="${escapeHtml(filters.applier_name || "")}" /></label></p>
           <p><label>教学班<input name="class_name" value="${escapeHtml(filters.class_name || "")}" /></label></p>
@@ -3599,6 +3797,7 @@ function taAdminAllApplicationsPage(res, user, notice, filters = {}) {
             <button class="secondary action-button" type="submit">筛选</button>
             <a class="button-link secondary action-button" href="/admin/ta/applications">重置</a>
           </div>
+        </div>
         </div>
       </form>
     </section>
@@ -3621,7 +3820,7 @@ function courseAdminAllApplicationsPage(res, user, notice) {
     <td>${escapeHtml(app.submitted_at)}</td>
     <td>${escapeHtml(statusLabels[app.status] || app.status)}</td>
     <td>${attachmentLink(app)}</td>
-    <td><a href="/course/applications/${app.application_id}">详情</a></td>
+    <td class="table-action-cell"><div class="table-action-inner"><a class="button-link secondary action-button" href="/course/applications/${app.application_id}">详情</a></div></td>
   </tr>`).join("");
   sendHtml(res, pageLayout("全部申请", `
     <section class="card">
@@ -3904,6 +4103,7 @@ function taAdminAllClassesPage(res, user, notice, filters = {}) {
     <section class="card">
       <h2>筛选教学班</h2>
       <form method="get" action="/admin/ta/classes">
+        <div class="filters-shell">
         <div class="filters-grid">
           <p><label>教授名<input name="professor_name" value="${escapeHtml(filters.professor_name || "")}" /></label></p>
           <p><label>教学班名称<input name="class_name" value="${escapeHtml(filters.class_name || "")}" /></label></p>
@@ -3918,9 +4118,10 @@ function taAdminAllClassesPage(res, user, notice, filters = {}) {
             <option value="N" ${filters.has_pending === "N" ? "selected" : ""}>无</option>
           </select></label></p>
         </div>
-        <div class="actions">
+        <div class="actions" style="margin-top:12px;">
           <button class="secondary action-button" type="submit">筛选</button>
           <a class="button-link secondary rect action-button" href="/admin/ta/classes">重置</a>
+        </div>
         </div>
       </form>
     </section>
@@ -4045,7 +4246,7 @@ async function taAdminProfessorEmailPreview(req, res, user, notice) {
       grouped.get(professor.user_id).classes.push(classRow);
     }
   }
-  const baseUrl = `http://${req.headers.host || `127.0.0.1:${PORT}`}`;
+  const baseUrl = getExternalBaseUrl(req);
   const draftCards = Array.from(grouped.values()).map(({ professor, classes }) => {
     const token = createLoginToken(db, professor.user_id, "/professor/pending");
     const accessLink = `${baseUrl}/magic-login?token=${token}`;
@@ -4093,7 +4294,7 @@ async function taAdminSendProfessorEmails(req, res, user) {
     db.close();
     return redirect(res, "/admin/ta/classes?notice=未匹配到任何教学班");
   }
-  const baseUrl = `http://${req.headers.host || `127.0.0.1:${PORT}`}`;
+  const baseUrl = getExternalBaseUrl(req);
   try {
     await sendProfessorNotificationEmails(db, selectedClasses, user, baseUrl);
   } catch (error) {
@@ -4140,11 +4341,17 @@ function taAdminClassApplicationsPage(res, user, classId, notice) {
     where class_id = ?
     order by submitted_at desc
   `).all(classId);
+  const statusPillClass = (status) => {
+    if (status === "PendingTAAdmin") return "pill gold";
+    if (status === "Approved" || status === "PendingProfessor") return "pill ok";
+    if (status === "RejectedByTAAdmin" || status === "RejectedByProfessor") return "pill bad";
+    return "pill muted";
+  };
   const rows = apps.map((app) => `<tr>
     <td>${app.application_id}</td>
     <td>${escapeHtml(app.applier_name)}</td>
     <td>${escapeHtml(app.submitted_at)}</td>
-    <td>${escapeHtml(statusLabels[app.status] || app.status)}</td>
+    <td><span class="${statusPillClass(app.status)}">${escapeHtml(statusLabels[app.status] || app.status)}</span></td>
     <td>${escapeHtml(app.application_reason)}</td>
     <td>${(() => {
       const conflicts = getAppliedConflicts(db, app.applier_user_id, classId);
@@ -4155,7 +4362,7 @@ function taAdminClassApplicationsPage(res, user, classId, notice) {
     })()}</td>
     <td>${attachmentLink(app)}</td>
     <td>${escapeHtml(app.ta_comment || "")}</td>
-    <td class="actions">${app.status === "PendingTAAdmin" ? `<a class="button-link secondary" href="/admin/ta/pending/${app.application_id}">单独审批</a>` : ""}</td>
+    <td class="table-action-cell"><div class="table-action-inner">${app.status === "PendingTAAdmin" ? `<a class="button-link secondary rect action-button" href="/admin/ta/pending/${app.application_id}">单独审批</a>` : `<span class="pill muted">已处理</span>`}</div></td>
   </tr>`).join("");
   db.close();
   const pendingCount = apps.filter((app) => app.status === "PendingTAAdmin").length;
@@ -4179,7 +4386,22 @@ function taAdminClassApplicationsPage(res, user, classId, notice) {
     </section>
     <section class="card">
       <h3>关联申请列表</h3>
-      <table><tr><th>ID</th><th>申请人</th><th>申请时间</th><th>状态</th><th>申请原因</th><th>冲突教学班摘要</th><th>简历</th><th>TAAdmin 备注</th><th>操作</th></tr>${rows}</table>
+      <div class="table-wrap">
+        <table class="wide compact-table fixed-layout">
+          <colgroup>
+            <col style="width:68px;" />
+            <col style="width:96px;" />
+            <col style="width:160px;" />
+            <col style="width:110px;" />
+            <col style="width:240px;" />
+            <col style="width:360px;" />
+            <col style="width:190px;" />
+            <col style="width:190px;" />
+            <col style="width:120px;" />
+          </colgroup>
+          <tr><th>ID</th><th>申请人</th><th>申请时间</th><th>状态</th><th>申请原因</th><th>冲突教学班摘要</th><th>简历</th><th>TAAdmin 备注</th><th>操作</th></tr>${rows}
+        </table>
+      </div>
     </section>
   `, user, notice));
 }
@@ -4511,6 +4733,7 @@ function courseUsersPage(res, user, notice, filters = {}) {
     <section class="card">
       <h2>筛选人员</h2>
       <form method="get" action="/course/users">
+        <div class="filters-shell">
         <div class="filters-grid">
           <p><label>姓名<input name="user_name" value="${escapeHtml(filters.user_name || "")}" /></label></p>
           <p><label>登录名<input name="login_name" value="${escapeHtml(filters.login_name || "")}" /></label></p>
@@ -4531,6 +4754,7 @@ function courseUsersPage(res, user, notice, filters = {}) {
             <button class="secondary action-button" type="submit">筛选</button>
             <a class="button-link secondary action-button" href="/course/users">重置</a>
           </div>
+        </div>
         </div>
       </form>
     </section>
@@ -5090,6 +5314,30 @@ async function handleRequest(req, res) {
   const pathname = url.pathname;
   const notice = url.searchParams.get("notice");
   const user = getCurrentUser(req);
+
+  if (pathname.startsWith("/assets/")) {
+    const fileName = path.basename(decodeURIComponent(pathname.replace("/assets/", "")));
+    const filePath = path.join(ASSET_DIR, fileName);
+    if (!fs.existsSync(filePath)) {
+      res.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" });
+      res.end("file not found");
+      return;
+    }
+    const ext = path.extname(fileName).toLowerCase();
+    const contentTypes = {
+      ".png": "image/png",
+      ".jpg": "image/jpeg",
+      ".jpeg": "image/jpeg",
+      ".svg": "image/svg+xml",
+      ".webp": "image/webp"
+    };
+    res.writeHead(200, {
+      "Content-Type": contentTypes[ext] || "application/octet-stream",
+      "Cache-Control": "public, max-age=3600"
+    });
+    fs.createReadStream(filePath).pipe(res);
+    return;
+  }
 
   if (pathname.startsWith("/uploads/")) {
     const fileName = path.basename(pathname.replace("/uploads/", ""));
