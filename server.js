@@ -351,6 +351,153 @@ function redirect(res, location, headers = {}) {
   res.end();
 }
 
+function ensureHttpUrl(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+  if (/^https?:\/\//i.test(raw)) return raw;
+  return `http://${raw}`;
+}
+
+function getSsoConfig() {
+  return {
+    loginUrl: ensureHttpUrl(process.env.SSO_LOGIN_URL),
+    authUrl: ensureHttpUrl(process.env.SSO_AUTH_URL),
+    tokenUrl: ensureHttpUrl(process.env.SSO_TOKEN_URL),
+    userInfoUrl: ensureHttpUrl(process.env.SSO_USERINFO_URL),
+    clientId: String(process.env.SSO_CLIENT_ID || "").trim(),
+    clientSecret: String(process.env.SSO_CLIENT_SECRET || "").trim(),
+    redirectUri: ensureHttpUrl(process.env.SSO_REDIRECT_URI),
+    loginNameField: String(process.env.SSO_LOGIN_NAME_FIELD || "account").trim(),
+    scope: String(process.env.SSO_SCOPE || "openid profile").trim(),
+    loginXStarted: String(process.env.SSO_LOGIN_X_STARTED || "Y").trim().toUpperCase() !== "N"
+  };
+}
+
+function getSsoMissingConfig(config = getSsoConfig()) {
+  const missing = [];
+  if (!config.authUrl) missing.push("SSO_AUTH_URL");
+  if (!config.tokenUrl) missing.push("SSO_TOKEN_URL");
+  if (!config.userInfoUrl) missing.push("SSO_USERINFO_URL");
+  if (!config.clientId) missing.push("SSO_CLIENT_ID");
+  if (!config.clientSecret) missing.push("SSO_CLIENT_SECRET");
+  if (!config.redirectUri) missing.push("SSO_REDIRECT_URI");
+  if (!config.loginNameField) missing.push("SSO_LOGIN_NAME_FIELD");
+  return missing;
+}
+
+function createSsoStatePayload(targetPath = "/") {
+  return Buffer.from(JSON.stringify({
+    nonce: crypto.randomBytes(12).toString("hex"),
+    targetPath
+  }), "utf8").toString("base64url");
+}
+
+function parseSsoStatePayload(value) {
+  try {
+    const raw = Buffer.from(String(value || ""), "base64url").toString("utf8");
+    const parsed = JSON.parse(raw);
+    return {
+      nonce: String(parsed.nonce || "").trim(),
+      targetPath: String(parsed.targetPath || "/").trim() || "/"
+    };
+  } catch (_error) {
+    return { nonce: "", targetPath: "/" };
+  }
+}
+
+function httpRequest(urlString, { method = "GET", headers = {}, body = null } = {}) {
+  return new Promise((resolve, reject) => {
+    const target = new URL(urlString);
+    const transport = target.protocol === "https:" ? require("node:https") : require("node:http");
+    const req = transport.request({
+      protocol: target.protocol,
+      hostname: target.hostname,
+      port: target.port || (target.protocol === "https:" ? 443 : 80),
+      path: `${target.pathname}${target.search}`,
+      method,
+      headers
+    }, (res) => {
+      const chunks = [];
+      res.on("data", (chunk) => chunks.push(chunk));
+      res.on("end", () => {
+        resolve({
+          statusCode: res.statusCode || 0,
+          headers: res.headers,
+          body: Buffer.concat(chunks).toString("utf8")
+        });
+      });
+    });
+    req.on("error", reject);
+    if (body) {
+      req.write(body);
+    }
+    req.end();
+  });
+}
+
+async function exchangeSsoCodeForToken(code, config = getSsoConfig()) {
+  const body = querystring.stringify({
+    grant_type: "authorization_code",
+    code,
+    redirect_uri: config.redirectUri,
+    client_id: config.clientId,
+    client_secret: config.clientSecret
+  });
+  const response = await httpRequest(config.tokenUrl, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/x-www-form-urlencoded",
+      "Content-Length": Buffer.byteLength(body)
+    },
+    body
+  });
+  if (response.statusCode < 200 || response.statusCode >= 300) {
+    throw new Error(`SSO token 接口返回异常（HTTP ${response.statusCode}）`);
+  }
+  let payload;
+  try {
+    payload = JSON.parse(response.body);
+  } catch (_error) {
+    throw new Error("SSO token 接口返回的不是合法 JSON");
+  }
+  const accessToken = String(payload.access_token || payload.accessToken || "").trim();
+  if (!accessToken) {
+    throw new Error("SSO token 响应中缺少 access_token");
+  }
+  return accessToken;
+}
+
+async function fetchSsoUserInfo(accessToken, config = getSsoConfig()) {
+  const response = await httpRequest(config.userInfoUrl, {
+    headers: {
+      Authorization: `Bearer ${accessToken}`
+    }
+  });
+  if (response.statusCode < 200 || response.statusCode >= 300) {
+    throw new Error(`SSO 用户信息接口返回异常（HTTP ${response.statusCode}）`);
+  }
+  let payload;
+  try {
+    payload = JSON.parse(response.body);
+  } catch (_error) {
+    throw new Error("SSO 用户信息接口返回的不是合法 JSON");
+  }
+  return payload;
+}
+
+function decodeJwtPayloadWithoutVerify(token) {
+  const parts = String(token || "").split(".");
+  if (parts.length < 2) {
+    throw new Error("access_token 不是合法 JWT");
+  }
+  try {
+    const payload = Buffer.from(parts[1], "base64url").toString("utf8");
+    return JSON.parse(payload);
+  } catch (_error) {
+    throw new Error("access_token JWT payload 解析失败");
+  }
+}
+
 function consumeLoginToken(res, token) {
   const db = getDb();
   const row = db.prepare("select * from login_tokens where token = ? and used_at is null").get(token);
@@ -688,7 +835,19 @@ function buildProfessorEmailDraft(professor, selectedClasses, accessLink) {
   return {
     to: professor.email,
     subject: "TA申请前置审核已完成",
-    body
+    text: body,
+    html: buildBrandedEmailHtml({
+      eyebrow: "TA 终审提醒",
+      title: "TA 申请前置审核已完成",
+      greeting,
+      intro: "你任教的以下教学班已完成 TA 申请前置审核，请进入系统进行最终审核。",
+      facts: [
+        { label: "审核入口", value: `<a href="${escapeHtml(accessLink)}" style="color:#1A2287;text-decoration:none;font-weight:700;">点击进入系统</a>` }
+      ],
+      listTitle: "待审核教学班",
+      listItems: selectedClasses.map((row) => `${row.course_name} / ${row.class_name}（${row.class_code}）`),
+      footer: "请勿将本邮件及其中链接转发给其他人员，以免造成学生申请信息、审核信息等敏感数据泄露。如邮件误收或不再负责相关审核工作，请及时删除并通知系统管理员。"
+    })
   };
 }
 
@@ -722,6 +881,199 @@ function createMailer() {
   });
 }
 
+function buildBrandedEmailHtml({ eyebrow, title, greeting, intro, facts = [], listTitle = "", listItems = [], footer = "" }) {
+  const factsHtml = facts.length
+    ? `<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="border-collapse:collapse;mso-table-lspace:0pt;mso-table-rspace:0pt;margin-top:18px;">
+      ${facts.map((item) => `<tr>
+        <td width="112" style="padding:10px 0;border-top:1px solid #E8E0D4;color:#887F6F;font-size:13px;line-height:18px;vertical-align:top;">${escapeHtml(item.label)}</td>
+        <td style="padding:10px 0;border-top:1px solid #E8E0D4;color:#2B231B;font-size:14px;line-height:22px;vertical-align:top;">${item.value}</td>
+      </tr>`).join("")}
+    </table>`
+    : "";
+  const listHtml = listItems.length
+    ? `<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="border-collapse:collapse;mso-table-lspace:0pt;mso-table-rspace:0pt;margin-top:20px;">
+        <tr>
+          <td style="padding:0 0 10px 0;color:#887F6F;font-size:13px;line-height:18px;font-weight:700;letter-spacing:1px;text-transform:uppercase;">${escapeHtml(listTitle || "相关信息")}</td>
+        </tr>
+        ${listItems.map((item) => `<tr>
+          <td style="padding:4px 0;color:#2B231B;font-size:14px;line-height:22px;">&#8226; ${escapeHtml(item)}</td>
+        </tr>`).join("")}
+      </table>`
+    : "";
+  return `<!doctype html>
+  <html lang="zh-CN">
+    <head>
+      <meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+      <meta name="x-apple-disable-message-reformatting">
+      <meta name="format-detection" content="telephone=no,address=no,email=no,date=no,url=no">
+    </head>
+    <body style="margin:0;padding:0;background-color:#F6F1E7;">
+      <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" bgcolor="#F6F1E7" style="width:100%;border-collapse:collapse;mso-table-lspace:0pt;mso-table-rspace:0pt;">
+        <tr>
+          <td align="center" style="padding:24px 12px;">
+            <table role="presentation" width="680" cellspacing="0" cellpadding="0" border="0" bgcolor="#FFFFFF" style="width:680px;max-width:680px;border-collapse:collapse;border:1px solid #E8E0D4;mso-table-lspace:0pt;mso-table-rspace:0pt;">
+              <tr>
+                <td bgcolor="#1A2287" style="padding:20px 28px;background-color:#1A2287;">
+                  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="border-collapse:collapse;">
+                    <tr>
+                      <td style="color:#D2AA6E;font-size:12px;line-height:18px;font-weight:700;letter-spacing:1px;text-transform:uppercase;">${escapeHtml(eyebrow || "SAIF TA System")}</td>
+                    </tr>
+                    <tr>
+                      <td style="padding-top:10px;color:#FFFFFF;font-size:28px;line-height:36px;font-weight:700;">${escapeHtml(title)}</td>
+                    </tr>
+                    <tr>
+                      <td style="padding-top:6px;color:#D9DDF8;font-size:14px;line-height:20px;">上海高级金融学院 TA 选课申请系统</td>
+                    </tr>
+                  </table>
+                </td>
+              </tr>
+              <tr>
+                <td style="padding:28px;">
+                  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="border-collapse:collapse;">
+                    <tr>
+                      <td style="color:#2B231B;font-size:16px;line-height:24px;font-weight:700;">${escapeHtml(greeting)}</td>
+                    </tr>
+                    <tr>
+                      <td style="padding-top:12px;color:#4B4034;font-size:14px;line-height:24px;">${escapeHtml(intro)}</td>
+                    </tr>
+                    <tr>
+                      <td>${factsHtml}${listHtml}</td>
+                    </tr>
+                    ${footer ? `<tr>
+                      <td style="padding-top:22px;">
+                        <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" bgcolor="#F6F1E7" style="border-collapse:collapse;background-color:#F6F1E7;">
+                          <tr>
+                            <td style="padding:14px 16px;color:#6D6257;font-size:13px;line-height:22px;">${escapeHtml(footer)}</td>
+                          </tr>
+                        </table>
+                      </td>
+                    </tr>` : ""}
+                  </table>
+                </td>
+              </tr>
+            </table>
+          </td>
+        </tr>
+      </table>
+    </body>
+  </html>`;
+}
+
+async function sendPlainTextEmail({ to, subject, text, html, cc }) {
+  if (!to) return;
+  const transporter = createMailer();
+  const fromAddress = String(process.env.SMTP_FROM || process.env.SMTP_USER || "").trim();
+  if (!fromAddress && String(process.env.SMTP_HOST || "").trim()) {
+    throw new Error("已配置 SMTP，但缺少 SMTP_FROM 发件人地址");
+  }
+  const message = { to, subject, text, html };
+  if (fromAddress) {
+    message.from = fromAddress;
+  }
+  if (cc) {
+    message.cc = cc;
+  }
+  await transporter.sendMail(message);
+}
+
+function buildTaAdminNewApplicationEmail(admin, applicant, classRow) {
+  return {
+    to: admin.email,
+    subject: "有新的 TA 申请待审核",
+    text: `${admin.user_name}老师您好，\n\n申请人 ${applicant.user_name} 已提交教学班《${classRow.class_name}》的 TA 申请，请尽快进入系统查看并完成初审。\n\n课程：${classRow.course_name}\n教学班：${classRow.class_name}\n教授：${classRow.teacher_name}\n\n请在系统中查看详细申请信息。`,
+    html: buildBrandedEmailHtml({
+      eyebrow: "新申请到达",
+      title: "有新的 TA 申请待审核",
+      greeting: `${admin.user_name}老师您好`,
+      intro: `申请人 ${applicant.user_name} 已提交新的 TA 申请，请尽快进入系统完成初审。`,
+      facts: [
+        { label: "课程", value: escapeHtml(classRow.course_name) },
+        { label: "教学班", value: escapeHtml(classRow.class_name) },
+        { label: "教授", value: escapeHtml(classRow.teacher_name) },
+        { label: "申请人", value: escapeHtml(applicant.user_name) }
+      ]
+    })
+  };
+}
+
+function buildTaDecisionEmail(applicant, app, result, comments) {
+  const isApproved = result === "Approved";
+  const intro = isApproved
+    ? `你的申请《${app.class_name}》已通过 TAAdmin 预审，待发布给 Professor 后进入最终审核。`
+    : `你的申请《${app.class_name}》未通过 TAAdmin 审核。`;
+  return {
+    to: applicant.email,
+    subject: isApproved ? "TA 预审通过通知" : "TA 预审结果通知",
+    text: `${applicant.user_name}你好，\n\n${intro}${comments ? `\nTAAdmin 备注：${comments}` : ""}\n\n教学班：${app.class_name}\n教授：${app.teacher_name}\n\n请进入系统查看申请详情。`,
+    html: buildBrandedEmailHtml({
+      eyebrow: "TA 预审结果",
+      title: isApproved ? "你的申请已通过 TAAdmin 预审" : "你的申请未通过 TAAdmin 审核",
+      greeting: `${applicant.user_name}你好`,
+      intro,
+      facts: [
+        { label: "教学班", value: escapeHtml(app.class_name) },
+        { label: "教授", value: escapeHtml(app.teacher_name) },
+        ...(comments ? [{ label: "TAAdmin 备注", value: escapeHtml(comments) }] : [])
+      ]
+    })
+  };
+}
+
+function buildProfessorDecisionEmail(applicant, app, result, comments) {
+  const isApproved = result === "Approved";
+  const intro = isApproved
+    ? `你的申请《${app.class_name}》已通过 Professor 审批。`
+    : `你的申请《${app.class_name}》未通过 Professor 审批。`;
+  return {
+    to: applicant.email,
+    subject: isApproved ? "Professor 审批通过通知" : "Professor 审批结果通知",
+    text: `${applicant.user_name}你好，\n\n${intro}${comments ? `\nProfessor 备注：${comments}` : ""}\n\n教学班：${app.class_name}\n教授：${app.teacher_name}\n\n请进入系统查看申请详情。`,
+    html: buildBrandedEmailHtml({
+      eyebrow: "Professor 终审结果",
+      title: isApproved ? "你的申请已通过 Professor 审批" : "你的申请未通过 Professor 审批",
+      greeting: `${applicant.user_name}你好`,
+      intro,
+      facts: [
+        { label: "教学班", value: escapeHtml(app.class_name) },
+        { label: "教授", value: escapeHtml(app.teacher_name) },
+        ...(comments ? [{ label: "Professor 备注", value: escapeHtml(comments) }] : [])
+      ]
+    })
+  };
+}
+
+function buildClassCapacityRejectedEmail(applicant, app) {
+  return {
+    to: applicant.email,
+    subject: "TA 申请结果通知",
+    text: `${applicant.user_name}你好，\n\n你的申请《${app.class_name}》因课程 TA 名额已满被系统自动拒绝。\n\n教学班：${app.class_name}\n教授：${app.teacher_name}\n拒绝原因：该课程TA已满\n\n请进入系统查看申请详情。`,
+    html: buildBrandedEmailHtml({
+      eyebrow: "系统自动处理",
+      title: "你的申请因 TA 名额已满被自动拒绝",
+      greeting: `${applicant.user_name}你好`,
+      intro: `你的申请《${app.class_name}》因课程 TA 名额已满，被系统自动拒绝。`,
+      facts: [
+        { label: "教学班", value: escapeHtml(app.class_name) },
+        { label: "教授", value: escapeHtml(app.teacher_name) },
+        { label: "拒绝原因", value: "该课程TA已满" }
+      ]
+    })
+  };
+}
+
+async function sendEmailsAndCollectErrors(emailJobs) {
+  const errors = [];
+  for (const job of emailJobs) {
+    if (!job || !job.to) continue;
+    try {
+      await sendPlainTextEmail(job);
+    } catch (error) {
+      errors.push(`${job.to}: ${error.message}`);
+    }
+  }
+  return errors;
+}
+
 async function sendProfessorNotificationEmails(db, classes, taAdmin, baseUrl) {
   const grouped = new Map();
   const findProfessor = db.prepare("select user_id, user_name, email from users where user_id = ? and role = 'Professor'");
@@ -750,7 +1102,8 @@ async function sendProfessorNotificationEmails(db, classes, taAdmin, baseUrl) {
     const message = {
       to: emailDraft.to,
       subject: emailDraft.subject,
-      text: emailDraft.body
+      text: emailDraft.text,
+      html: emailDraft.html
     };
     if (fromAddress) {
       message.from = fromAddress;
@@ -1632,6 +1985,8 @@ function pageLayout(title, body, user, notice) {
 }
 
 function loginPage(res, notice) {
+  const ssoConfig = getSsoConfig();
+  const ssoReady = getSsoMissingConfig(ssoConfig).length === 0;
   const body = `
     <div class="hero">
       <section class="card hero-panel">
@@ -1656,6 +2011,11 @@ function loginPage(res, notice) {
             <button type="submit">登录</button>
           </div>
         </form>
+        <div style="margin:18px 0 12px;text-align:center;color:#887F6F;font-size:13px;">或</div>
+        <div class="actions">
+          <a class="button-link secondary rect action-button" href="/login/sso">SSO 登录</a>
+        </div>
+        <p class="muted" style="margin-top:12px;">${ssoReady ? "如你已开通统一身份认证账号，可直接使用 SSO 登录。" : "SSO 登录入口已预留，待系统管理员补充 OAuth2 参数后启用。"}</p>
       </section>
     </div>`;
   sendHtml(res, pageLayout("登录", body, null, notice));
@@ -2618,7 +2978,7 @@ async function createApplication(req, res, user) {
   );
   db.prepare("update classes set published_to_professor = 'N', professor_notified_at = null where class_id = ?").run(classId);
   const applicationId = insertResult.lastInsertRowid;
-  const taAdmins = db.prepare("select user_id from users where role = 'TAAdmin'").all();
+  const taAdmins = db.prepare("select user_id, user_name, email from users where role = 'TAAdmin'").all();
   for (const admin of taAdmins) {
     createNotification(
       db,
@@ -2628,8 +2988,10 @@ async function createApplication(req, res, user) {
       `/admin/ta/pending/${applicationId}`
     );
   }
+  const emailJobs = taAdmins.map((admin) => buildTaAdminNewApplicationEmail(admin, user, classRow));
   db.close();
-  redirect(res, "/ta/applications?notice=申请已提交");
+  const emailErrors = await sendEmailsAndCollectErrors(emailJobs);
+  redirect(res, `/ta/applications?notice=${emailErrors.length ? "申请已提交，站内通知已发送，部分邮件发送失败" : "申请已提交，站内通知和邮件已发送"}`);
 }
 
 function taProfilePage(res, user, notice) {
@@ -2946,6 +3308,7 @@ function applyTaAdminDecision(db, approver, app, result, comments) {
   } else {
     createNotification(db, app.applier_user_id, "TA 审批未通过", `你的申请《${app.class_name}》被 TAAdmin 拒绝。`, `/ta/applications/${app.application_id}`);
   }
+  return nextStatus;
 }
 
 async function taAdminApprove(req, res, user, applicationId) {
@@ -2958,6 +3321,7 @@ async function taAdminApprove(req, res, user, applicationId) {
     db.close();
     return redirect(res, "/admin/ta/pending?notice=申请已被处理");
   }
+  const applicant = db.prepare("select user_id, user_name, email from users where user_id = ?").get(app.applier_user_id);
   try {
     applyTaAdminDecision(db, user, app, result, comments);
   } catch (error) {
@@ -2965,7 +3329,8 @@ async function taAdminApprove(req, res, user, applicationId) {
     return redirect(res, `/admin/ta/pending/${applicationId}?notice=${error.message}`);
   }
   db.close();
-  redirect(res, "/admin/ta/pending?notice=审批已完成");
+  const emailErrors = await sendEmailsAndCollectErrors([buildTaDecisionEmail(applicant, app, result, comments)]);
+  redirect(res, `/admin/ta/pending?notice=${emailErrors.length ? "审批已完成，站内通知已发送，部分邮件发送失败" : "审批已完成，站内通知和邮件已发送"}`);
 }
 
 async function taAdminBatchApprove(req, res, user) {
@@ -2978,8 +3343,10 @@ async function taAdminBatchApprove(req, res, user) {
   }
   const db = getDb();
   const selectApp = db.prepare("select * from applications where application_id = ?");
+  const selectApplicant = db.prepare("select user_id, user_name, email from users where user_id = ?");
   let processed = 0;
   let skipped = 0;
+  const emailJobs = [];
   try {
     db.exec("BEGIN");
     for (const applicationId of applicationIds) {
@@ -2989,6 +3356,7 @@ async function taAdminBatchApprove(req, res, user) {
         continue;
       }
       applyTaAdminDecision(db, user, app, result, comments);
+      emailJobs.push(buildTaDecisionEmail(selectApplicant.get(app.applier_user_id), app, result, comments));
       processed += 1;
     }
     db.exec("COMMIT");
@@ -2998,7 +3366,8 @@ async function taAdminBatchApprove(req, res, user) {
     return redirect(res, `/admin/ta/pending?notice=${error.message}`);
   }
   db.close();
-  redirect(res, `/admin/ta/pending?notice=批量审批完成：成功 ${processed} 条，跳过 ${skipped} 条`);
+  const emailErrors = await sendEmailsAndCollectErrors(emailJobs);
+  redirect(res, `/admin/ta/pending?notice=${emailErrors.length ? `批量审批完成：成功 ${processed} 条，跳过 ${skipped} 条；部分邮件发送失败` : `批量审批完成：成功 ${processed} 条，跳过 ${skipped} 条；站内通知和邮件已发送`}`);
 }
 
 function adminOverrideSection(actionPath, currentStatus) {
@@ -3359,6 +3728,7 @@ async function professorApprove(req, res, user, applicationId) {
     db.close();
     return redirect(res, "/professor/pending?notice=申请已被处理");
   }
+  const applicant = db.prepare("select user_id, user_name, email from users where user_id = ?").get(app.applier_user_id);
   const classRow = db.prepare("select * from classes where class_id = ?").get(app.class_id);
   if (result === "Approved") {
     const approvedCount = db.prepare("select count(*) as count from applications where class_id = ? and status = 'Approved'").get(app.class_id).count;
@@ -3377,6 +3747,7 @@ async function professorApprove(req, res, user, applicationId) {
     insert into approval_logs (application_id, approval_stage, approver_user_id, approver_name, result, comments, acted_at)
     values (?, 'Professor', ?, ?, ?, ?, ?)
   `).run(applicationId, user.user_id, user.user_name, result, comments, nowStr());
+  const emailJobs = [buildProfessorDecisionEmail(applicant, app, result, comments)];
   if (result === "Approved") {
     createNotification(db, app.applier_user_id, "Professor 审批通过", `你的申请《${app.class_name}》已通过 Professor 审批。`, `/ta/applications/${applicationId}`);
     const finalApprovedCount = db.prepare("select count(*) as count from applications where class_id = ? and status = 'Approved'").get(app.class_id).count;
@@ -3397,10 +3768,12 @@ async function professorApprove(req, res, user, applicationId) {
         insert into approval_logs (application_id, approval_stage, approver_user_id, approver_name, result, comments, acted_at)
         values (?, 'Professor', ?, ?, 'Rejected', ?, ?)
       `);
+      const selectApplicant = db.prepare("select user_id, user_name, email from users where user_id = ?");
       for (const other of otherApps) {
         rejectStmt.run(rejectReason, nowStr(), other.application_id);
         rejectLog.run(other.application_id, user.user_id, user.user_name, rejectReason, nowStr());
         createNotification(db, other.applier_user_id, "TA 申请被拒绝", `你的申请《${other.class_name}》因课程 TA 名额已满被自动拒绝。`, `/ta/applications/${other.application_id}`);
+        emailJobs.push(buildClassCapacityRejectedEmail(selectApplicant.get(other.applier_user_id), other));
       }
     }
     syncClassApplyAvailabilityByCapacity(db, app.class_id);
@@ -3408,7 +3781,8 @@ async function professorApprove(req, res, user, applicationId) {
     createNotification(db, app.applier_user_id, "Professor 审批未通过", `你的申请《${app.class_name}》被 Professor 拒绝。`, `/ta/applications/${applicationId}`);
   }
   db.close();
-  redirect(res, "/professor/pending?notice=终审已完成");
+  const emailErrors = await sendEmailsAndCollectErrors(emailJobs);
+  redirect(res, `/professor/pending?notice=${emailErrors.length ? "终审已完成，站内通知已发送，部分邮件发送失败" : "终审已完成，站内通知和邮件已发送"}`);
 }
 
 function professorOptions(selectedUserId) {
@@ -4257,7 +4631,7 @@ async function taAdminProfessorEmailPreview(req, res, user, notice) {
         <p>收件人：${escapeHtml(emailDraft.to)}</p>
         <p>抄送：${escapeHtml(user.email || "未设置")}</p>
         <p>主题：${escapeHtml(emailDraft.subject)}</p>
-        <pre style="white-space:pre-wrap;">${escapeHtml(emailDraft.body)}</pre>
+        <pre style="white-space:pre-wrap;">${escapeHtml(emailDraft.text)}</pre>
       </section>
     `;
   }).join("");
@@ -4411,6 +4785,7 @@ async function taAdminBatchApproveByClass(req, res, user, classId) {
   const result = String(body.result || "Rejected");
   const comments = String(body.comments || "").trim();
   const db = getDb();
+  const selectApplicant = db.prepare("select user_id, user_name, email from users where user_id = ?");
   const apps = db.prepare(`
     select *
     from applications
@@ -4422,16 +4797,19 @@ async function taAdminBatchApproveByClass(req, res, user, classId) {
     db.close();
     return redirect(res, `/admin/ta/classes/${classId}/applications?notice=当前教学班没有待审批申请`);
   }
+  const emailJobs = [];
   try {
     for (const app of apps) {
       applyTaAdminDecision(db, user, app, result, comments);
+      emailJobs.push(buildTaDecisionEmail(selectApplicant.get(app.applier_user_id), app, result, comments));
     }
   } catch (error) {
     db.close();
     return redirect(res, `/admin/ta/classes/${classId}/applications?notice=${error.message}`);
   }
   db.close();
-  redirect(res, `/admin/ta/classes/${classId}/applications?notice=批量审批已完成`);
+  const emailErrors = await sendEmailsAndCollectErrors(emailJobs);
+  redirect(res, `/admin/ta/classes/${classId}/applications?notice=${emailErrors.length ? "批量审批已完成，部分邮件发送失败" : "批量审批已完成，站内通知和邮件已发送"}`);
 }
 
 function courseClassDetailPage(res, user, classId, notice) {
@@ -5308,6 +5686,82 @@ async function batchDeleteClasses(req, res) {
   redirect(res, `/course/classes?notice=已批量删除 ${result.deletedCount} 个教学班及其关联数据`);
 }
 
+function startSsoLogin(req, res) {
+  const config = getSsoConfig();
+  const missing = getSsoMissingConfig(config);
+  if (missing.length) {
+    return redirect(res, `/?notice=SSO 尚未完成配置：缺少 ${missing.join(", ")}`);
+  }
+  const state = createSsoStatePayload("/");
+  const authorizeUrl = new URL(config.authUrl);
+  authorizeUrl.searchParams.set("response_type", "code");
+  authorizeUrl.searchParams.set("client_id", config.clientId);
+  authorizeUrl.searchParams.set("redirect_uri", config.redirectUri);
+  authorizeUrl.searchParams.set("scope", config.scope);
+  authorizeUrl.searchParams.set("state", state);
+  if (config.loginUrl) {
+    const loginUrl = new URL(config.loginUrl);
+    if (config.loginXStarted) {
+      loginUrl.searchParams.set("x_started", "true");
+    }
+    loginUrl.searchParams.set("redirect_uri", authorizeUrl.toString());
+    return redirect(res, loginUrl.toString());
+  }
+  return redirect(res, authorizeUrl.toString());
+}
+
+async function handleSsoCallback(req, res, url) {
+  const config = getSsoConfig();
+  const missing = getSsoMissingConfig(config);
+  if (missing.length) {
+    return redirect(res, `/?notice=SSO 尚未完成配置：缺少 ${missing.join(", ")}`);
+  }
+  const code = String(url.searchParams.get("code") || "").trim();
+  const state = String(url.searchParams.get("state") || "").trim();
+  const errorText = String(url.searchParams.get("error_description") || url.searchParams.get("error") || "").trim();
+  if (errorText) {
+    return redirect(res, `/?notice=SSO 登录失败：${errorText}`);
+  }
+  if (!code) {
+    return redirect(res, "/?notice=SSO 回调缺少 code");
+  }
+  const parsedState = parseSsoStatePayload(state);
+  if (!parsedState.nonce) {
+    return redirect(res, "/?notice=SSO 回调 state 无效");
+  }
+  let accessToken = "";
+  let userInfo = null;
+  let jwtPayload = null;
+  try {
+    accessToken = await exchangeSsoCodeForToken(code, config);
+    try {
+      jwtPayload = decodeJwtPayloadWithoutVerify(accessToken);
+    } catch (_error) {
+      jwtPayload = null;
+    }
+    try {
+      userInfo = await fetchSsoUserInfo(accessToken, config);
+    } catch (_error) {
+      userInfo = null;
+    }
+  } catch (error) {
+    return redirect(res, `/?notice=${error.message}`);
+  }
+  const loginName = String(userInfo?.[config.loginNameField] || jwtPayload?.[config.loginNameField] || "").trim();
+  if (!loginName) {
+    return redirect(res, `/?notice=SSO 用户信息中缺少 ${config.loginNameField}`);
+  }
+  const db = getDb();
+  const row = db.prepare("select * from users where login_name = ?").get(loginName);
+  db.close();
+  if (!row) {
+    return redirect(res, `/?notice=SSO 账号 ${loginName} 未在本系统开通`);
+  }
+  const sid = crypto.randomBytes(16).toString("hex");
+  sessions.set(sid, row.user_id);
+  return redirect(res, `${parsedState.targetPath || "/"}?notice=${row.user_name} 已通过 SSO 登录`, { "Set-Cookie": `sid=${sid}; Path=/; HttpOnly` });
+}
+
 async function handleRequest(req, res) {
   initDb();
   const url = new URL(req.url, `http://${req.headers.host}`);
@@ -5373,6 +5827,14 @@ async function handleRequest(req, res) {
     const sid = crypto.randomBytes(16).toString("hex");
     sessions.set(sid, row.user_id);
     return redirect(res, `/?notice=${row.user_name} 已登录`, { "Set-Cookie": `sid=${sid}; Path=/; HttpOnly` });
+  }
+
+  if (pathname === "/login/sso") {
+    return startSsoLogin(req, res);
+  }
+
+  if (pathname === "/login/sso/callback") {
+    return handleSsoCallback(req, res, url);
   }
 
   if (pathname === "/logout") {

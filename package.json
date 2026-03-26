@@ -7,6 +7,10 @@
     "start": "./node-v22.22.1-darwin-arm64/bin/node server.js"
   },
   "dependencies": {
+    "axios": "^1.13.6",
+    "express": "^5.2.1",
+    "express-session": "^1.19.0",
+    "jsonwebtoken": "^9.0.3",
     "nodemailer": "^8.0.2",
     "puppeteer-core": "^24.39.1",
     "xlsx": "^0.18.5"
