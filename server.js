@@ -351,153 +351,6 @@ function redirect(res, location, headers = {}) {
   res.end();
 }
 
-function ensureHttpUrl(value) {
-  const raw = String(value || "").trim();
-  if (!raw) return "";
-  if (/^https?:\/\//i.test(raw)) return raw;
-  return `http://${raw}`;
-}
-
-function getSsoConfig() {
-  return {
-    loginUrl: ensureHttpUrl(process.env.SSO_LOGIN_URL),
-    authUrl: ensureHttpUrl(process.env.SSO_AUTH_URL),
-    tokenUrl: ensureHttpUrl(process.env.SSO_TOKEN_URL),
-    userInfoUrl: ensureHttpUrl(process.env.SSO_USERINFO_URL),
-    clientId: String(process.env.SSO_CLIENT_ID || "").trim(),
-    clientSecret: String(process.env.SSO_CLIENT_SECRET || "").trim(),
-    redirectUri: ensureHttpUrl(process.env.SSO_REDIRECT_URI),
-    loginNameField: String(process.env.SSO_LOGIN_NAME_FIELD || "account").trim(),
-    scope: String(process.env.SSO_SCOPE || "openid profile").trim(),
-    loginXStarted: String(process.env.SSO_LOGIN_X_STARTED || "Y").trim().toUpperCase() !== "N"
-  };
-}
-
-function getSsoMissingConfig(config = getSsoConfig()) {
-  const missing = [];
-  if (!config.authUrl) missing.push("SSO_AUTH_URL");
-  if (!config.tokenUrl) missing.push("SSO_TOKEN_URL");
-  if (!config.userInfoUrl) missing.push("SSO_USERINFO_URL");
-  if (!config.clientId) missing.push("SSO_CLIENT_ID");
-  if (!config.clientSecret) missing.push("SSO_CLIENT_SECRET");
-  if (!config.redirectUri) missing.push("SSO_REDIRECT_URI");
-  if (!config.loginNameField) missing.push("SSO_LOGIN_NAME_FIELD");
-  return missing;
-}
-
-function createSsoStatePayload(targetPath = "/") {
-  return Buffer.from(JSON.stringify({
-    nonce: crypto.randomBytes(12).toString("hex"),
-    targetPath
-  }), "utf8").toString("base64url");
-}
-
-function parseSsoStatePayload(value) {
-  try {
-    const raw = Buffer.from(String(value || ""), "base64url").toString("utf8");
-    const parsed = JSON.parse(raw);
-    return {
-      nonce: String(parsed.nonce || "").trim(),
-      targetPath: String(parsed.targetPath || "/").trim() || "/"
-    };
-  } catch (_error) {
-    return { nonce: "", targetPath: "/" };
-  }
-}
-
-function httpRequest(urlString, { method = "GET", headers = {}, body = null } = {}) {
-  return new Promise((resolve, reject) => {
-    const target = new URL(urlString);
-    const transport = target.protocol === "https:" ? require("node:https") : require("node:http");
-    const req = transport.request({
-      protocol: target.protocol,
-      hostname: target.hostname,
-      port: target.port || (target.protocol === "https:" ? 443 : 80),
-      path: `${target.pathname}${target.search}`,
-      method,
-      headers
-    }, (res) => {
-      const chunks = [];
-      res.on("data", (chunk) => chunks.push(chunk));
-      res.on("end", () => {
-        resolve({
-          statusCode: res.statusCode || 0,
-          headers: res.headers,
-          body: Buffer.concat(chunks).toString("utf8")
-        });
-      });
-    });
-    req.on("error", reject);
-    if (body) {
-      req.write(body);
-    }
-    req.end();
-  });
-}
-
-async function exchangeSsoCodeForToken(code, config = getSsoConfig()) {
-  const body = querystring.stringify({
-    grant_type: "authorization_code",
-    code,
-    redirect_uri: config.redirectUri,
-    client_id: config.clientId,
-    client_secret: config.clientSecret
-  });
-  const response = await httpRequest(config.tokenUrl, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/x-www-form-urlencoded",
-      "Content-Length": Buffer.byteLength(body)
-    },
-    body
-  });
-  if (response.statusCode < 200 || response.statusCode >= 300) {
-    throw new Error(`SSO token 接口返回异常（HTTP ${response.statusCode}）`);
-  }
-  let payload;
-  try {
-    payload = JSON.parse(response.body);
-  } catch (_error) {
-    throw new Error("SSO token 接口返回的不是合法 JSON");
-  }
-  const accessToken = String(payload.access_token || payload.accessToken || "").trim();
-  if (!accessToken) {
-    throw new Error("SSO token 响应中缺少 access_token");
-  }
-  return accessToken;
-}
-
-async function fetchSsoUserInfo(accessToken, config = getSsoConfig()) {
-  const response = await httpRequest(config.userInfoUrl, {
-    headers: {
-      Authorization: `Bearer ${accessToken}`
-    }
-  });
-  if (response.statusCode < 200 || response.statusCode >= 300) {
-    throw new Error(`SSO 用户信息接口返回异常（HTTP ${response.statusCode}）`);
-  }
-  let payload;
-  try {
-    payload = JSON.parse(response.body);
-  } catch (_error) {
-    throw new Error("SSO 用户信息接口返回的不是合法 JSON");
-  }
-  return payload;
-}
-
-function decodeJwtPayloadWithoutVerify(token) {
-  const parts = String(token || "").split(".");
-  if (parts.length < 2) {
-    throw new Error("access_token 不是合法 JWT");
-  }
-  try {
-    const payload = Buffer.from(parts[1], "base64url").toString("utf8");
-    return JSON.parse(payload);
-  } catch (_error) {
-    throw new Error("access_token JWT payload 解析失败");
-  }
-}
-
 function consumeLoginToken(res, token) {
   const db = getDb();
   const row = db.prepare("select * from login_tokens where token = ? and used_at is null").get(token);
@@ -1985,8 +1838,6 @@ function pageLayout(title, body, user, notice) {
 }
 
 function loginPage(res, notice) {
-  const ssoConfig = getSsoConfig();
-  const ssoReady = getSsoMissingConfig(ssoConfig).length === 0;
   const body = `
     <div class="hero">
       <section class="card hero-panel">
@@ -2011,11 +1862,6 @@ function loginPage(res, notice) {
             <button type="submit">登录</button>
           </div>
         </form>
-        <div style="margin:18px 0 12px;text-align:center;color:#887F6F;font-size:13px;">或</div>
-        <div class="actions">
-          <a class="button-link secondary rect action-button" href="/login/sso">SSO 登录</a>
-        </div>
-        <p class="muted" style="margin-top:12px;">${ssoReady ? "如你已开通统一身份认证账号，可直接使用 SSO 登录。" : "SSO 登录入口已预留，待系统管理员补充 OAuth2 参数后启用。"}</p>
       </section>
     </div>`;
   sendHtml(res, pageLayout("登录", body, null, notice));
@@ -5686,82 +5532,6 @@ async function batchDeleteClasses(req, res) {
   redirect(res, `/course/classes?notice=已批量删除 ${result.deletedCount} 个教学班及其关联数据`);
 }
 
-function startSsoLogin(req, res) {
-  const config = getSsoConfig();
-  const missing = getSsoMissingConfig(config);
-  if (missing.length) {
-    return redirect(res, `/?notice=SSO 尚未完成配置：缺少 ${missing.join(", ")}`);
-  }
-  const state = createSsoStatePayload("/");
-  const authorizeUrl = new URL(config.authUrl);
-  authorizeUrl.searchParams.set("response_type", "code");
-  authorizeUrl.searchParams.set("client_id", config.clientId);
-  authorizeUrl.searchParams.set("redirect_uri", config.redirectUri);
-  authorizeUrl.searchParams.set("scope", config.scope);
-  authorizeUrl.searchParams.set("state", state);
-  if (config.loginUrl) {
-    const loginUrl = new URL(config.loginUrl);
-    if (config.loginXStarted) {
-      loginUrl.searchParams.set("x_started", "true");
-    }
-    loginUrl.searchParams.set("redirect_uri", authorizeUrl.toString());
-    return redirect(res, loginUrl.toString());
-  }
-  return redirect(res, authorizeUrl.toString());
-}
-
-async function handleSsoCallback(req, res, url) {
-  const config = getSsoConfig();
-  const missing = getSsoMissingConfig(config);
-  if (missing.length) {
-    return redirect(res, `/?notice=SSO 尚未完成配置：缺少 ${missing.join(", ")}`);
-  }
-  const code = String(url.searchParams.get("code") || "").trim();
-  const state = String(url.searchParams.get("state") || "").trim();
-  const errorText = String(url.searchParams.get("error_description") || url.searchParams.get("error") || "").trim();
-  if (errorText) {
-    return redirect(res, `/?notice=SSO 登录失败：${errorText}`);
-  }
-  if (!code) {
-    return redirect(res, "/?notice=SSO 回调缺少 code");
-  }
-  const parsedState = parseSsoStatePayload(state);
-  if (!parsedState.nonce) {
-    return redirect(res, "/?notice=SSO 回调 state 无效");
-  }
-  let accessToken = "";
-  let userInfo = null;
-  let jwtPayload = null;
-  try {
-    accessToken = await exchangeSsoCodeForToken(code, config);
-    try {
-      jwtPayload = decodeJwtPayloadWithoutVerify(accessToken);
-    } catch (_error) {
-      jwtPayload = null;
-    }
-    try {
-      userInfo = await fetchSsoUserInfo(accessToken, config);
-    } catch (_error) {
-      userInfo = null;
-    }
-  } catch (error) {
-    return redirect(res, `/?notice=${error.message}`);
-  }
-  const loginName = String(userInfo?.[config.loginNameField] || jwtPayload?.[config.loginNameField] || "").trim();
-  if (!loginName) {
-    return redirect(res, `/?notice=SSO 用户信息中缺少 ${config.loginNameField}`);
-  }
-  const db = getDb();
-  const row = db.prepare("select * from users where login_name = ?").get(loginName);
-  db.close();
-  if (!row) {
-    return redirect(res, `/?notice=SSO 账号 ${loginName} 未在本系统开通`);
-  }
-  const sid = crypto.randomBytes(16).toString("hex");
-  sessions.set(sid, row.user_id);
-  return redirect(res, `${parsedState.targetPath || "/"}?notice=${row.user_name} 已通过 SSO 登录`, { "Set-Cookie": `sid=${sid}; Path=/; HttpOnly` });
-}
-
 async function handleRequest(req, res) {
   initDb();
   const url = new URL(req.url, `http://${req.headers.host}`);
@@ -5827,14 +5597,6 @@ async function handleRequest(req, res) {
     const sid = crypto.randomBytes(16).toString("hex");
     sessions.set(sid, row.user_id);
     return redirect(res, `/?notice=${row.user_name} 已登录`, { "Set-Cookie": `sid=${sid}; Path=/; HttpOnly` });
-  }
-
-  if (pathname === "/login/sso") {
-    return startSsoLogin(req, res);
-  }
-
-  if (pathname === "/login/sso/callback") {
-    return handleSsoCallback(req, res, url);
   }
 
   if (pathname === "/logout") {
