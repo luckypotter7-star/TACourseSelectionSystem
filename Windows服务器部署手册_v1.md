@@ -3,10 +3,12 @@
 ## 1. 适用范围
 
 本手册适用于当前 TA 选课系统的 Windows 服务器部署版本。  
-当前系统技术栈如下：
+当前系统默认以 **MySQL** 作为主数据库运行，并保留 SQLite 兼容回退能力。
 
-- Node.js
-- SQLite
+当前项目技术栈如下：
+
+- Node.js 22
+- MySQL 8.4 LTS 或更稳定的企业可用版本
 - 服务端渲染 HTML
 - 文件上传目录：`uploads/`
 - 静态资源目录：`assets/`
@@ -16,7 +18,7 @@
 
 - 启动文件：`server.js`
 - 依赖文件：`package.json`
-- 数据库文件：`ta_system_node.db`
+- MySQL 结构脚本：`db/mysql_schema.sql`
 - 上传目录：`uploads`
 - 资源目录：`assets`
 - 配置文件：`.env.local`
@@ -26,9 +28,10 @@
 部署完成后，应达到以下效果：
 
 1. 用户可通过服务器地址或正式域名访问 TA 系统。
-2. 系统可稳定运行，不依赖手工打开命令行窗口。
+2. 系统默认连接 MySQL 数据库运行。
 3. 附件上传、邮件通知、日志与数据库可持续保存。
 4. 服务器重启后，系统可自动恢复运行。
+5. 后续可继续接入 IIS / HTTPS / 域名 / SSO。
 
 ## 3. 部署前准备
 
@@ -42,6 +45,7 @@
 - 是否有公网访问需求
 - 是否已有正式域名
 - 是否计划启用 HTTPS
+- MySQL 是否计划与应用部署在同一台服务器
 
 建议至少准备：
 
@@ -59,9 +63,11 @@ D:\TASystem
 │   ├── server.js
 │   ├── package.json
 │   ├── package-lock.json
+│   ├── config
+│   ├── db
+│   ├── scripts
 │   ├── assets
 │   ├── uploads
-│   ├── ta_system_node.db
 │   └── .env.local
 ├── logs
 └── backups
@@ -71,7 +77,7 @@ D:\TASystem
 
 - `app`：应用主目录
 - `logs`：运行日志目录
-- `backups`：数据库与附件备份目录
+- `backups`：数据库、附件和配置备份目录
 
 ## 4. 软件安装清单
 
@@ -98,7 +104,25 @@ npm -v
 git --version
 ```
 
-### 4.3 PM2
+### 4.3 MySQL Server
+
+建议安装：
+
+- **MySQL Community Server 8.4 LTS**
+
+安装建议：
+
+- 端口：`3306`
+- 字符集：后续建库时统一使用 `utf8mb4`
+- 为 TA 系统单独创建数据库，例如：`ta_system`
+
+安装完成后，建议确认：
+
+```powershell
+mysql --version
+```
+
+### 4.4 PM2
 
 用于管理 Node 进程。
 
@@ -114,7 +138,7 @@ npm install -g pm2
 pm2 -v
 ```
 
-### 4.4 IIS 与 URL Rewrite（推荐）
+### 4.5 IIS 与 URL Rewrite（推荐）
 
 如果计划使用正式域名和 HTTPS，建议启用：
 
@@ -157,20 +181,45 @@ cd D:\TASystem\app
 npm install
 ```
 
-## 6. 准备运行文件
+## 6. 准备数据库
 
-### 6.1 数据库文件
+### 6.1 创建 MySQL 数据库
 
-当前系统使用 SQLite。  
-请将现有数据库文件复制到：
+建议创建：
 
-```text
-D:\TASystem\app\ta_system_node.db
+```sql
+CREATE DATABASE ta_system CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
 ```
 
-如果不复制，系统会按当前代码初始化空库或种子数据。
+### 6.2 初始化表结构
 
-### 6.2 上传目录
+在项目根目录执行：
+
+```powershell
+node scripts\init_mysql.js
+```
+
+该脚本会根据：
+
+```text
+db\mysql_schema.sql
+```
+
+初始化当前系统的 MySQL 表结构。
+
+### 6.3 迁移现有 SQLite 数据（如有）
+
+如果你已有本地或测试环境的 SQLite 数据，希望迁到 MySQL，可执行：
+
+```powershell
+node scripts\migrate_sqlite_to_mysql.js
+```
+
+执行前建议先备份 SQLite 数据和 MySQL 空库。
+
+## 7. 准备运行目录
+
+### 7.1 上传目录
 
 请确认目录存在：
 
@@ -184,7 +233,7 @@ D:\TASystem\app\uploads
 mkdir D:\TASystem\app\uploads
 ```
 
-### 6.3 静态资源目录
+### 7.2 静态资源目录
 
 请确认目录存在：
 
@@ -194,7 +243,7 @@ D:\TASystem\app\assets
 
 此目录中应包含当前使用的 SAIF Logo 等资源文件。
 
-## 7. 配置 `.env.local`
+## 8. 配置 `.env.local`
 
 在 `D:\TASystem\app` 下创建：
 
@@ -205,9 +254,18 @@ D:\TASystem\app\assets
 建议至少包含以下配置：
 
 ```env
+DB_CLIENT=mysql
+
 HOST=0.0.0.0
 PORT=3000
 PUBLIC_BASE_URL=https://你的正式域名
+
+MYSQL_HOST=127.0.0.1
+MYSQL_PORT=3306
+MYSQL_USER=你的MySQL账号
+MYSQL_PASSWORD=你的MySQL密码
+MYSQL_DATABASE=ta_system
+MYSQL_CONNECTION_LIMIT=10
 
 SMTP_HOST=smtp.qq.com
 SMTP_PORT=465
@@ -215,13 +273,17 @@ SMTP_SECURE=true
 SMTP_USER=你的邮箱
 SMTP_PASS=你的SMTP授权码
 SMTP_FROM=你的邮箱
+
+MAIL_USE_SENDMAIL=N
 ```
 
 说明：
 
+- `DB_CLIENT=mysql`：当前正式环境默认值
 - `HOST=0.0.0.0`：允许其他机器访问
 - `PORT=3000`：Node 服务监听端口
 - `PUBLIC_BASE_URL`：邮件链接、免登录链接等使用的外部访问地址
+- `MYSQL_*`：MySQL 连接配置
 - SMTP 配置：用于系统邮件发送
 
 如果当前没有正式域名，可临时写成：
@@ -235,7 +297,7 @@ PUBLIC_BASE_URL=http://服务器IP:3000
 - 正式域名
 - HTTPS
 
-## 8. 本机直接启动测试
+## 9. 本机直接启动测试
 
 先在服务器上直接启动，确认系统本身可运行：
 
@@ -247,7 +309,8 @@ node server.js
 若控制台显示类似：
 
 ```text
-Server running at http://0.0.0.0:3000
+TA system MVP running at http://0.0.0.0:3000
+[db] 默认数据库：MySQL。当前主流程、管理主链、报表、审计与导入已切换到 MySQL。
 ```
 
 说明服务已经启动。
@@ -258,228 +321,137 @@ Server running at http://0.0.0.0:3000
 http://127.0.0.1:3000
 ```
 
-再从内网其他电脑访问：
+## 10. 局域网访问测试
+
+如果要让内网其他电脑访问，请确认：
+
+1. `.env.local` 中 `HOST=0.0.0.0`
+2. Windows 防火墙已允许对应端口
+3. 服务器网络策略允许内网访问
+
+然后从其他电脑访问：
 
 ```text
 http://服务器IP:3000
 ```
 
-## 9. 防火墙放行
+## 11. 使用 PM2 管理服务
 
-如果其他机器无法访问，请检查 Windows 防火墙。
-
-可放行 3000 端口：
-
-```powershell
-New-NetFirewallRule -DisplayName "TA System 3000" -Direction Inbound -Protocol TCP -LocalPort 3000 -Action Allow
-```
-
-如果后续走 IIS 反向代理，通常只需开放：
-
-- 80
-- 443
-
-## 10. 使用 PM2 守护进程
-
-### 10.1 启动应用
+### 11.1 启动
 
 ```powershell
 cd D:\TASystem\app
 pm2 start server.js --name ta-system
 ```
 
-### 10.2 查看状态
+### 11.2 查看状态
 
 ```powershell
 pm2 status
 ```
 
-### 10.3 查看日志
+### 11.3 查看日志
 
 ```powershell
 pm2 logs ta-system
 ```
 
-### 10.4 重启应用
+### 11.4 保存进程列表
 
 ```powershell
-pm2 restart ta-system
+pm2 save
 ```
 
-### 10.5 停止应用
+### 11.5 配置开机自启动
 
-```powershell
-pm2 stop ta-system
-```
+Windows 下可结合：
 
-## 11. Windows 开机自动启动
+- `pm2 startup`
+- 或任务计划程序
+- 或 `nssm`
 
-Windows 下 PM2 开机自启不如 Linux 简单，建议用以下两种方式之一。
+如果你们服务器运维规范更偏 Windows 原生服务，推荐后续再评估 `nssm` 方案。
 
-### 方案 A：使用 PM2 + 启动脚本
+## 12. 通过 IIS 反向代理（推荐）
 
-可在系统启动后自动执行：
+正式环境建议：
 
-```powershell
-pm2 resurrect
-```
+- IIS 对外提供 `80/443`
+- Node 服务仍监听 `3000`
+- IIS 反代到 `http://127.0.0.1:3000`
 
-然后通过“任务计划程序”在开机时运行该命令。
+推荐原因：
 
-### 方案 B：使用 NSSM（推荐）
-
-安装 NSSM 后，将 Node 服务注册为 Windows 服务。
-
-示例：
-
-- Application：`C:\Program Files\nodejs\node.exe`
-- Startup directory：`D:\TASystem\app`
-- Arguments：`server.js`
-
-优点：
-
-- 更符合 Windows 服务管理方式
-- 更稳定
-- 可配合服务自动重启
-
-如果你后面决定正式上线，我建议优先使用：
-
-- IIS 反向代理
-- NSSM 管理 Node 服务
-
-## 12. 配置 IIS 反向代理（推荐正式环境）
-
-### 12.1 IIS 作用
-
-IIS 负责：
-
-- 对外暴露正式域名
-- 处理 HTTPS 证书
-- 将请求转发到 Node `3000`
-
-### 12.2 推荐架构
-
-```text
-浏览器 -> IIS(80/443) -> Node.js(127.0.0.1:3000)
-```
-
-### 12.3 IIS 配置要点
-
-1. 在 IIS 中新建站点，绑定域名
-2. 安装并启用：
-   - URL Rewrite
-   - ARR
-3. 配置反向代理到：
-
-```text
-http://127.0.0.1:3000
-```
-
-4. 绑定 HTTPS 证书
-
-### 12.4 为什么建议用 IIS
-
-原因：
-
-- 统一对外入口
+- 更容易绑定正式域名
 - 更容易接 HTTPS
-- 未来若接 SSO，更容易满足回调地址要求
-- 正式域名管理更规范
+- 更利于后续接 SSO
+- 更适合生产发布
 
-## 13. 正式上线前检查清单
+## 13. 上线前检查项
 
-上线前建议逐项确认：
+上线前建议至少逐项确认：
 
-### 13.1 基础访问
+1. 本地登录正常
+2. TA 申请正常
+3. TAAdmin 审批正常
+4. Professor 审批正常
+5. 教学班管理正常
+6. 人员管理正常
+7. 导入导出正常
+8. 审计日志正常
+9. 报表页面正常
+10. SMTP 发信正常
+11. 附件上传、下载正常
+12. MySQL 数据库连接稳定
+13. 备份目录已准备
 
-- 首页可访问
-- 本地登录正常
-- 各角色能正常进入首页
+## 14. 当前推荐备份对象
 
-### 13.2 核心流程
+当前默认 MySQL 部署下，重点备份对象为：
 
-- TA 可提交申请
-- TA 可撤销申请
-- TAAdmin 可审批
-- 教学班可发布至 Professor
-- Professor 可终审
-- 名额满后可自动拒绝其他申请
+1. MySQL 数据库 `ta_system`
+2. `uploads/`
+3. `.env.local`
+4. `assets/`
 
-### 13.3 管理功能
+说明：
 
-- 教学班新增/编辑/删除正常
-- 人员新增/编辑/删除正常
-- Excel 导入人员正常
-- Excel 导入教学班正常
+- 当前数据库已不再以 SQLite 为默认生产方案
+- 备份数据库时建议使用 `mysqldump`
 
-### 13.4 邮件与通知
+例如：
 
-- TA 提交申请后，TAAdmin 收到邮件
-- TAAdmin 审批后，TA 收到邮件
-- Professor 审批后，TA 收到邮件
-- 站内通知同步正常
-
-### 13.5 附件
-
-- 个人简历上传正常
-- 申请附件引用正常
-- 下载附件正常
-
-### 13.6 日志与审计
-
-- 审计日志可查看
-- 申请业务日志可查看
-- 申请日志列表页可筛选
-
-## 14. 备份策略
-
-当前系统至少要备份以下内容：
-
-### 14.1 SQLite 数据库
-
-```text
-D:\TASystem\app\ta_system_node.db
+```powershell
+mysqldump -h 127.0.0.1 -P 3306 -u root -p ta_system > D:\TASystem\backups\daily\ta_system_2026-03-30.sql
 ```
 
-### 14.2 上传附件
+## 15. 推荐上线顺序
 
-```text
-D:\TASystem\app\uploads
-```
+建议按这个顺序推进：
 
-### 14.3 配置文件
+1. 安装 Node / Git / MySQL / PM2
+2. 拉代码并安装依赖
+3. 配置 `.env.local`
+4. 初始化 MySQL
+5. 如有旧数据，则执行迁移
+6. 本机启动测试
+7. 内网访问测试
+8. PM2 托管
+9. IIS / HTTPS / 域名接入
+10. 上线前全量回归
 
-```text
-D:\TASystem\app\.env.local
-```
+## 16. 当前结论
 
-### 14.4 备份频率建议
+就当前系统状态而言，Windows 服务器部署建议已经从：
 
-建议：
+- `SQLite 本地文件部署`
 
-- 数据库：每日备份
-- uploads：每日备份
-- `.env.local`：修改后立即备份
+切换为：
 
-## 15. 当前阶段建议部署方案
+- `MySQL 默认部署`
 
-基于你当前系统成熟度，建议按下面顺序推进：
+SQLite 仅建议保留为：
 
-1. 先在 Windows 服务器上以内网方式部署
-2. 先用 SQLite 跑正式试运行
-3. 先把邮件、附件、日志、权限都验证稳定
-4. 再考虑：
-   - IIS + HTTPS
-   - 正式域名
-   - SSO
-   - MySQL
-
-## 16. 下一步建议
-
-完成本手册后，建议下一步继续输出：
-
-1. Windows 服务器部署检查清单
-2. IIS 反向代理配置模板
-3. `.env.local` 正式环境模板
-4. 备份与恢复手册
-
+- 本地快速回退
+- 历史兼容
+- 紧急调试

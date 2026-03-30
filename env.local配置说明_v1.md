@@ -9,10 +9,14 @@
 .env.local
 ```
 
+当前系统默认以 **MySQL** 作为运行数据库。  
+SQLite 仅保留为兼容回退和本地调试用途。
+
 建议：
 
 - 开发环境、本机测试环境、服务器正式环境都使用同一个文件名
 - 不同环境只修改值，不修改字段名
+- 正式环境以 MySQL 配置为准
 
 ## 2. 文件位置
 
@@ -31,6 +35,16 @@ D:\TASystem\app\.env.local
 ## 3. 当前统一推荐模板
 
 ```env
+# 数据库
+DB_CLIENT=mysql
+
+MYSQL_HOST=127.0.0.1
+MYSQL_PORT=3306
+MYSQL_USER=root
+MYSQL_PASSWORD=your_mysql_password
+MYSQL_DATABASE=ta_system
+MYSQL_CONNECTION_LIMIT=10
+
 # 服务监听
 HOST=0.0.0.0
 PORT=3000
@@ -52,7 +66,92 @@ MAIL_USE_SENDMAIL=N
 
 ## 4. 字段说明
 
-### 4.1 `HOST`
+### 4.1 `DB_CLIENT`
+
+用途：
+
+- 指定当前应用使用的数据库类型
+
+建议值：
+
+- 默认：`mysql`
+- 临时回退：`sqlite`
+
+说明：
+
+- 当前正式部署建议固定为 `mysql`
+- 若需要临时兼容调试，可显式设为 `sqlite`
+
+### 4.2 `MYSQL_HOST`
+
+用途：
+
+- MySQL 服务地址
+
+示例：
+
+```env
+MYSQL_HOST=127.0.0.1
+```
+
+### 4.3 `MYSQL_PORT`
+
+用途：
+
+- MySQL 服务端口
+
+默认值：
+
+```env
+MYSQL_PORT=3306
+```
+
+### 4.4 `MYSQL_USER`
+
+用途：
+
+- MySQL 登录账号
+
+示例：
+
+```env
+MYSQL_USER=root
+```
+
+### 4.5 `MYSQL_PASSWORD`
+
+用途：
+
+- MySQL 登录密码
+
+说明：
+
+- 正式环境应使用受控账号，不建议长期使用高权限 root 账号
+
+### 4.6 `MYSQL_DATABASE`
+
+用途：
+
+- 当前系统使用的数据库名
+
+建议值：
+
+```env
+MYSQL_DATABASE=ta_system
+```
+
+### 4.7 `MYSQL_CONNECTION_LIMIT`
+
+用途：
+
+- MySQL 连接池大小
+
+建议值：
+
+- 默认可使用 `10`
+- 并发较高时可根据服务器资源再调整
+
+### 4.8 `HOST`
 
 用途：
 
@@ -67,7 +166,7 @@ MAIL_USE_SENDMAIL=N
 
 - 如果要让内网其他设备访问，必须使用 `0.0.0.0`
 
-### 4.2 `PORT`
+### 4.9 `PORT`
 
 用途：
 
@@ -81,7 +180,7 @@ MAIL_USE_SENDMAIL=N
 
 - 如果后续通过 IIS 反向代理，也可以继续保持 `3000`
 
-### 4.3 `PUBLIC_BASE_URL`
+### 4.10 `PUBLIC_BASE_URL`
 
 用途：
 
@@ -113,7 +212,7 @@ PUBLIC_BASE_URL=https://ta.saif.sjtu.edu.cn
 - 不要写成 `0.0.0.0`
 - 正式环境推荐使用 `https + 正式域名`
 
-### 4.4 `SMTP_HOST`
+### 4.11 `SMTP_HOST`
 
 用途：
 
@@ -125,7 +224,7 @@ PUBLIC_BASE_URL=https://ta.saif.sjtu.edu.cn
 SMTP_HOST=smtp.qq.com
 ```
 
-### 4.5 `SMTP_PORT`
+### 4.12 `SMTP_PORT`
 
 用途：
 
@@ -142,7 +241,7 @@ SMTP_HOST=smtp.qq.com
 SMTP_PORT=465
 ```
 
-### 4.6 `SMTP_SECURE`
+### 4.13 `SMTP_SECURE`
 
 用途：
 
@@ -159,19 +258,13 @@ SMTP_PORT=465
 SMTP_SECURE=true
 ```
 
-### 4.7 `SMTP_USER`
+### 4.14 `SMTP_USER`
 
 用途：
 
 - 发信账号
 
-示例：
-
-```env
-SMTP_USER=179038726@qq.com
-```
-
-### 4.8 `SMTP_PASS`
+### 4.15 `SMTP_PASS`
 
 用途：
 
@@ -182,7 +275,7 @@ SMTP_USER=179038726@qq.com
 - QQ 邮箱应填写 SMTP 授权码
 - 不建议直接写邮箱网页登录密码
 
-### 4.9 `SMTP_FROM`
+### 4.16 `SMTP_FROM`
 
 用途：
 
@@ -192,13 +285,7 @@ SMTP_USER=179038726@qq.com
 
 - 与 `SMTP_USER` 保持一致
 
-示例：
-
-```env
-SMTP_FROM=179038726@qq.com
-```
-
-### 4.10 `MAIL_USE_SENDMAIL`
+### 4.17 `MAIL_USE_SENDMAIL`
 
 用途：
 
@@ -219,6 +306,13 @@ SMTP_FROM=179038726@qq.com
 ### 5.1 本机开发
 
 ```env
+DB_CLIENT=mysql
+MYSQL_HOST=127.0.0.1
+MYSQL_PORT=3306
+MYSQL_USER=root
+MYSQL_PASSWORD=你的MySQL密码
+MYSQL_DATABASE=ta_system
+MYSQL_CONNECTION_LIMIT=10
 HOST=127.0.0.1
 PORT=3000
 PUBLIC_BASE_URL=http://127.0.0.1:3000
@@ -234,6 +328,13 @@ MAIL_USE_SENDMAIL=N
 ### 5.2 内网测试
 
 ```env
+DB_CLIENT=mysql
+MYSQL_HOST=127.0.0.1
+MYSQL_PORT=3306
+MYSQL_USER=root
+MYSQL_PASSWORD=你的MySQL密码
+MYSQL_DATABASE=ta_system
+MYSQL_CONNECTION_LIMIT=10
 HOST=0.0.0.0
 PORT=3000
 PUBLIC_BASE_URL=http://服务器内网IP:3000
@@ -249,6 +350,13 @@ MAIL_USE_SENDMAIL=N
 ### 5.3 正式部署
 
 ```env
+DB_CLIENT=mysql
+MYSQL_HOST=127.0.0.1
+MYSQL_PORT=3306
+MYSQL_USER=ta_system_user
+MYSQL_PASSWORD=你的正式数据库密码
+MYSQL_DATABASE=ta_system
+MYSQL_CONNECTION_LIMIT=10
 HOST=0.0.0.0
 PORT=3000
 PUBLIC_BASE_URL=https://你的正式域名
@@ -261,60 +369,10 @@ SMTP_FROM=你的邮箱
 MAIL_USE_SENDMAIL=N
 ```
 
-## 6. 当前系统实际依赖这些字段的功能
+## 6. 当前建议
 
-### 6.1 `PUBLIC_BASE_URL` 影响的功能
+基于当前系统状态，推荐你后续统一采用：
 
-- 教授邮件中的系统链接
-- 免登录审核链接
-- 所有邮件中的系统访问地址
-
-### 6.2 SMTP 相关字段影响的功能
-
-- TA 提交申请后通知 TAAdmin
-- TAAdmin 审批后通知 TA
-- Professor 审批后通知 TA
-- 发布教学班给 Professor 的邮件
-
-### 6.3 `HOST/PORT` 影响的功能
-
-- 是否能从内网访问系统
-- Node 服务监听地址
-
-## 7. 配置检查建议
-
-修改 `.env.local` 后，建议检查以下几点：
-
-1. 服务是否能正常启动
-2. 系统首页是否可访问
-3. 邮件是否可成功发送
-4. 邮件中的链接是否跳转正确
-5. 内网其他设备是否可访问
-
-## 8. 修改 `.env.local` 后的操作
-
-修改完成后，需要重启服务，配置才会生效。
-
-本机启动示例：
-
-```bash
-cd /Users/yanren/Documents/Playground
-HOST=0.0.0.0 ./node-v22.22.1-darwin-arm64/bin/node server.js
-```
-
-Windows 服务器示例：
-
-```powershell
-cd D:\TASystem\app
-pm2 restart ta-system
-```
-
-## 9. 配置文件管理建议
-
-建议遵守以下规则：
-
-1. `.env.local` 不提交到 GitHub
-2. 正式环境与测试环境分别备份
-3. 修改后记录修改时间和用途
-4. SMTP 授权码变更后及时同步更新
-
+1. `DB_CLIENT=mysql`
+2. 开发、测试、正式环境只调整连接参数和访问地址
+3. 保留 `DB_CLIENT=sqlite` 仅作为临时应急回退方案
