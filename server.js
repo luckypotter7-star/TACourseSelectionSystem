@@ -203,6 +203,19 @@ function initDb() {
       created_at text not null
     );
 
+    create table if not exists audit_logs (
+      audit_log_id integer primary key autoincrement,
+      actor_user_id integer,
+      actor_name text,
+      actor_role text,
+      action_type text not null,
+      target_type text not null,
+      target_id text,
+      target_name text,
+      details text,
+      created_at text not null
+    );
+
     create table if not exists login_tokens (
       token text primary key,
       user_id integer not null,
@@ -612,6 +625,81 @@ function createNotification(db, userId, title, content, targetPath = null) {
   `).run(userId, title, content, targetPath, nowStr());
 }
 
+function createAuditLog(db, { actor = null, actionType, targetType, targetId = "", targetName = "", details = "" }) {
+  db.prepare(`
+    insert into audit_logs (
+      actor_user_id, actor_name, actor_role, action_type, target_type, target_id, target_name, details, created_at
+    ) values (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    actor?.user_id ?? null,
+    actor?.user_name ?? "系统",
+    actor?.role ?? "System",
+    actionType,
+    targetType,
+    String(targetId || ""),
+    String(targetName || ""),
+    String(details || ""),
+    nowStr()
+  );
+}
+
+const auditActionLabels = {
+  TA_APPLY: "TA提交申请",
+  TA_WITHDRAW: "TA撤销申请",
+  TAADMIN_APPROVE: "TAAdmin通过申请",
+  TAADMIN_REJECT: "TAAdmin拒绝申请",
+  PROFESSOR_APPROVE: "Professor通过申请",
+  PROFESSOR_REJECT: "Professor拒绝申请",
+  AUTO_REJECT_CAPACITY: "名额已满自动拒绝",
+  ADMIN_OVERRIDE_STATUS: "管理员改申请状态",
+  CLASS_CREATE: "创建教学班",
+  CLASS_UPDATE: "修改教学班",
+  CLASS_DELETE: "删除教学班",
+  CLASS_PUBLISH_TO_PROFESSOR: "发布教学班到Professor",
+  CLASS_PUBLISH_STATUS_UPDATE: "批量修改发布状态",
+  CLASS_APPLY_WINDOW_UPDATE: "批量修改申请时间",
+  CLASS_APPLY_TOGGLE: "批量修改开放申请",
+  TA_TOGGLE_APPLY_QUALIFICATION: "修改TA申请资格",
+  USER_CREATE: "创建人员",
+  USER_UPDATE: "修改人员",
+  USER_DELETE: "删除人员",
+  USER_IMPORT: "导入人员",
+  USER_IMPORT_FAILED: "导入人员失败",
+  CLASS_IMPORT: "导入教学班",
+  CLASS_IMPORT_FAILED: "导入教学班失败",
+  PROFESSOR_EMAIL_SEND_FAILED: "发送Professor邮件失败",
+  EMAIL_PARTIAL_FAILURE: "邮件部分发送失败"
+};
+
+const auditActionTones = {
+  TA_APPLY: "info",
+  TA_WITHDRAW: "muted",
+  TAADMIN_APPROVE: "approve",
+  TAADMIN_REJECT: "reject",
+  PROFESSOR_APPROVE: "approve",
+  PROFESSOR_REJECT: "reject",
+  AUTO_REJECT_CAPACITY: "reject",
+  ADMIN_OVERRIDE_STATUS: "admin",
+  USER_IMPORT_FAILED: "reject",
+  CLASS_IMPORT_FAILED: "reject",
+  PROFESSOR_EMAIL_SEND_FAILED: "reject",
+  EMAIL_PARTIAL_FAILURE: "warn"
+};
+
+function auditActionTone(actionType) {
+  return auditActionTones[actionType] || "neutral";
+}
+
+function renderAuditActionBadge(actionType) {
+  const tone = auditActionTone(actionType);
+  const label = auditActionLabels[actionType] || actionType;
+  return `<span class="audit-badge audit-badge-${tone}">${escapeHtml(label)}</span>`;
+}
+
+function renderAuditDetails(value) {
+  return escapeHtml(value || "-").replace(/\n/g, "<br>");
+}
+
 function unreadNotificationCount(userId) {
   const db = getDb();
   const count = db.prepare("select count(*) as count from notifications where user_id = ? and is_read = 'N'").get(userId).count;
@@ -965,10 +1053,31 @@ async function sendProfessorNotificationEmails(db, classes, taAdmin, baseUrl) {
       message.cc = taAdmin.email;
     }
     await transporter.sendMail(message);
+    const classSummary = selectedClasses
+      .map((row) => row.class_name)
+      .filter(Boolean)
+      .join("、");
+    createNotification(
+      db,
+      professor.user_id,
+      "TA申请待终审",
+      `以下教学班已由 TAAdmin 完成前置审核，并发布给你进行最终审核：${classSummary || "相关教学班"}。请进入系统完成审批。`,
+      "/professor/pending"
+    );
   }
   const classIds = classes.map((row) => row.class_id);
   for (const classId of classIds) {
     db.prepare("update classes set published_to_professor = 'Y', professor_notified_at = ? where class_id = ?").run(nowStr(), classId);
+  }
+  for (const row of classes) {
+    createAuditLog(db, {
+      actor: taAdmin,
+      actionType: "CLASS_PUBLISH_TO_PROFESSOR",
+      targetType: "Class",
+      targetId: row.class_id,
+      targetName: `${row.course_name} / ${row.class_name}`,
+      details: `教学班代码：${row.class_code}\n教授：${row.teacher_name}\n操作结果：已发送Professor提醒邮件并抄送TAAdmin`
+    });
   }
 }
 
@@ -981,11 +1090,11 @@ function pageLayout(title, body, user, notice) {
     if (user.role === "TA") {
       links.splice(1, 0, '<a href="/ta/classes">可申请教学班</a>', '<a href="/ta/applications">我的申请</a>', '<a href="/ta/profile">个人资料</a>');
     } else if (user.role === "TAAdmin") {
-      links.splice(1, 0, '<a href="/admin/ta/pending">待初审申请</a>', '<a href="/admin/ta/applications">全部申请</a>', '<a href="/admin/ta/classes">全部教学班</a>', '<a href="/admin/ta/users">TA 管理</a>');
+      links.splice(1, 0, '<a href="/admin/ta/pending">待初审申请</a>', '<a href="/admin/ta/applications">全部申请</a>', '<a href="/admin/ta/application-logs">申请日志</a>', '<a href="/admin/ta/classes">全部教学班</a>', '<a href="/admin/ta/users">TA 管理</a>');
     } else if (user.role === "Professor") {
       links.splice(1, 0, '<a href="/professor/pending">待教授审批</a>');
     } else if (user.role === "CourseAdmin") {
-      links.splice(1, 0, '<a href="/course/applications">全部申请</a>', '<a href="/course/classes">教学班管理</a>', '<a href="/course/users">人员管理</a>');
+      links.splice(1, 0, '<a href="/course/reports">报表视图</a>', '<a href="/course/applications">全部申请</a>', '<a href="/course/application-logs">申请日志</a>', '<a href="/course/classes">教学班管理</a>', '<a href="/course/users">人员管理</a>', '<a href="/course/audit-logs">审计日志</a>');
     }
     nav = `<nav class="nav-links">${links.join("")}</nav>`;
   }
@@ -1169,6 +1278,23 @@ function pageLayout(title, body, user, notice) {
         -webkit-overflow-scrolling: touch;
         scrollbar-gutter: stable both-edges;
       }
+      .table-wrap.list-scroll {
+        max-height: min(62vh, 760px);
+        overflow: auto;
+        border: 1px solid var(--line);
+        border-radius: 18px;
+        background: var(--panel);
+      }
+      .table-wrap.list-scroll table {
+        margin: 0;
+      }
+      .table-wrap.list-scroll th {
+        position: sticky;
+        top: 0;
+        z-index: 4;
+        background: linear-gradient(180deg, #f8efe4, #f6f0e8);
+        box-shadow: inset 0 -1px 0 #d8c9b1;
+      }
       table.wide { min-width: 1320px; }
       table.compact-table th {
         font-size: 11px;
@@ -1247,6 +1373,9 @@ function pageLayout(title, body, user, notice) {
       @media (max-width: 720px) {
         .filters-grid { grid-template-columns: 1fr; }
         .class-card-grid { grid-template-columns: 1fr; }
+        .report-grid { grid-template-columns: 1fr; }
+        .report-row { grid-template-columns: 1fr; }
+        .report-row-side { text-align: left; }
       }
       .notice {
         max-width: 1360px;
@@ -1299,6 +1428,195 @@ function pageLayout(title, body, user, notice) {
       .pill.muted {
         background: rgba(136, 127, 111, 0.14);
         color: #6e665c;
+      }
+      .audit-badge {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        padding: 6px 12px;
+        border-radius: 999px;
+        font-size: 12px;
+        line-height: 1.2;
+        font-weight: 700;
+        letter-spacing: 0.01em;
+        white-space: nowrap;
+      }
+      .audit-badge-info {
+        background: rgba(26, 34, 135, 0.1);
+        color: var(--accent);
+      }
+      .audit-badge-approve {
+        background: rgba(26, 34, 135, 0.12);
+        color: var(--accent);
+      }
+      .audit-badge-reject {
+        background: rgba(200, 22, 30, 0.12);
+        color: var(--brand-red);
+      }
+      .audit-badge-admin {
+        background: rgba(210, 170, 110, 0.22);
+        color: #8a5f22;
+      }
+      .audit-badge-warn {
+        background: rgba(210, 170, 110, 0.18);
+        color: #8a5f22;
+      }
+      .audit-badge-muted {
+        background: rgba(136, 127, 111, 0.14);
+        color: #6e665c;
+      }
+      .audit-badge-neutral {
+        background: rgba(136, 127, 111, 0.12);
+        color: #6e665c;
+      }
+      .audit-log-table td:nth-child(4),
+      .audit-log-table th:nth-child(4) {
+        white-space: nowrap;
+      }
+      .audit-log-table tr.audit-row-approve td {
+        background: rgba(26, 34, 135, 0.03);
+      }
+      .audit-log-table tr.audit-row-reject td {
+        background: rgba(200, 22, 30, 0.035);
+      }
+      .audit-log-table tr.audit-row-admin td,
+      .audit-log-table tr.audit-row-warn td {
+        background: rgba(210, 170, 110, 0.08);
+      }
+      .audit-log-table tr.audit-row-muted td {
+        background: rgba(136, 127, 111, 0.05);
+      }
+      .audit-timeline {
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+        min-width: 280px;
+      }
+      .audit-timeline-item {
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+        padding: 8px 10px;
+        border-radius: 12px;
+        border: 1px solid var(--line);
+        background: #fffdfa;
+      }
+      .audit-timeline-meta {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        flex-wrap: wrap;
+      }
+      .audit-timeline-time {
+        font-size: 12px;
+        color: var(--muted);
+      }
+      .audit-timeline-actor {
+        font-size: 12px;
+        color: var(--muted);
+      }
+      .audit-timeline-empty {
+        color: var(--muted);
+      }
+      .audit-summary-count {
+        font-size: 12px;
+        color: var(--muted);
+        margin-top: 6px;
+      }
+      .stats-grid {
+        display: grid;
+        gap: 14px;
+        grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+        margin-bottom: 20px;
+      }
+      .stat-card {
+        padding: 18px;
+        border-radius: 18px;
+        border: 1px solid #e6d7bf;
+        background: linear-gradient(180deg, #fffdf8, #f8f2ea);
+      }
+      .stat-card .stat-label {
+        color: var(--muted);
+        font-size: 12px;
+        line-height: 1.4;
+        margin-bottom: 8px;
+      }
+      .stat-card .stat-value {
+        font-size: 30px;
+        line-height: 1;
+        font-weight: 800;
+        letter-spacing: -0.03em;
+        color: var(--ink);
+      }
+      .stat-card .stat-footnote {
+        margin-top: 8px;
+        color: var(--muted);
+        font-size: 12px;
+        line-height: 1.5;
+      }
+      .report-grid {
+        display: grid;
+        gap: 18px;
+        grid-template-columns: 1.3fr 1fr;
+        margin-top: 20px;
+      }
+      .report-card {
+        border: 1px solid #e6d7bf;
+        border-radius: 20px;
+        background: #fff;
+        padding: 18px;
+      }
+      .report-list {
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+      }
+      .report-row {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) 120px;
+        gap: 12px;
+        align-items: center;
+      }
+      .report-row-main {
+        min-width: 0;
+      }
+      .report-row-title {
+        font-weight: 600;
+        line-height: 1.45;
+      }
+      .report-row-meta {
+        color: var(--muted);
+        font-size: 12px;
+        line-height: 1.5;
+      }
+      .report-row-side {
+        text-align: right;
+        white-space: nowrap;
+      }
+      .bar-track {
+        margin-top: 6px;
+        height: 8px;
+        border-radius: 999px;
+        background: #f1eadf;
+        overflow: hidden;
+      }
+      .bar-fill {
+        height: 100%;
+        border-radius: 999px;
+        background: linear-gradient(90deg, var(--accent), var(--brand-gold));
+      }
+      .bar-fill.red {
+        background: linear-gradient(90deg, #d6636c, var(--brand-red));
+      }
+      .bar-fill.gold {
+        background: linear-gradient(90deg, #d8b57a, var(--brand-gold));
+      }
+      .report-kicker {
+        color: var(--muted);
+        font-size: 12px;
+        text-transform: uppercase;
+        letter-spacing: 0.06em;
+        margin-bottom: 8px;
       }
       .schedule-summary {
         display: flex;
@@ -2034,6 +2352,7 @@ function homePage(res, user, notice) {
     body += `<section class="grid"><article class="card card-brand feature-card"><h3>待教授审批</h3><p>按教学班查看待终审申请，并在达到名额上限时自动完成其余申请处理。</p><div class="actions"><a class="button-link" href="/professor/pending">进入</a></div></article></section>`;
   } else if (user.role === "CourseAdmin") {
     body += `<section class="grid">
+      <article class="card card-brand feature-card"><h3>报表视图</h3><p>集中查看申请、审批、教学班开放与名额使用情况。</p><div class="actions"><a class="button-link" href="/course/reports">进入</a></div></article>
       <article class="card card-brand feature-card"><h3>全部申请</h3><p>查看全量申请并在必要时进行管理性状态调整。</p><div class="actions"><a class="button-link" href="/course/applications">进入</a></div></article>
       <article class="card card-brand feature-card"><h3>教学班管理</h3><p>维护教学班、排课、导入和批量操作。</p><div class="actions"><a class="button-link" href="/course/classes">进入</a></div></article>
       <article class="card card-brand feature-card"><h3>人员管理</h3><p>新增、编辑、导入和维护系统角色人员。</p><div class="actions"><a class="button-link" href="/course/users">进入</a></div></article>
@@ -2834,6 +3153,14 @@ async function createApplication(req, res, user) {
       `/admin/ta/pending/${applicationId}`
     );
   }
+  createAuditLog(db, {
+    actor: user,
+    actionType: "TA_APPLY",
+    targetType: "Application",
+    targetId: applicationId,
+    targetName: `${classRow.course_name} / ${classRow.class_name}`,
+    details: `申请人：${user.user_name}\n教学班：${classRow.class_name}\n教授：${classRow.teacher_name}\n申请原因：${reason}`
+  });
   const emailJobs = taAdmins.map((admin) => buildTaAdminNewApplicationEmail(admin, user, classRow));
   db.close();
   const emailErrors = await sendEmailsAndCollectErrors(emailJobs);
@@ -2962,6 +3289,7 @@ function taApplicationDetailPage(res, user, applicationId, notice) {
     return;
   }
   const logs = db.prepare("select * from approval_logs where application_id = ? order by acted_at").all(applicationId);
+  const auditRows = applicationAuditRows(db, applicationId);
   db.close();
   const logRows = logs.map((log) => `<tr><td>${escapeHtml(log.approval_stage)}</td><td>${escapeHtml(log.approver_name)}</td><td>${escapeHtml(log.result)}</td><td>${escapeHtml(log.comments || "")}</td><td>${escapeHtml(log.acted_at)}</td></tr>`).join("");
   sendHtml(res, pageLayout("申请详情", `
@@ -2978,6 +3306,7 @@ function taApplicationDetailPage(res, user, applicationId, notice) {
       <h3>审批日志</h3>
       <table><tr><th>阶段</th><th>审批人</th><th>结果</th><th>备注</th><th>时间</th></tr>${logRows}</table>
     </section>
+    ${renderApplicationAuditSection(auditRows)}
   `, user, notice));
 }
 
@@ -2993,6 +3322,14 @@ function withdrawApplication(res, user, applicationId) {
     return redirect(res, "/ta/applications?notice=当前状态不可撤销");
   }
   db.prepare("update applications set status = 'Withdrawn' where application_id = ?").run(applicationId);
+  createAuditLog(db, {
+    actor: user,
+    actionType: "TA_WITHDRAW",
+    targetType: "Application",
+    targetId: applicationId,
+    targetName: app.class_name,
+    details: `申请人：${app.applier_name}\n原状态：${statusLabels[app.status] || app.status}\n操作结果：已撤销`
+  });
   db.close();
   redirect(res, "/ta/applications?notice=申请已撤销");
 }
@@ -3057,7 +3394,7 @@ function taAdminPendingPage(res, user, notice, filters = {}) {
       <div class="actions" style="margin-bottom:12px;">
         <label><input type="checkbox" id="select-all-pending-apps" /> 全选当前列表</label>
       </div>
-      <table><tr><th style="width:56px;">选择</th><th>申请人</th><th>教学班</th><th>教授</th><th>申请时间</th><th>申请原因</th><th>操作</th></tr>${rows}</table>
+      <div class="table-wrap list-scroll"><table><tr><th style="width:56px;">选择</th><th>申请人</th><th>教学班</th><th>教授</th><th>申请时间</th><th>申请原因</th><th>操作</th></tr>${rows}</table></div>
     </section>
     <script>
       (() => {
@@ -3104,6 +3441,7 @@ function taAdminDetailPage(res, user, applicationId, notice) {
     return;
   }
   const conflictApps = getAppliedConflicts(db, app.applier_user_id, app.class_id);
+  const auditRows = applicationAuditRows(db, applicationId);
   db.close();
   const conflictSection = conflictApps.length
     ? `<section class="card">
@@ -3133,6 +3471,7 @@ function taAdminDetailPage(res, user, applicationId, notice) {
       ` : `<p class="muted">该申请已完成处理，当前为只读状态。</p>`}
     </section>
     ${conflictSection}
+    ${renderApplicationAuditSection(auditRows)}
     ${adminOverrideSection(`/admin/ta/applications/${applicationId}/override-status`, app.status)}
   `, user, notice));
 }
@@ -3149,6 +3488,14 @@ function applyTaAdminDecision(db, approver, app, result, comments) {
     insert into approval_logs (application_id, approval_stage, approver_user_id, approver_name, result, comments, acted_at)
     values (?, 'TAAdmin', ?, ?, ?, ?, ?)
   `).run(app.application_id, approver.user_id, approver.user_name, result, comments, actedAt);
+  createAuditLog(db, {
+    actor: approver,
+    actionType: result === "Approved" ? "TAADMIN_APPROVE" : "TAADMIN_REJECT",
+    targetType: "Application",
+    targetId: app.application_id,
+    targetName: app.class_name,
+    details: `申请人：${app.applier_name}\n审批结果：${result === "Approved" ? "通过" : "拒绝"}\n新状态：${statusLabels[nextStatus] || nextStatus}${comments ? `\n备注：${comments}` : ""}`
+  });
   if (result === "Approved") {
     createNotification(db, app.applier_user_id, "TA 预审通过", `你的申请《${app.class_name}》已通过 TAAdmin 预审，待发布给 Professor 后进入最终审核。`, `/ta/applications/${app.application_id}`);
   } else {
@@ -3176,6 +3523,18 @@ async function taAdminApprove(req, res, user, applicationId) {
   }
   db.close();
   const emailErrors = await sendEmailsAndCollectErrors([buildTaDecisionEmail(applicant, app, result, comments)]);
+  if (emailErrors.length) {
+    const auditDb = getDb();
+    createAuditLog(auditDb, {
+      actor: user,
+      actionType: "EMAIL_PARTIAL_FAILURE",
+      targetType: "Application",
+      targetId: applicationId,
+      targetName: app.class_name,
+      details: `场景：TAAdmin单条审批\n失败邮件：\n${emailErrors.join("\n")}`
+    });
+    auditDb.close();
+  }
   redirect(res, `/admin/ta/pending?notice=${emailErrors.length ? "审批已完成，站内通知已发送，部分邮件发送失败" : "审批已完成，站内通知和邮件已发送"}`);
 }
 
@@ -3213,6 +3572,18 @@ async function taAdminBatchApprove(req, res, user) {
   }
   db.close();
   const emailErrors = await sendEmailsAndCollectErrors(emailJobs);
+  if (emailErrors.length) {
+    const auditDb = getDb();
+    createAuditLog(auditDb, {
+      actor: user,
+      actionType: "EMAIL_PARTIAL_FAILURE",
+      targetType: "Application",
+      targetId: applicationIds.join(","),
+      targetName: "TAAdmin批量审批",
+      details: `场景：TAAdmin批量审批\n失败邮件：\n${emailErrors.join("\n")}`
+    });
+    auditDb.close();
+  }
   redirect(res, `/admin/ta/pending?notice=${emailErrors.length ? `批量审批完成：成功 ${processed} 条，跳过 ${skipped} 条；部分邮件发送失败` : `批量审批完成：成功 ${processed} 条，跳过 ${skipped} 条；站内通知和邮件已发送`}`);
 }
 
@@ -3265,6 +3636,14 @@ function applyAdminStatusOverride(db, actor, app, nextStatus, comments) {
     insert into approval_logs (application_id, approval_stage, approver_user_id, approver_name, result, comments, acted_at)
     values (?, 'AdminOverride', ?, ?, ?, ?, ?)
   `).run(app.application_id, actor.user_id, actor.user_name, nextStatus, comments, actedAt);
+  createAuditLog(db, {
+    actor,
+    actionType: "ADMIN_OVERRIDE_STATUS",
+    targetType: "Application",
+    targetId: app.application_id,
+    targetName: app.class_name,
+    details: `申请人：${app.applier_name}\n原状态：${statusLabels[app.status] || app.status}\n新状态：${statusLabels[nextStatus] || nextStatus}\n调整说明：${comments}`
+  });
   createNotification(
     db,
     app.applier_user_id,
@@ -3334,7 +3713,7 @@ function taUsersPage(res, user, notice) {
     <td>${row.approved_count}</td>
     <td class="table-action-cell"><div class="table-action-inner"><form class="inline" method="post" action="/admin/ta/users/${row.user_id}/toggle"><button type="submit">${row.is_allowed_to_apply === "Y" ? "关闭资格" : "开启资格"}</button></form></div></td>
   </tr>`).join("");
-  sendHtml(res, pageLayout("TA 管理", `<section class="card"><h2>TA 管理</h2><table><tr><th>姓名</th><th>账号</th><th>邮箱</th><th>允许申请</th><th>申请数</th><th>已通过</th><th>操作</th></tr>${htmlRows}</table></section>`, user, notice));
+  sendHtml(res, pageLayout("TA 管理", `<section class="card"><h2>TA 管理</h2><div class="table-wrap list-scroll"><table><tr><th>姓名</th><th>账号</th><th>邮箱</th><th>允许申请</th><th>申请数</th><th>已通过</th><th>操作</th></tr>${htmlRows}</table></div></section>`, user, notice));
 }
 
 function notificationsPage(res, user, notice) {
@@ -3352,7 +3731,205 @@ function notificationsPage(res, user, notice) {
   sendHtml(res, pageLayout("通知中心", `
     <section class="card">
       <h2>通知中心</h2>
-      <table><tr><th>ID</th><th>标题</th><th>内容</th><th>时间</th><th>状态</th><th>操作</th></tr>${tableRows}</table>
+      <div class="table-wrap list-scroll"><table><tr><th>ID</th><th>标题</th><th>内容</th><th>时间</th><th>状态</th><th>操作</th></tr>${tableRows}</table></div>
+    </section>
+  `, user, notice));
+}
+
+function courseAuditLogsPage(res, user, notice, filters = {}) {
+  const actionType = String(filters.action_type || "").trim();
+  const actorName = String(filters.actor_name || "").trim().toLowerCase();
+  const targetType = String(filters.target_type || "").trim();
+  const keyword = String(filters.keyword || "").trim().toLowerCase();
+  const db = getDb();
+  const rows = db.prepare("select * from audit_logs order by created_at desc, audit_log_id desc").all()
+    .filter((row) => !actionType || row.action_type === actionType)
+    .filter((row) => !targetType || row.target_type === targetType)
+    .filter((row) => !actorName || String(row.actor_name || "").toLowerCase().includes(actorName))
+    .filter((row) => !keyword || [row.target_name, row.details, row.target_id].some((value) => String(value || "").toLowerCase().includes(keyword)));
+  db.close();
+  const actionOptions = Object.entries(auditActionLabels)
+    .map(([value, label]) => `<option value="${value}" ${actionType === value ? "selected" : ""}>${escapeHtml(label)}</option>`)
+    .join("");
+  const rowsHtml = rows.map((row) => `<tr class="audit-row-${auditActionTone(row.action_type)}">
+    <td>${escapeHtml(row.created_at)}</td>
+    <td>${escapeHtml(row.actor_name || "系统")}</td>
+    <td>${escapeHtml(row.actor_role || "System")}</td>
+    <td>${renderAuditActionBadge(row.action_type)}</td>
+    <td>${escapeHtml(row.target_type)}</td>
+    <td>${escapeHtml(row.target_name || row.target_id || "-")}</td>
+    <td>${renderAuditDetails(row.details)}</td>
+  </tr>`).join("");
+  sendHtml(res, pageLayout("审计日志", `
+    <section class="card">
+      <h2>审计日志</h2>
+      <form method="get" action="/course/audit-logs">
+        <div class="filters-shell">
+          <div class="filters-grid">
+            <p><label>操作人<input name="actor_name" value="${escapeHtml(filters.actor_name || "")}" /></label></p>
+            <p><label>动作类型<select name="action_type"><option value="">全部</option>${actionOptions}</select></label></p>
+            <p><label>对象类型<select name="target_type">
+              <option value="">全部</option>
+              <option value="Application" ${targetType === "Application" ? "selected" : ""}>Application</option>
+              <option value="Class" ${targetType === "Class" ? "selected" : ""}>Class</option>
+              <option value="User" ${targetType === "User" ? "selected" : ""}>User</option>
+            </select></label></p>
+            <p><label>关键字<input name="keyword" value="${escapeHtml(filters.keyword || "")}" /></label></p>
+            <div class="actions">
+              <button class="secondary action-button" type="submit">筛选</button>
+              <a class="button-link secondary action-button" href="/course/audit-logs">重置</a>
+            </div>
+          </div>
+        </div>
+      </form>
+    </section>
+    <section class="card">
+      <h3>操作记录</h3>
+      <div class="table-wrap list-scroll">
+        <table class="wide audit-log-table">
+          <tr><th>时间</th><th>操作人</th><th>角色</th><th>动作</th><th>对象类型</th><th>对象</th><th>详情</th></tr>
+          ${rowsHtml || '<tr><td colspan="7" class="muted">暂无审计日志。</td></tr>'}
+        </table>
+      </div>
+    </section>
+  `, user, notice));
+}
+
+function applicationAuditRows(db, applicationId) {
+  return db.prepare(`
+    select created_at, actor_name, actor_role, action_type, target_name, details
+    from audit_logs
+    where target_type = 'Application'
+      and target_id = ?
+    order by created_at, audit_log_id
+  `).all(String(applicationId));
+}
+
+function renderApplicationAuditSection(rows) {
+  const rowHtml = rows.map((row) => `<tr class="audit-row-${auditActionTone(row.action_type)}">
+    <td>${escapeHtml(row.created_at)}</td>
+    <td>${escapeHtml(row.actor_name || "系统")}</td>
+    <td>${escapeHtml(row.actor_role || "System")}</td>
+    <td>${renderAuditActionBadge(row.action_type)}</td>
+    <td>${renderAuditDetails(row.details)}</td>
+  </tr>`).join("");
+  return `
+    <section class="card">
+      <h3>申请业务日志</h3>
+      <div class="table-wrap list-scroll"><table class="audit-log-table">
+        <tr><th>时间</th><th>操作人</th><th>角色</th><th>动作</th><th>详情</th></tr>
+        ${rowHtml || '<tr><td colspan="5" class="muted">暂无业务日志。</td></tr>'}
+      </table></div>
+    </section>
+  `;
+}
+
+function buildApplicationAuditMap(db) {
+  const rows = db.prepare(`
+    select target_id, created_at, actor_name, actor_role, action_type, details
+    from audit_logs
+    where target_type = 'Application'
+    order by created_at desc, audit_log_id desc
+  `).all();
+  const map = new Map();
+  rows.forEach((row) => {
+    const key = String(row.target_id || "");
+    if (!map.has(key)) map.set(key, []);
+    map.get(key).push(row);
+  });
+  return map;
+}
+
+function renderApplicationAuditTimeline(rows) {
+  if (!rows || !rows.length) {
+    return '<div class="audit-timeline-empty">暂无申请日志</div>';
+  }
+  const preview = rows.slice(0, 3).map((row) => `
+    <div class="audit-timeline-item audit-row-${auditActionTone(row.action_type)}">
+      <div class="audit-timeline-meta">
+        ${renderAuditActionBadge(row.action_type)}
+        <span class="audit-timeline-time">${escapeHtml(row.created_at)}</span>
+      </div>
+      <div class="audit-timeline-actor">${escapeHtml(row.actor_name || "系统")} · ${escapeHtml(row.actor_role || "System")}</div>
+    </div>
+  `).join("");
+  return `
+    <div class="audit-timeline">
+      ${preview}
+      ${rows.length > 3 ? `<div class="audit-summary-count">共 ${rows.length} 条日志，最近显示 3 条</div>` : ""}
+    </div>
+  `;
+}
+
+function applicationStatusPillClass(status) {
+  if (status === "PendingTAAdmin") return "pill gold";
+  if (status === "Approved" || status === "PendingProfessor") return "pill ok";
+  if (status === "RejectedByTAAdmin" || status === "RejectedByProfessor") return "pill bad";
+  return "pill muted";
+}
+
+function applicationLogListPage(res, user, notice, filters = {}, options) {
+  const studentFilter = String(filters.applier_name || "").trim().toLowerCase();
+  const classFilter = String(filters.class_name || "").trim().toLowerCase();
+  const teacherFilter = String(filters.teacher_name || "").trim().toLowerCase();
+  const statusFilter = String(filters.status || "").trim();
+  const submittedFrom = String(filters.submitted_from || "").trim();
+  const submittedTo = String(filters.submitted_to || "").trim();
+  const db = getDb();
+  const auditMap = buildApplicationAuditMap(db);
+  const rows = db.prepare("select * from applications order by submitted_at desc, application_id desc").all()
+    .filter((app) => !studentFilter || String(app.applier_name || "").toLowerCase().includes(studentFilter))
+    .filter((app) => !classFilter || String(app.class_name || "").toLowerCase().includes(classFilter))
+    .filter((app) => !teacherFilter || String(app.teacher_name || "").toLowerCase().includes(teacherFilter))
+    .filter((app) => !statusFilter || String(app.status || "") === statusFilter)
+    .filter((app) => !submittedFrom || String(app.submitted_at || "").slice(0, 10) >= submittedFrom)
+    .filter((app) => !submittedTo || String(app.submitted_at || "").slice(0, 10) <= submittedTo)
+    .map((app) => ({ ...app, auditRows: auditMap.get(String(app.application_id)) || [] }));
+  db.close();
+  const tableRows = rows.map((app) => {
+    const latest = app.auditRows[0];
+    return `<tr>
+      <td>${app.application_id}</td>
+      <td>${escapeHtml(app.applier_name)}</td>
+      <td>${escapeHtml(app.class_name)}</td>
+      <td>${escapeHtml(app.teacher_name)}</td>
+      <td><span class="${applicationStatusPillClass(app.status)}">${escapeHtml(statusLabels[app.status] || app.status)}</span></td>
+      <td>${latest ? `${renderAuditActionBadge(latest.action_type)}<div class="audit-summary-count">${escapeHtml(latest.created_at)}</div>` : '<span class="muted">暂无</span>'}</td>
+      <td>${renderApplicationAuditTimeline(app.auditRows)}</td>
+      <td class="table-action-cell"><div class="table-action-inner"><a class="button-link secondary action-button" href="${options.detailBasePath}/${app.application_id}">查看详情</a></div></td>
+    </tr>`;
+  }).join("");
+  sendHtml(res, pageLayout(options.title, `
+    <section class="card">
+      <h2>筛选申请日志</h2>
+      <form method="get" action="${options.listPath}">
+        <div class="filters-shell">
+          <div class="filters-grid">
+            <p><label>申请学生<input name="applier_name" value="${escapeHtml(filters.applier_name || "")}" /></label></p>
+            <p><label>教学班<input name="class_name" value="${escapeHtml(filters.class_name || "")}" /></label></p>
+            <p><label>教授<input name="teacher_name" value="${escapeHtml(filters.teacher_name || "")}" /></label></p>
+            <p><label>状态<select name="status">
+              <option value="" ${!filters.status ? "selected" : ""}>全部</option>
+              ${Object.entries(statusLabels).map(([key, label]) => `<option value="${key}" ${filters.status === key ? "selected" : ""}>${escapeHtml(label)}</option>`).join("")}
+            </select></label></p>
+            <p><label>申请时间起<input type="date" name="submitted_from" value="${escapeHtml(filters.submitted_from || "")}" /></label></p>
+            <p><label>申请时间止<input type="date" name="submitted_to" value="${escapeHtml(filters.submitted_to || "")}" /></label></p>
+            <div class="actions">
+              <button class="secondary action-button" type="submit">筛选</button>
+              <a class="button-link secondary action-button" href="${options.listPath}">重置</a>
+            </div>
+          </div>
+        </div>
+      </form>
+    </section>
+    <section class="card">
+      <h2>${escapeHtml(options.heading)}</h2>
+      <div class="table-wrap list-scroll">
+        <table class="wide">
+          <tr><th>ID</th><th>申请人</th><th>教学班</th><th>教授</th><th>当前状态</th><th>最新动作</th><th>日志摘要</th><th>操作</th></tr>
+          ${tableRows || '<tr><td colspan="8" class="muted">暂无符合条件的申请日志。</td></tr>'}
+        </table>
+      </div>
     </section>
   `, user, notice));
 }
@@ -3364,14 +3941,23 @@ function markNotificationRead(res, user, notificationId) {
   redirect(res, "/notifications?notice=通知已标记为已读");
 }
 
-function toggleTaUser(res, userId) {
+function toggleTaUser(res, actor, userId) {
   const db = getDb();
   const row = db.prepare("select * from users where user_id = ? and role = 'TA'").get(userId);
   if (!row) {
     db.close();
     return redirect(res, "/admin/ta/users?notice=TA 不存在");
   }
-  db.prepare("update users set is_allowed_to_apply = ? where user_id = ?").run(row.is_allowed_to_apply === "Y" ? "N" : "Y", userId);
+  const nextValue = row.is_allowed_to_apply === "Y" ? "N" : "Y";
+  db.prepare("update users set is_allowed_to_apply = ? where user_id = ?").run(nextValue, userId);
+  createAuditLog(db, {
+    actor,
+    actionType: "TA_TOGGLE_APPLY_QUALIFICATION",
+    targetType: "User",
+    targetId: userId,
+    targetName: row.user_name,
+    details: `登录名：${row.login_name}\n新允许申请状态：${nextValue}`
+  });
   db.close();
   redirect(res, "/admin/ta/users?notice=TA 资格已更新");
 }
@@ -3448,7 +4034,13 @@ function professorClassReviewPage(res, user, classId, notice) {
     return;
   }
   const schedules = fetchSchedules(db, classId);
-  const apps = db.prepare("select * from applications where class_id = ? order by case when status = 'PendingProfessor' then 0 else 1 end, submitted_at, application_id").all(classId);
+  const apps = db.prepare(`
+    select *
+    from applications
+    where class_id = ?
+      and status != 'Withdrawn'
+    order by case when status = 'PendingProfessor' then 0 else 1 end, submitted_at, application_id
+  `).all(classId);
   const approvedCount = db.prepare("select count(*) as count from applications where class_id = ? and status = 'Approved'").get(classId).count;
   db.close();
   const remaining = Math.max(0, Number(classRow.maximum_number_of_tas_admitted) - Number(approvedCount));
@@ -3496,7 +4088,7 @@ function professorClassReviewPage(res, user, classId, notice) {
     <section class="card">
       <h3>该教学班全部申请</h3>
       <div class="desktop-only">
-        <div class="table-wrap">
+        <div class="table-wrap list-scroll">
           <table><tr><th>申请人</th><th>申请时间</th><th>状态</th><th>TAAdmin 备注</th><th>操作</th></tr>${rows}</table>
         </div>
       </div>
@@ -3514,6 +4106,7 @@ function professorDetailPage(res, user, applicationId, notice) {
     from applications a
     left join classes c on c.class_id = a.class_id
     where a.application_id = ?
+      and a.status != 'Withdrawn'
       and (',' || a.teacher_user_id || ',') like '%,' || ? || ',%'
       and c.published_to_professor = 'Y'
   `).get(applicationId, String(user.user_id));
@@ -3525,6 +4118,7 @@ function professorDetailPage(res, user, applicationId, notice) {
   }
   const classRow = db.prepare("select * from classes where class_id = ?").get(app.class_id);
   const approvedCount = db.prepare("select count(*) as count from applications where class_id = ? and status = 'Approved'").get(app.class_id).count;
+  const auditRows = applicationAuditRows(db, applicationId);
   db.close();
   const willAutoRejectOthers = approvedCount + (app.status === "PendingProfessor" ? 1 : 0) >= classRow.maximum_number_of_tas_admitted;
   sendHtml(res, pageLayout("教授审批", `
@@ -3554,6 +4148,7 @@ function professorDetailPage(res, user, applicationId, notice) {
         <a class="button-link secondary rect" href="/professor/classes/${app.class_id}">返回教学班审核</a>
       </div>
     </section>
+    ${renderApplicationAuditSection(auditRows)}
   `, user, notice));
 }
 
@@ -3593,6 +4188,14 @@ async function professorApprove(req, res, user, applicationId) {
     insert into approval_logs (application_id, approval_stage, approver_user_id, approver_name, result, comments, acted_at)
     values (?, 'Professor', ?, ?, ?, ?, ?)
   `).run(applicationId, user.user_id, user.user_name, result, comments, nowStr());
+  createAuditLog(db, {
+    actor: user,
+    actionType: result === "Approved" ? "PROFESSOR_APPROVE" : "PROFESSOR_REJECT",
+    targetType: "Application",
+    targetId: applicationId,
+    targetName: app.class_name,
+    details: `申请人：${app.applier_name}\n审批结果：${result === "Approved" ? "通过" : "拒绝"}\n新状态：${statusLabels[nextStatus] || nextStatus}${comments ? `\n备注：${comments}` : ""}`
+  });
   const emailJobs = [buildProfessorDecisionEmail(applicant, app, result, comments)];
   if (result === "Approved") {
     createNotification(db, app.applier_user_id, "Professor 审批通过", `你的申请《${app.class_name}》已通过 Professor 审批。`, `/ta/applications/${applicationId}`);
@@ -3618,6 +4221,14 @@ async function professorApprove(req, res, user, applicationId) {
       for (const other of otherApps) {
         rejectStmt.run(rejectReason, nowStr(), other.application_id);
         rejectLog.run(other.application_id, user.user_id, user.user_name, rejectReason, nowStr());
+        createAuditLog(db, {
+          actor: user,
+          actionType: "AUTO_REJECT_CAPACITY",
+          targetType: "Application",
+          targetId: other.application_id,
+          targetName: other.class_name,
+          details: `申请人：${other.applier_name}\n触发来源：${app.applier_name} 的申请通过后名额已满\n拒绝原因：${rejectReason}`
+        });
         createNotification(db, other.applier_user_id, "TA 申请被拒绝", `你的申请《${other.class_name}》因课程 TA 名额已满被自动拒绝。`, `/ta/applications/${other.application_id}`);
         emailJobs.push(buildClassCapacityRejectedEmail(selectApplicant.get(other.applier_user_id), other));
       }
@@ -3628,6 +4239,18 @@ async function professorApprove(req, res, user, applicationId) {
   }
   db.close();
   const emailErrors = await sendEmailsAndCollectErrors(emailJobs);
+  if (emailErrors.length) {
+    const auditDb = getDb();
+    createAuditLog(auditDb, {
+      actor: user,
+      actionType: "EMAIL_PARTIAL_FAILURE",
+      targetType: "Application",
+      targetId: applicationId,
+      targetName: app.class_name,
+      details: `场景：Professor审批\n失败邮件：\n${emailErrors.join("\n")}`
+    });
+    auditDb.close();
+  }
   redirect(res, `/professor/pending?notice=${emailErrors.length ? "终审已完成，站内通知已发送，部分邮件发送失败" : "终审已完成，站内通知和邮件已发送"}`);
 }
 
@@ -3915,7 +4538,7 @@ function courseClassesPage(res, user, notice, filters = {}) {
         <span class="muted">已选 <strong id="selected-class-count">0</strong> 个教学班</span>
       </div>
       <div class="desktop-only">
-        <div class="table-wrap">
+        <div class="table-wrap list-scroll">
           <table class="wide compact-table fixed-layout">
             <colgroup>
               <col style="width:56px;" />
@@ -4023,7 +4646,7 @@ function taAdminAllApplicationsPage(res, user, notice, filters = {}) {
     </section>
     <section class="card">
       <h2>全部 TA 申请</h2>
-      <table><tr><th>ID</th><th>申请人</th><th>教学班</th><th>教授</th><th>申请时间</th><th>状态</th><th>简历</th><th>操作</th></tr>${tableRows}</table>
+      <div class="table-wrap list-scroll"><table><tr><th>ID</th><th>申请人</th><th>教学班</th><th>教授</th><th>申请时间</th><th>状态</th><th>简历</th><th>操作</th></tr>${tableRows}</table></div>
     </section>
   `, user, notice));
 }
@@ -4045,7 +4668,204 @@ function courseAdminAllApplicationsPage(res, user, notice) {
   sendHtml(res, pageLayout("全部申请", `
     <section class="card">
       <h2>全部 TA 申请</h2>
-      <table><tr><th>ID</th><th>申请人</th><th>教学班</th><th>教授</th><th>申请时间</th><th>状态</th><th>简历</th><th>操作</th></tr>${tableRows}</table>
+      <div class="table-wrap list-scroll"><table><tr><th>ID</th><th>申请人</th><th>教学班</th><th>教授</th><th>申请时间</th><th>状态</th><th>简历</th><th>操作</th></tr>${tableRows}</table></div>
+    </section>
+  `, user, notice));
+}
+
+function taAdminApplicationLogsPage(res, user, notice, filters = {}) {
+  return applicationLogListPage(res, user, notice, filters, {
+    title: "申请日志",
+    heading: "TA 申请日志",
+    listPath: "/admin/ta/application-logs",
+    detailBasePath: "/admin/ta/pending"
+  });
+}
+
+function courseAdminApplicationLogsPage(res, user, notice, filters = {}) {
+  return applicationLogListPage(res, user, notice, filters, {
+    title: "申请日志",
+    heading: "TA 申请日志",
+    listPath: "/course/application-logs",
+    detailBasePath: "/course/applications"
+  });
+}
+
+function courseReportsPage(res, user, notice, filters = {}) {
+  const submittedFrom = String(filters.submitted_from || "").trim();
+  const submittedTo = String(filters.submitted_to || "").trim();
+  const db = getDb();
+  const applications = db.prepare("select * from applications order by submitted_at desc, application_id desc").all()
+    .filter((app) => !submittedFrom || String(app.submitted_at || "").slice(0, 10) >= submittedFrom)
+    .filter((app) => !submittedTo || String(app.submitted_at || "").slice(0, 10) <= submittedTo);
+  const classes = db.prepare(`
+    select c.*,
+      (select count(*) from applications a where a.class_id = c.class_id) as application_count,
+      (select count(*) from applications a where a.class_id = c.class_id and a.status = 'Approved') as approved_count,
+      (select count(*) from applications a where a.class_id = c.class_id and a.status = 'PendingTAAdmin') as pending_taadmin_count,
+      (select count(*) from applications a where a.class_id = c.class_id and a.status = 'PendingProfessor') as pending_professor_count
+    from classes c
+    order by c.class_code
+  `).all();
+  db.close();
+
+  const statusCounts = {
+    PendingTAAdmin: 0,
+    PendingProfessor: 0,
+    Approved: 0,
+    RejectedByTAAdmin: 0,
+    RejectedByProfessor: 0,
+    Withdrawn: 0
+  };
+  applications.forEach((app) => {
+    if (Object.hasOwn(statusCounts, app.status)) {
+      statusCounts[app.status] += 1;
+    }
+  });
+  const totalApplications = applications.length;
+  const totalClasses = classes.length;
+  const openClasses = classes.filter((row) => classOpenStatus(row) === "open").length;
+  const fullClasses = classes.filter((row) => Number(row.approved_count || 0) >= Number(row.maximum_number_of_tas_admitted || 0)).length;
+  const publishedClasses = classes.filter((row) => row.published_to_professor === "Y").length;
+  const pendingTaAdmin = statusCounts.PendingTAAdmin;
+  const pendingProfessor = statusCounts.PendingProfessor;
+  const approvedApplications = statusCounts.Approved;
+  const rejectedApplications = statusCounts.RejectedByTAAdmin + statusCounts.RejectedByProfessor;
+
+  const topClasses = [...classes]
+    .sort((a, b) => Number(b.application_count || 0) - Number(a.application_count || 0) || String(a.class_name || "").localeCompare(String(b.class_name || "")))
+    .slice(0, 8);
+
+  const professorSummaryMap = new Map();
+  classes.forEach((row) => {
+    const key = String(row.teacher_name || "未设置教授");
+    if (!professorSummaryMap.has(key)) {
+      professorSummaryMap.set(key, { teacher_name: key, class_count: 0, application_count: 0, pending_professor_count: 0, approved_count: 0 });
+    }
+    const item = professorSummaryMap.get(key);
+    item.class_count += 1;
+    item.application_count += Number(row.application_count || 0);
+    item.pending_professor_count += Number(row.pending_professor_count || 0);
+    item.approved_count += Number(row.approved_count || 0);
+  });
+  const professorSummary = Array.from(professorSummaryMap.values())
+    .sort((a, b) => b.application_count - a.application_count || b.pending_professor_count - a.pending_professor_count)
+    .slice(0, 8);
+
+  const dayMap = new Map();
+  applications.forEach((app) => {
+    const day = String(app.submitted_at || "").slice(0, 10);
+    if (!day) return;
+    dayMap.set(day, (dayMap.get(day) || 0) + 1);
+  });
+  const recentDays = Array.from(dayMap.entries())
+    .sort((a, b) => a[0].localeCompare(b[0]))
+    .slice(-7);
+  const maxDayCount = Math.max(1, ...recentDays.map(([, count]) => count));
+
+  const topClassMax = Math.max(1, ...topClasses.map((row) => Number(row.application_count || 0)));
+  const professorMax = Math.max(1, ...professorSummary.map((row) => Number(row.application_count || 0)));
+
+  const topClassRows = topClasses.map((row) => `
+    <div class="report-row">
+      <div class="report-row-main">
+        <div class="report-row-title">${escapeHtml(row.class_name)}</div>
+        <div class="report-row-meta">${escapeHtml(row.class_code)} · ${escapeHtml(row.teacher_name)} · 已通过 ${row.approved_count}/${row.maximum_number_of_tas_admitted}</div>
+        <div class="bar-track"><div class="bar-fill" style="width:${Math.max(8, Math.round(Number(row.application_count || 0) / topClassMax * 100))}%"></div></div>
+      </div>
+      <div class="report-row-side">${row.application_count} 份申请</div>
+    </div>
+  `).join("");
+
+  const professorRows = professorSummary.map((row) => `
+    <div class="report-row">
+      <div class="report-row-main">
+        <div class="report-row-title">${escapeHtml(row.teacher_name)}</div>
+        <div class="report-row-meta">教学班 ${row.class_count} · 待教授审批 ${row.pending_professor_count} · 已通过 ${row.approved_count}</div>
+        <div class="bar-track"><div class="bar-fill gold" style="width:${Math.max(8, Math.round(Number(row.application_count || 0) / professorMax * 100))}%"></div></div>
+      </div>
+      <div class="report-row-side">${row.application_count} 份申请</div>
+    </div>
+  `).join("");
+
+  const dayRows = recentDays.map(([day, count]) => `
+    <div class="report-row">
+      <div class="report-row-main">
+        <div class="report-row-title">${escapeHtml(day)}</div>
+        <div class="bar-track"><div class="bar-fill red" style="width:${Math.max(8, Math.round(count / maxDayCount * 100))}%"></div></div>
+      </div>
+      <div class="report-row-side">${count} 份</div>
+    </div>
+  `).join("");
+
+  sendHtml(res, pageLayout("报表视图", `
+    <section class="card card-brand">
+      <h2>CourseAdmin 报表视图</h2>
+      <p class="muted">集中查看申请、审批、教学班开放与名额使用情况。当前报表按申请提交时间统计。</p>
+      <form method="get" action="/course/reports">
+        <div class="filters-shell">
+          <div class="filters-grid">
+            <p><label>申请时间起<input type="date" name="submitted_from" value="${escapeHtml(submittedFrom)}" /></label></p>
+            <p><label>申请时间止<input type="date" name="submitted_to" value="${escapeHtml(submittedTo)}" /></label></p>
+            <div class="actions">
+              <button class="secondary action-button" type="submit">更新报表</button>
+              <a class="button-link secondary action-button" href="/course/reports">重置</a>
+            </div>
+          </div>
+        </div>
+      </form>
+    </section>
+
+    <section class="stats-grid">
+      <article class="stat-card"><div class="stat-label">申请总数</div><div class="stat-value">${totalApplications}</div><div class="stat-footnote">当前筛选范围内全部 TA 申请</div></article>
+      <article class="stat-card"><div class="stat-label">待 TAAdmin 审批</div><div class="stat-value">${pendingTaAdmin}</div><div class="stat-footnote">仍停留在初审阶段</div></article>
+      <article class="stat-card"><div class="stat-label">待 Professor 审批</div><div class="stat-value">${pendingProfessor}</div><div class="stat-footnote">已初审通过，待终审</div></article>
+      <article class="stat-card"><div class="stat-label">已通过申请</div><div class="stat-value">${approvedApplications}</div><div class="stat-footnote">最终通过的申请数量</div></article>
+      <article class="stat-card"><div class="stat-label">已拒绝申请</div><div class="stat-value">${rejectedApplications}</div><div class="stat-footnote">TAAdmin 或 Professor 拒绝合计</div></article>
+      <article class="stat-card"><div class="stat-label">教学班总数</div><div class="stat-value">${totalClasses}</div><div class="stat-footnote">系统内全部教学班</div></article>
+      <article class="stat-card"><div class="stat-label">开放中教学班</div><div class="stat-value">${openClasses}</div><div class="stat-footnote">当前开放且可申请</div></article>
+      <article class="stat-card"><div class="stat-label">TA 已满教学班</div><div class="stat-value">${fullClasses}</div><div class="stat-footnote">已通过人数达到上限</div></article>
+      <article class="stat-card"><div class="stat-label">已发布至 Professor</div><div class="stat-value">${publishedClasses}</div><div class="stat-footnote">已发送教授邮件的教学班</div></article>
+    </section>
+
+    <section class="report-grid">
+      <article class="report-card">
+        <div class="report-kicker">热门教学班</div>
+        <h3>申请量最高的教学班</h3>
+        <div class="report-list">
+          ${topClassRows || '<div class="muted">暂无数据</div>'}
+        </div>
+      </article>
+      <article class="report-card">
+        <div class="report-kicker">教授维度</div>
+        <h3>教授名下申请分布</h3>
+        <div class="report-list">
+          ${professorRows || '<div class="muted">暂无数据</div>'}
+        </div>
+      </article>
+    </section>
+
+    <section class="report-grid">
+      <article class="report-card">
+        <div class="report-kicker">状态分布</div>
+        <h3>申请状态概览</h3>
+        <table>
+          <tr><th>状态</th><th>数量</th></tr>
+          <tr><td><span class="${applicationStatusPillClass("PendingTAAdmin")}">${escapeHtml(statusLabels.PendingTAAdmin)}</span></td><td>${statusCounts.PendingTAAdmin}</td></tr>
+          <tr><td><span class="${applicationStatusPillClass("PendingProfessor")}">${escapeHtml(statusLabels.PendingProfessor)}</span></td><td>${statusCounts.PendingProfessor}</td></tr>
+          <tr><td><span class="${applicationStatusPillClass("Approved")}">${escapeHtml(statusLabels.Approved)}</span></td><td>${statusCounts.Approved}</td></tr>
+          <tr><td><span class="${applicationStatusPillClass("RejectedByTAAdmin")}">${escapeHtml(statusLabels.RejectedByTAAdmin)}</span></td><td>${statusCounts.RejectedByTAAdmin}</td></tr>
+          <tr><td><span class="${applicationStatusPillClass("RejectedByProfessor")}">${escapeHtml(statusLabels.RejectedByProfessor)}</span></td><td>${statusCounts.RejectedByProfessor}</td></tr>
+          <tr><td><span class="${applicationStatusPillClass("Withdrawn")}">${escapeHtml(statusLabels.Withdrawn)}</span></td><td>${statusCounts.Withdrawn}</td></tr>
+        </table>
+      </article>
+      <article class="report-card">
+        <div class="report-kicker">近 7 个申请日</div>
+        <h3>申请提交趋势</h3>
+        <div class="report-list">
+          ${dayRows || '<div class="muted">暂无数据</div>'}
+        </div>
+      </article>
     </section>
   `, user, notice));
 }
@@ -4059,6 +4879,7 @@ function courseAdminApplicationDetailPage(res, user, applicationId, notice) {
     where application_id = ?
     order by acted_at, approval_log_id
   `).all(applicationId);
+  const auditRows = applicationAuditRows(db, applicationId);
   db.close();
   if (!app) {
     res.writeHead(404, { "Content-Type": "text/html; charset=utf-8" });
@@ -4087,6 +4908,7 @@ function courseAdminApplicationDetailPage(res, user, applicationId, notice) {
       <h3>审批记录</h3>
       <table><tr><th>阶段</th><th>审批人</th><th>结果</th><th>备注</th><th>时间</th></tr>${logRows || "<tr><td colspan=\"5\">暂无审批记录</td></tr>"}</table>
     </section>
+    ${renderApplicationAuditSection(auditRows)}
     ${adminOverrideSection(`/course/applications/${applicationId}/override-status`, app.status)}
   `, user, notice));
 }
@@ -4376,7 +5198,7 @@ function taAdminAllClassesPage(res, user, notice, filters = {}) {
         <span class="muted">已选 <strong id="selected-ta-class-count">0</strong> 个教学班</span>
       </div>
       <div class="desktop-only">
-        <div class="table-wrap">
+        <div class="table-wrap list-scroll">
           <table class="wide compact-table fixed-layout">
             <colgroup>
               <col style="width:56px;" />
@@ -4518,6 +5340,14 @@ async function taAdminSendProfessorEmails(req, res, user) {
   try {
     await sendProfessorNotificationEmails(db, selectedClasses, user, baseUrl);
   } catch (error) {
+    createAuditLog(db, {
+      actor: user,
+      actionType: "PROFESSOR_EMAIL_SEND_FAILED",
+      targetType: "Class",
+      targetId: selectedClasses.map((row) => row.class_id).join(","),
+      targetName: "发布至Professor失败",
+      details: `教学班数：${selectedClasses.length}\n失败原因：${error.message}`
+    });
     db.close();
     return redirect(res, `/admin/ta/classes?notice=${error.message}`);
   }
@@ -4525,7 +5355,7 @@ async function taAdminSendProfessorEmails(req, res, user) {
   redirect(res, "/admin/ta/classes?notice=邮件已发送，教学班已发布至 Professor");
 }
 
-async function batchUpdateProfessorPublishStatus(req, res) {
+async function batchUpdateProfessorPublishStatus(req, res, user) {
   const body = await readBody(req);
   const refs = parseBatchClassRefs(body.class_refs);
   const nextValue = String(body.published_to_professor || "N").trim() === "Y" ? "Y" : "N";
@@ -4541,6 +5371,14 @@ async function batchUpdateProfessorPublishStatus(req, res) {
   const updateStmt = db.prepare("update classes set published_to_professor = ?, professor_notified_at = ? where class_id = ?");
   for (const row of selectedClasses) {
     updateStmt.run(nextValue, nextValue === "Y" ? nowStr() : null, row.class_id);
+    createAuditLog(db, {
+      actor: user,
+      actionType: "CLASS_PUBLISH_STATUS_UPDATE",
+      targetType: "Class",
+      targetId: row.class_id,
+      targetName: `${row.course_name} / ${row.class_name}`,
+      details: `教学班代码：${row.class_code}\n新发布状态：${nextValue === "Y" ? "已发送" : "未发送"}`
+    });
   }
   db.close();
   redirect(res, `/admin/ta/classes?notice=已批量更新 ${selectedClasses.length} 个教学班的发布状态`);
@@ -4984,7 +5822,7 @@ function courseUsersPage(res, user, notice, filters = {}) {
     </section>
     <section class="card">
       <h2>人员列表</h2>
-      <table>
+      <div class="table-wrap list-scroll"><table>
         <tr>
           <th>序号</th>
           <th>${sortableHeader("姓名", "user_name", "/course/users", headerFilters, sortBy, sortOrder)}</th>
@@ -4997,7 +5835,7 @@ function courseUsersPage(res, user, notice, filters = {}) {
           <th>操作</th>
         </tr>
         ${rows}
-      </table>
+      </table></div>
     </section>
   `, user, notice));
 }
@@ -5046,13 +5884,13 @@ function courseUserDetailPage(res, user, userId, notice) {
   `, user, notice));
 }
 
-async function createCourseUser(req, res) {
+async function createCourseUser(req, res, user) {
   const body = await readBody(req);
   const role = String(body.role || "TA");
   const isAllowed = role === "TA" ? String(body.is_allowed_to_apply || "N") : "N";
   const db = getDb();
   try {
-    db.prepare(`
+    const result = db.prepare(`
       insert into users (user_name, login_name, email, password, role, is_allowed_to_apply)
       values (?, ?, ?, ?, ?, ?)
     `).run(
@@ -5063,6 +5901,14 @@ async function createCourseUser(req, res) {
       role,
       isAllowed
     );
+    createAuditLog(db, {
+      actor: user,
+      actionType: "USER_CREATE",
+      targetType: "User",
+      targetId: result.lastInsertRowid,
+      targetName: String(body.user_name || "").trim(),
+      details: `登录名：${String(body.login_name || "").trim()}\n角色：${role}\n邮箱：${String(body.email || "").trim()}\n允许申请：${isAllowed}`
+    });
   } catch (error) {
     db.close();
     return redirect(res, "/course/users?notice=创建失败，登录名可能已存在");
@@ -5071,7 +5917,7 @@ async function createCourseUser(req, res) {
   redirect(res, "/course/users?notice=人员已创建");
 }
 
-async function importCourseUsers(req, res) {
+async function importCourseUsers(req, res, user) {
   const contentType = req.headers["content-type"] || "";
   if (!contentType.startsWith("multipart/form-data")) {
     return redirect(res, "/course/users?notice=请通过文件上传导入");
@@ -5095,6 +5941,16 @@ async function importCourseUsers(req, res) {
   try {
     importedUsers = parseImportedUsersWorkbook(file);
   } catch (error) {
+    const failedDb = getDb();
+    createAuditLog(failedDb, {
+      actor: user,
+      actionType: "USER_IMPORT_FAILED",
+      targetType: "Import",
+      targetId: file.filename,
+      targetName: "人员导入失败",
+      details: `文件名：${file.filename}\n失败原因：${error.message}`
+    });
+    failedDb.close();
     const reportId = saveImportReport({
       status: "failed",
       errorMessage: error.message,
@@ -5105,6 +5961,14 @@ async function importCourseUsers(req, res) {
   const db = getDb();
   try {
     const result = upsertImportedUsers(db, importedUsers);
+    createAuditLog(db, {
+      actor: user,
+      actionType: "USER_IMPORT",
+      targetType: "Import",
+      targetId: file.filename,
+      targetName: "人员导入",
+      details: `文件名：${file.filename}\n新增人员：${result.createdCount}\n更新人员：${result.updatedCount}`
+    });
     db.close();
     const reportId = saveImportReport({
       status: "success",
@@ -5112,6 +5976,14 @@ async function importCourseUsers(req, res) {
     });
     return redirect(res, `/course/users/import/result/${reportId}?notice=导入完成`);
   } catch (error) {
+    createAuditLog(db, {
+      actor: user,
+      actionType: "USER_IMPORT_FAILED",
+      targetType: "Import",
+      targetId: file.filename,
+      targetName: "人员导入失败",
+      details: `文件名：${file.filename}\n失败原因：${error.message}`
+    });
     db.close();
     const reportId = saveImportReport({
       status: "failed",
@@ -5122,7 +5994,7 @@ async function importCourseUsers(req, res) {
   }
 }
 
-async function updateCourseUser(req, res, userId) {
+async function updateCourseUser(req, res, user, userId) {
   const body = await readBody(req);
   const role = String(body.role || "TA");
   const isAllowed = role === "TA" ? String(body.is_allowed_to_apply || "N") : "N";
@@ -5160,6 +6032,14 @@ async function updateCourseUser(req, res, userId) {
         db.prepare("update classes set teacher_name = ? where class_id = ?").run(names, row.class_id);
       }
     }
+    createAuditLog(db, {
+      actor: user,
+      actionType: "USER_UPDATE",
+      targetType: "User",
+      targetId: userId,
+      targetName: String(body.user_name || "").trim(),
+      details: `原登录名：${target.login_name}\n新登录名：${String(body.login_name || "").trim()}\n角色：${role}\n邮箱：${String(body.email || "").trim()}\n允许申请：${isAllowed}`
+    });
   } catch (error) {
     db.close();
     return redirect(res, `/course/users/${userId}?notice=更新失败，登录名可能已存在`);
@@ -5168,7 +6048,7 @@ async function updateCourseUser(req, res, userId) {
   redirect(res, `/course/users/${userId}?notice=人员信息已更新`);
 }
 
-function deleteCourseUser(res, userId) {
+function deleteCourseUser(res, user, userId) {
   const db = getDb();
   const target = db.prepare("select * from users where user_id = ?").get(userId);
   if (!target) {
@@ -5182,12 +6062,20 @@ function deleteCourseUser(res, userId) {
     db.close();
     return redirect(res, "/course/users?notice=该用户已有关联业务数据，当前不允许删除");
   }
+  createAuditLog(db, {
+    actor: user,
+    actionType: "USER_DELETE",
+    targetType: "User",
+    targetId: userId,
+    targetName: target.user_name,
+    details: `登录名：${target.login_name}\n角色：${target.role}\n邮箱：${target.email}`
+  });
   db.prepare("delete from users where user_id = ?").run(userId);
   db.close();
   redirect(res, "/course/users?notice=人员已删除");
 }
 
-async function createClass(req, res) {
+async function createClass(req, res, user) {
   const body = await readBody(req);
   const maximumNumber = Number(body.maximum_number || 1);
   const isConflictAllowed = String(body.is_conflict_allowed || "N");
@@ -5258,6 +6146,14 @@ async function createClass(req, res) {
         schedule.isExam
       );
     }
+    createAuditLog(db, {
+      actor: user,
+      actionType: "CLASS_CREATE",
+      targetType: "Class",
+      targetId: result.lastInsertRowid,
+      targetName: `${String(body.course_name || "").trim()} / ${String(body.class_name || "").trim()}`,
+      details: `教学班代码：${String(body.class_code || "").trim()}\n教授：${professorSelection.nameText}\n学期：${String(body.semester || "").trim()}\nTA上限：${maximumNumber}\n排课数：${scheduleRows.length}`
+    });
   } catch (error) {
     db.close();
     return redirect(res, "/course/classes?notice=ClassCode 已存在或字段非法");
@@ -5266,7 +6162,7 @@ async function createClass(req, res) {
   redirect(res, "/course/classes?notice=教学班已创建");
 }
 
-async function importClasses(req, res) {
+async function importClasses(req, res, user) {
   const contentType = req.headers["content-type"] || "";
   if (!contentType.startsWith("multipart/form-data")) {
     return redirect(res, "/course/classes?notice=请通过文件上传导入");
@@ -5291,6 +6187,16 @@ async function importClasses(req, res) {
   try {
     importedClasses = parseImportedClassesWorkbook(file);
   } catch (error) {
+    const failedDb = getDb();
+    createAuditLog(failedDb, {
+      actor: user,
+      actionType: "CLASS_IMPORT_FAILED",
+      targetType: "Import",
+      targetId: file.filename,
+      targetName: "教学班导入失败",
+      details: `文件名：${file.filename}\n失败原因：${error.message}`
+    });
+    failedDb.close();
     const reportId = saveImportReport({
       status: "failed",
       errorMessage: error.message,
@@ -5301,6 +6207,14 @@ async function importClasses(req, res) {
   const db = getDb();
   try {
     const result = upsertImportedClasses(db, importedClasses);
+    createAuditLog(db, {
+      actor: user,
+      actionType: "CLASS_IMPORT",
+      targetType: "Import",
+      targetId: file.filename,
+      targetName: "教学班导入",
+      details: `文件名：${file.filename}\n新增教学班：${result.createdCount}\n更新教学班：${result.updatedCount}`
+    });
     db.close();
     const reportId = saveImportReport({
       status: "success",
@@ -5308,6 +6222,14 @@ async function importClasses(req, res) {
     });
     return redirect(res, `/course/classes/import/result/${reportId}?notice=导入完成`);
   } catch (error) {
+    createAuditLog(db, {
+      actor: user,
+      actionType: "CLASS_IMPORT_FAILED",
+      targetType: "Import",
+      targetId: file.filename,
+      targetName: "教学班导入失败",
+      details: `文件名：${file.filename}\n失败原因：${error.message}`
+    });
     db.close();
     const reportId = saveImportReport({
       status: "failed",
@@ -5318,7 +6240,7 @@ async function importClasses(req, res) {
   }
 }
 
-async function updateClass(req, res, classId) {
+async function updateClass(req, res, user, classId) {
   const body = await readBody(req);
   const maximumNumber = Number(body.maximum_number || 1);
   const isConflictAllowed = String(body.is_conflict_allowed || "N");
@@ -5394,6 +6316,14 @@ async function updateClass(req, res, classId) {
       String(body.class_name || "").trim(),
       classId
     );
+    createAuditLog(db, {
+      actor: user,
+      actionType: "CLASS_UPDATE",
+      targetType: "Class",
+      targetId: classId,
+      targetName: `${String(body.course_name || "").trim()} / ${String(body.class_name || "").trim()}`,
+      details: `教学班代码：${String(body.class_code || "").trim()}\n教授：${professorSelection.nameText}\n学期：${String(body.semester || "").trim()}\nTA上限：${maximumNumber}\n排课数：${scheduleRows.length}`
+    });
   } catch (error) {
     db.close();
     return redirect(res, `/course/classes/${classId}?notice=更新失败，ClassCode 可能已存在`);
@@ -5402,7 +6332,7 @@ async function updateClass(req, res, classId) {
   redirect(res, `/course/classes/${classId}?notice=教学班已更新`);
 }
 
-async function batchUpdateClassWindow(req, res) {
+async function batchUpdateClassWindow(req, res, user) {
   const body = await readBody(req);
   const refs = parseBatchClassRefs(body.class_refs);
   let applyStartAt;
@@ -5429,6 +6359,17 @@ async function batchUpdateClassWindow(req, res) {
     const result = updateStmt.run(applyStartAt, applyEndAt, Number.isInteger(id) && id > 0 ? id : -1, ref);
     changed += result.changes;
   }
+  const changedRows = loadClassRowsByRefs(db, refs);
+  for (const row of changedRows) {
+    createAuditLog(db, {
+      actor: user,
+      actionType: "CLASS_APPLY_WINDOW_UPDATE",
+      targetType: "Class",
+      targetId: row.class_id,
+      targetName: `${row.course_name} / ${row.class_name}`,
+      details: `教学班代码：${row.class_code}\n开放开始：${applyStartAt}\n开放结束：${applyEndAt}`
+    });
+  }
   db.close();
   if (changed === 0) {
     return redirect(res, "/course/classes?notice=未匹配到任何教学班");
@@ -5436,7 +6377,7 @@ async function batchUpdateClassWindow(req, res) {
   redirect(res, `/course/classes?notice=已批量更新 ${changed} 个教学班的开放申请时间`);
 }
 
-async function batchToggleClassApply(req, res) {
+async function batchToggleClassApply(req, res, user) {
   const body = await readBody(req);
   const refs = parseBatchClassRefs(body.class_refs);
   const taAllowed = String(body.ta_allowed || "Y");
@@ -5458,6 +6399,17 @@ async function batchToggleClassApply(req, res) {
     const result = updateStmt.run(taAllowed, Number.isInteger(id) && id > 0 ? id : -1, ref);
     changed += result.changes;
   }
+  const changedRows = loadClassRowsByRefs(db, refs);
+  for (const row of changedRows) {
+    createAuditLog(db, {
+      actor: user,
+      actionType: "CLASS_APPLY_TOGGLE",
+      targetType: "Class",
+      targetId: row.class_id,
+      targetName: `${row.course_name} / ${row.class_name}`,
+      details: `教学班代码：${row.class_code}\n新开放申请状态：${taAllowed}`
+    });
+  }
   db.close();
   if (changed === 0) {
     return redirect(res, "/course/classes?notice=未匹配到任何教学班");
@@ -5465,7 +6417,7 @@ async function batchToggleClassApply(req, res) {
   redirect(res, `/course/classes?notice=已批量更新 ${changed} 个教学班的申请权限`);
 }
 
-function deleteClassesByIds(classIds) {
+function deleteClassesByIds(classIds, actor = null) {
   const ids = Array.from(new Set(
     classIds
       .map((item) => Number(item))
@@ -5483,8 +6435,9 @@ function deleteClassesByIds(classIds) {
   const filesToDelete = [];
   let deletedCount = 0;
   for (const classId of ids) {
-    const classRow = db.prepare("select class_id from classes where class_id = ?").get(classId);
+    const classRow = db.prepare("select * from classes where class_id = ?").get(classId);
     if (!classRow) continue;
+    const impact = classDeleteImpact(db, classId);
     const apps = selectApps.all(classId);
     for (const app of apps) {
       deleteApproval.run(app.application_id);
@@ -5494,6 +6447,14 @@ function deleteClassesByIds(classIds) {
     }
     deleteApps.run(classId);
     deleteSchedules.run(classId);
+    createAuditLog(db, {
+      actor,
+      actionType: "CLASS_DELETE",
+      targetType: "Class",
+      targetId: classId,
+      targetName: `${classRow.course_name} / ${classRow.class_name}`,
+      details: `教学班代码：${classRow.class_code}\n教授：${classRow.teacher_name}\n排课数：${impact.scheduleCount}\n申请数：${impact.applicationCount}\n审批日志数：${impact.approvalCount}`
+    });
     deletedCount += deleteClassStmt.run(classId).changes;
   }
   db.close();
@@ -5505,15 +6466,15 @@ function deleteClassesByIds(classIds) {
   return { deletedCount };
 }
 
-function deleteClass(res, classId) {
-  const result = deleteClassesByIds([classId]);
+function deleteClass(res, user, classId) {
+  const result = deleteClassesByIds([classId], user);
   if (result.deletedCount === 0) {
     return redirect(res, "/course/classes?notice=教学班不存在");
   }
   redirect(res, "/course/classes?notice=教学班及其关联排课、申请、审批记录已删除");
 }
 
-async function batchDeleteClasses(req, res) {
+async function batchDeleteClasses(req, res, user) {
   const body = await readBody(req);
   const refs = parseBatchClassRefs(body.class_refs);
   if (!refs.length) {
@@ -5525,7 +6486,7 @@ async function batchDeleteClasses(req, res) {
   if (!classRows.length) {
     return redirect(res, "/course/classes?notice=未匹配到任何教学班");
   }
-  const result = deleteClassesByIds(classRows.map((row) => row.class_id));
+  const result = deleteClassesByIds(classRows.map((row) => row.class_id), user);
   if (result.deletedCount === 0) {
     return redirect(res, "/course/classes?notice=未删除任何教学班");
   }
@@ -5681,6 +6642,17 @@ async function handleRequest(req, res) {
       status: url.searchParams.get("status") || ""
     });
   }
+  if (pathname === "/admin/ta/application-logs") {
+    if (!requireRole(res, user, ["TAAdmin"])) return;
+    return taAdminApplicationLogsPage(res, user, notice, {
+      applier_name: url.searchParams.get("applier_name") || "",
+      class_name: url.searchParams.get("class_name") || "",
+      teacher_name: url.searchParams.get("teacher_name") || "",
+      status: url.searchParams.get("status") || "",
+      submitted_from: url.searchParams.get("submitted_from") || "",
+      submitted_to: url.searchParams.get("submitted_to") || ""
+    });
+  }
   if (pathname === "/admin/ta/pending/batch-approve" && req.method === "POST") {
     if (!requireRole(res, user, ["TAAdmin"])) return;
     return taAdminBatchApprove(req, res, user);
@@ -5712,7 +6684,7 @@ async function handleRequest(req, res) {
   }
   if (pathname === "/admin/ta/classes/batch-publish" && req.method === "POST") {
     if (!requireRole(res, user, ["TAAdmin"])) return;
-    return batchUpdateProfessorPublishStatus(req, res);
+    return batchUpdateProfessorPublishStatus(req, res, user);
   }
   if (/^\/admin\/ta\/classes\/\d+\/applications\/approve$/.test(pathname) && req.method === "POST") {
     if (!requireRole(res, user, ["TAAdmin"])) return;
@@ -5736,7 +6708,7 @@ async function handleRequest(req, res) {
   }
   if (/^\/admin\/ta\/users\/\d+\/toggle$/.test(pathname) && req.method === "POST") {
     if (!requireRole(res, user, ["TAAdmin"])) return;
-    return toggleTaUser(res, Number(pathname.split("/")[4]));
+    return toggleTaUser(res, user, Number(pathname.split("/")[4]));
   }
 
   if (pathname === "/professor/pending") {
@@ -5766,6 +6738,33 @@ async function handleRequest(req, res) {
       status_filter: url.searchParams.get("status_filter") || "",
       sort_by: url.searchParams.get("sort_by") || "class_code",
       sort_order: url.searchParams.get("sort_order") || "asc"
+    });
+  }
+  if (pathname === "/course/reports") {
+    if (!requireRole(res, user, ["CourseAdmin"])) return;
+    return courseReportsPage(res, user, notice, {
+      submitted_from: url.searchParams.get("submitted_from") || "",
+      submitted_to: url.searchParams.get("submitted_to") || ""
+    });
+  }
+  if (pathname === "/course/audit-logs") {
+    if (!requireRole(res, user, ["CourseAdmin"])) return;
+    return courseAuditLogsPage(res, user, notice, {
+      actor_name: url.searchParams.get("actor_name") || "",
+      action_type: url.searchParams.get("action_type") || "",
+      target_type: url.searchParams.get("target_type") || "",
+      keyword: url.searchParams.get("keyword") || ""
+    });
+  }
+  if (pathname === "/course/application-logs") {
+    if (!requireRole(res, user, ["CourseAdmin"])) return;
+    return courseAdminApplicationLogsPage(res, user, notice, {
+      applier_name: url.searchParams.get("applier_name") || "",
+      class_name: url.searchParams.get("class_name") || "",
+      teacher_name: url.searchParams.get("teacher_name") || "",
+      status: url.searchParams.get("status") || "",
+      submitted_from: url.searchParams.get("submitted_from") || "",
+      submitted_to: url.searchParams.get("submitted_to") || ""
     });
   }
   if (/^\/course\/applications\/\d+\/override-status$/.test(pathname) && req.method === "POST") {
@@ -5842,19 +6841,19 @@ async function handleRequest(req, res) {
   }
   if (pathname === "/course/classes/create" && req.method === "POST") {
     if (!requireRole(res, user, ["CourseAdmin"])) return;
-    return createClass(req, res);
+    return createClass(req, res, user);
   }
   if (pathname === "/course/classes/import" && req.method === "POST") {
     if (!requireRole(res, user, ["CourseAdmin"])) return;
-    return importClasses(req, res);
+    return importClasses(req, res, user);
   }
   if (pathname === "/course/classes/batch-toggle" && req.method === "POST") {
     if (!requireRole(res, user, ["CourseAdmin"])) return;
-    return batchToggleClassApply(req, res);
+    return batchToggleClassApply(req, res, user);
   }
   if (pathname === "/course/classes/batch-window" && req.method === "POST") {
     if (!requireRole(res, user, ["CourseAdmin"])) return;
-    return batchUpdateClassWindow(req, res);
+    return batchUpdateClassWindow(req, res, user);
   }
   if (pathname === "/course/classes/batch-delete" && req.method === "POST") {
     if (!requireRole(res, user, ["CourseAdmin"])) return;
@@ -5862,7 +6861,7 @@ async function handleRequest(req, res) {
   }
   if (pathname === "/course/classes/batch-delete/confirm" && req.method === "POST") {
     if (!requireRole(res, user, ["CourseAdmin"])) return;
-    return batchDeleteClasses(req, res);
+    return batchDeleteClasses(req, res, user);
   }
   if (/^\/course\/classes\/\d+$/.test(pathname)) {
     if (!requireRole(res, user, ["CourseAdmin"])) return;
@@ -5878,11 +6877,11 @@ async function handleRequest(req, res) {
   }
   if (/^\/course\/classes\/\d+\/delete\/confirm$/.test(pathname) && req.method === "POST") {
     if (!requireRole(res, user, ["CourseAdmin"])) return;
-    return deleteClass(res, Number(pathname.split("/")[3]));
+    return deleteClass(res, user, Number(pathname.split("/")[3]));
   }
   if (/^\/course\/classes\/\d+\/update$/.test(pathname) && req.method === "POST") {
     if (!requireRole(res, user, ["CourseAdmin"])) return;
-    return updateClass(req, res, Number(pathname.split("/")[3]));
+    return updateClass(req, res, user, Number(pathname.split("/")[3]));
   }
   if (pathname === "/course/users") {
     if (!requireRole(res, user, ["CourseAdmin"])) return;
@@ -5928,7 +6927,7 @@ async function handleRequest(req, res) {
   }
   if (pathname === "/course/users/import" && req.method === "POST") {
     if (!requireRole(res, user, ["CourseAdmin"])) return;
-    return importCourseUsers(req, res);
+    return importCourseUsers(req, res, user);
   }
   if (/^\/course\/users\/import\/result\/[A-Za-z0-9]+$/.test(pathname)) {
     if (!requireRole(res, user, ["CourseAdmin"])) return;
@@ -5936,7 +6935,7 @@ async function handleRequest(req, res) {
   }
   if (pathname === "/course/users/create" && req.method === "POST") {
     if (!requireRole(res, user, ["CourseAdmin"])) return;
-    return createCourseUser(req, res);
+    return createCourseUser(req, res, user);
   }
   if (/^\/course\/users\/\d+$/.test(pathname)) {
     if (!requireRole(res, user, ["CourseAdmin"])) return;
@@ -5944,11 +6943,11 @@ async function handleRequest(req, res) {
   }
   if (/^\/course\/users\/\d+\/update$/.test(pathname) && req.method === "POST") {
     if (!requireRole(res, user, ["CourseAdmin"])) return;
-    return updateCourseUser(req, res, Number(pathname.split("/")[3]));
+    return updateCourseUser(req, res, user, Number(pathname.split("/")[3]));
   }
   if (/^\/course\/users\/\d+\/delete$/.test(pathname) && req.method === "POST") {
     if (!requireRole(res, user, ["CourseAdmin"])) return;
-    return deleteCourseUser(res, Number(pathname.split("/")[3]));
+    return deleteCourseUser(res, user, Number(pathname.split("/")[3]));
   }
 
   res.writeHead(404, { "Content-Type": "text/html; charset=utf-8" });
