@@ -6,6 +6,8 @@ const os = require("node:os");
 const { URL } = require("node:url");
 const querystring = require("node:querystring");
 const { DatabaseSync } = require("node:sqlite");
+const { BASE_DIR, DB_PATH, UPLOAD_DIR, ASSET_DIR, DB_CLIENT, PORT, HOST } = require("./config/runtime");
+const dbGateway = require("./db/gateway");
 const XLSX = require("xlsx");
 let nodemailer = null;
 try {
@@ -14,13 +16,6 @@ try {
   nodemailer = null;
 }
 
-const BASE_DIR = __dirname;
-const DB_PATH = path.join(BASE_DIR, "ta_system_node.db");
-const UPLOAD_DIR = path.join(BASE_DIR, "uploads");
-const ASSET_DIR = path.join(BASE_DIR, "assets");
-const LOCAL_ENV_PATH = path.join(BASE_DIR, ".env.local");
-const PORT = 3000;
-const HOST = process.env.HOST || "127.0.0.1";
 const SAIF_LOGO_HORIZONTAL = `/assets/${encodeURIComponent("学院logo金色版2-英文横版.png")}`;
 const SAIF_LOGO_VERTICAL = `/assets/${encodeURIComponent("学院logo金色版7-原竖版.png")}`;
 const sessions = new Map();
@@ -64,27 +59,6 @@ const reapplyAllowedStatuses = new Set([
   "RejectedByProfessor"
 ]);
 
-function loadLocalEnv(filePath) {
-  if (!fs.existsSync(filePath)) return;
-  const content = fs.readFileSync(filePath, "utf8");
-  for (const line of content.split(/\r?\n/)) {
-    const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith("#")) continue;
-    const index = trimmed.indexOf("=");
-    if (index <= 0) continue;
-    const key = trimmed.slice(0, index).trim();
-    let value = trimmed.slice(index + 1).trim();
-    if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
-      value = value.slice(1, -1);
-    }
-    if (!(key in process.env)) {
-      process.env[key] = value;
-    }
-  }
-}
-
-loadLocalEnv(LOCAL_ENV_PATH);
-
 function nowStr() {
   const date = new Date();
   const pad = (v) => String(v).padStart(2, "0");
@@ -95,6 +69,22 @@ function nowMinuteStr() {
   const date = new Date();
   const pad = (v) => String(v).padStart(2, "0");
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+function comparableDateTimeValue(value) {
+  if (!value) return "";
+  if (value instanceof Date && !Number.isNaN(value.getTime())) {
+    return formatDateTime(value).slice(0, 16);
+  }
+  const raw = String(value).trim();
+  if (!raw) return "";
+  if (raw.includes("T")) {
+    const date = new Date(raw);
+    if (!Number.isNaN(date.getTime())) {
+      return formatDateTime(date).slice(0, 16);
+    }
+  }
+  return raw.replace("T", " ").slice(0, 16);
 }
 
 function toArray(value) {
@@ -343,20 +333,27 @@ function parseCookies(req) {
   );
 }
 
-function getCurrentUser(req) {
+async function getCurrentUser(req) {
   const sid = parseCookies(req).sid;
   if (!sid || !sessions.has(sid)) {
     return null;
   }
-  const db = getDb();
-  const user = db.prepare("select * from users where user_id = ?").get(sessions.get(sid));
-  db.close();
-  return user ?? null;
+  return (await dbGateway.findUserById(sessions.get(sid))) ?? null;
 }
 
-function sendHtml(res, html, headers = {}) {
-  res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", ...headers });
-  res.end(html);
+function sendHtml(res, html, headers = {}, statusCode = 200) {
+  Promise.resolve(html)
+    .then((resolvedHtml) => {
+      if (res.writableEnded) return;
+      res.writeHead(statusCode, { "Content-Type": "text/html; charset=utf-8", ...headers });
+      res.end(resolvedHtml);
+    })
+    .catch((error) => {
+      if (res.writableEnded) return;
+      fs.writeFileSync(path.join(BASE_DIR, "server-error.log"), `${nowStr()} ${error.stack}\n`, { flag: "a" });
+      res.writeHead(500, { "Content-Type": "text/html; charset=utf-8" });
+      res.end(`<section style="padding:24px;font-family:system-ui,sans-serif;"><h2>服务异常</h2><pre style="white-space:pre-wrap;">${escapeHtml(error.stack || error.message || error)}</pre></section>`);
+    });
 }
 
 function redirect(res, location, headers = {}) {
@@ -364,24 +361,19 @@ function redirect(res, location, headers = {}) {
   res.end();
 }
 
-function consumeLoginToken(res, token) {
-  const db = getDb();
-  const row = db.prepare("select * from login_tokens where token = ? and used_at is null").get(token);
+async function consumeLoginToken(res, token) {
+  const row = await dbGateway.findUnusedLoginToken(token);
   if (!row) {
-    db.close();
     return redirect(res, "/?notice=登录链接无效或已失效");
   }
   if (row.expires_at < nowStr()) {
-    db.close();
     return redirect(res, "/?notice=登录链接已过期");
   }
-  const user = db.prepare("select * from users where user_id = ?").get(row.user_id);
+  const user = await dbGateway.findUserById(row.user_id);
   if (!user) {
-    db.close();
     return redirect(res, "/?notice=用户不存在");
   }
-  db.prepare("update login_tokens set used_at = ? where token = ?").run(nowStr(), token);
-  db.close();
+  await dbGateway.markLoginTokenUsed(token, nowStr());
   const sid = crypto.randomBytes(16).toString("hex");
   sessions.set(sid, user.user_id);
   return redirect(res, row.target_path, { "Set-Cookie": `sid=${sid}; Path=/; HttpOnly` });
@@ -509,7 +501,7 @@ function isClassOpenForApply(classRow) {
   if (!classRow || classRow.ta_applications_allowed !== "Y") return false;
   if (!classRow.apply_start_at || !classRow.apply_end_at) return false;
   const now = nowMinuteStr();
-  return classRow.apply_start_at <= now && now <= classRow.apply_end_at;
+  return comparableDateTimeValue(classRow.apply_start_at) <= now && now <= comparableDateTimeValue(classRow.apply_end_at);
 }
 
 function applyWindowText(classRow) {
@@ -550,8 +542,10 @@ function classOpenStatus(classRow) {
   if (classRow.ta_applications_allowed !== "Y") return "closed";
   if (!classRow.apply_start_at || !classRow.apply_end_at) return "unset";
   const now = nowMinuteStr();
-  if (now < classRow.apply_start_at) return "upcoming";
-  if (now > classRow.apply_end_at) return "expired";
+  const startAt = comparableDateTimeValue(classRow.apply_start_at);
+  const endAt = comparableDateTimeValue(classRow.apply_end_at);
+  if (now < startAt) return "upcoming";
+  if (now > endAt) return "expired";
   return "open";
 }
 
@@ -565,6 +559,38 @@ function classOpenStatusLabel(classRow) {
     unset: "未设置"
   };
   return labels[status] || status;
+}
+
+function ynPill(value, yesLabel = "是", noLabel = "否") {
+  const normalized = String(value || "").toUpperCase() === "Y";
+  return `<span class="pill ${normalized ? "ok" : "muted"}">${normalized ? yesLabel : noLabel}</span>`;
+}
+
+function classOpenStatusPill(classRow) {
+  const status = classOpenStatus(classRow);
+  const tone =
+    status === "open" ? "ok" :
+    status === "upcoming" ? "gold" :
+    status === "expired" ? "bad" :
+    "muted";
+  return `<span class="pill ${tone}">${escapeHtml(classOpenStatusLabel(classRow))}</span>`;
+}
+
+function classCapacityPill(isFull) {
+  return `<span class="pill ${isFull ? "gold" : "muted"}">${isFull ? "已满" : "未满"}</span>`;
+}
+
+function metricPill(value, tone = "muted") {
+  return `<span class="pill ${tone}" style="min-width:0; padding:5px 10px; font-size:12px;">${escapeHtml(value)}</span>`;
+}
+
+function namePills(value) {
+  const names = String(value || "")
+    .split("；")
+    .map((item) => item.trim())
+    .filter(Boolean);
+  if (!names.length) return '<span class="pill muted">-</span>';
+  return `<div class="pill-stack">${names.map((name) => `<span class="pill muted">${escapeHtml(name)}</span>`).join("")}</div>`;
 }
 
 function parseBatchClassRefs(value) {
@@ -700,11 +726,8 @@ function renderAuditDetails(value) {
   return escapeHtml(value || "-").replace(/\n/g, "<br>");
 }
 
-function unreadNotificationCount(userId) {
-  const db = getDb();
-  const count = db.prepare("select count(*) as count from notifications where user_id = ? and is_read = 'N'").get(userId).count;
-  db.close();
-  return count;
+async function unreadNotificationCount(userId) {
+  return dbGateway.unreadNotificationCountByUser(userId);
 }
 
 function saveImportReport(report) {
@@ -1081,11 +1104,11 @@ async function sendProfessorNotificationEmails(db, classes, taAdmin, baseUrl) {
   }
 }
 
-function pageLayout(title, body, user, notice) {
+async function pageLayout(title, body, user, notice) {
   let nav = "";
   if (user) {
     const links = ['<a href="/">首页</a>', '<a href="/logout">退出</a>'];
-    const unreadCount = unreadNotificationCount(user.user_id);
+    const unreadCount = await unreadNotificationCount(user.user_id);
     links.splice(1, 0, `<a href="/notifications">通知${unreadCount ? `(${unreadCount})` : ""}</a>`);
     if (user.role === "TA") {
       links.splice(1, 0, '<a href="/ta/classes">可申请教学班</a>', '<a href="/ta/applications">我的申请</a>', '<a href="/ta/profile">个人资料</a>');
@@ -1429,6 +1452,16 @@ function pageLayout(title, body, user, notice) {
         background: rgba(136, 127, 111, 0.14);
         color: #6e665c;
       }
+      .pill-stack {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px;
+        align-items: center;
+      }
+      .pill-stack .pill {
+        padding: 4px 9px;
+        font-size: 12px;
+      }
       .audit-badge {
         display: inline-flex;
         align-items: center;
@@ -1583,6 +1616,14 @@ function pageLayout(title, body, user, notice) {
       .report-row-title {
         font-weight: 600;
         line-height: 1.45;
+      }
+      .report-row-title a {
+        color: var(--ink);
+        text-decoration: none;
+      }
+      .report-row-title a:hover {
+        color: var(--accent);
+        text-decoration: underline;
       }
       .report-row-meta {
         color: var(--muted);
@@ -1766,6 +1807,17 @@ function pageLayout(title, body, user, notice) {
       .action-button {
         min-width: 88px;
       }
+      .table-actions-compact {
+        display: flex;
+        gap: 6px;
+        flex-wrap: wrap;
+      }
+      .table-actions-compact .action-button {
+        min-width: 64px;
+        padding: 7px 10px;
+        font-size: 12px;
+        border-radius: 9px;
+      }
       .actions a,
       .actions button {
         white-space: nowrap;
@@ -1774,11 +1826,15 @@ function pageLayout(title, body, user, notice) {
       .table-action-cell {
         vertical-align: middle;
         text-align: center;
+        overflow: visible !important;
+        text-overflow: clip !important;
       }
       .table-action-cell .table-action-inner {
         display: inline-flex;
         align-items: center;
         justify-content: center;
+        gap: 6px;
+        flex-wrap: wrap;
         min-height: 100%;
       }
       .mobile-only { display: none; }
@@ -2286,6 +2342,79 @@ function getLatestApplicationMap(db, taUserId) {
   return map;
 }
 
+function getLatestApplicationMapFromRows(rows) {
+  const map = new Map();
+  for (const row of rows || []) {
+    if (!map.has(row.class_id)) {
+      map.set(row.class_id, row);
+    }
+  }
+  return map;
+}
+
+function buildScheduleMapFromRows(rows) {
+  const map = new Map();
+  for (const row of rows || []) {
+    if (!map.has(row.class_id)) map.set(row.class_id, []);
+    map.get(row.class_id).push(row);
+  }
+  return map;
+}
+
+function buildClassMapFromRows(rows) {
+  return new Map((rows || []).map((row) => [row.class_id, row]));
+}
+
+function getAppliedConflictsFromData(applications, classMap, scheduleMap, classId) {
+  const target = scheduleMap.get(classId) || [];
+  return (applications || []).flatMap((app) => {
+    if (["RejectedByTAAdmin", "RejectedByProfessor", "Withdrawn"].includes(app.status)) {
+      return [];
+    }
+    if (app.class_id === classId) {
+      return [];
+    }
+    const existing = scheduleMap.get(app.class_id) || [];
+    const matches = [];
+    for (const t of target) {
+      for (const e of existing) {
+        if (t.lesson_date === e.lesson_date && hasTimeConflict(t.start_time, t.end_time, e.start_time, e.end_time)) {
+          matches.push(`${t.lesson_date} ${t.start_time}-${t.end_time} vs ${e.start_time}-${e.end_time}`);
+        }
+      }
+    }
+    if (!matches.length) return [];
+    return [{
+      ...app,
+      is_conflict_allowed: classMap.get(app.class_id)?.is_conflict_allowed || "N",
+      matches
+    }];
+  });
+}
+
+function getOpenClassConflictsFromData(openClasses, applications, scheduleMap, classId) {
+  const target = scheduleMap.get(classId) || [];
+  return (openClasses || []).flatMap((classRow) => {
+    if (classRow.class_id === classId) return [];
+    const existing = scheduleMap.get(classRow.class_id) || [];
+    const matches = [];
+    for (const t of target) {
+      for (const e of existing) {
+        if (t.lesson_date === e.lesson_date && hasTimeConflict(t.start_time, t.end_time, e.start_time, e.end_time)) {
+          matches.push(`${t.lesson_date} ${t.start_time}-${t.end_time} vs ${e.start_time}-${e.end_time}`);
+        }
+      }
+    }
+    if (!matches.length) return [];
+    const relatedApplication = (applications || []).find((app) => app.class_id === classRow.class_id) || null;
+    return [{
+      classRow,
+      relatedApplication,
+      matches
+    }];
+  });
+}
+
 function compactScheduleList(schedules) {
   if (!schedules.length) {
     return "<p class='muted'>暂无排课信息。</p>";
@@ -2398,6 +2527,175 @@ function sortableHeader(label, field, basePath, filters, currentSortBy, currentS
   return `<a class="${activeClass}" href="${href}">${escapeHtml(label)}${arrow}</a>`;
 }
 
+function loadCourseAdminClassRows(db, filters = {}) {
+  const classCodeFilter = String(filters.class_code || "").trim().toLowerCase();
+  const classNameFilter = String(filters.class_name || "").trim().toLowerCase();
+  const teacherFilter = String(filters.teacher_name || "").trim().toLowerCase();
+  const statusFilter = String(filters.status_filter || "").trim();
+  const taFullFilter = String(filters.ta_full || "").trim();
+  const sortBy = String(filters.sort_by || "class_code");
+  const sortOrder = String(filters.sort_order || "asc").toLowerCase() === "desc" ? "desc" : "asc";
+  const rowsRaw = db.prepare(`
+    select c.*,
+      (select count(*) from applications a where a.class_id = c.class_id) as application_count,
+      (select count(*) from applications a where a.class_id = c.class_id and a.status = 'Approved') as approved_count,
+      (select count(*) from applications a where a.class_id = c.class_id and a.status = 'PendingTAAdmin') as pending_taadmin_count,
+      (select count(*) from applications a where a.class_id = c.class_id and a.status = 'PendingProfessor') as pending_professor_count,
+      (select group_concat(a.applier_name, '；') from applications a where a.class_id = c.class_id and a.status = 'Approved') as approved_ta_names
+    from classes c
+  `).all();
+  const sortValueMap = {
+    class_code: (row) => String(row.class_code || "").toLowerCase(),
+    class_name: (row) => String(row.class_name || "").toLowerCase(),
+    teacher_name: (row) => String(row.teacher_name || "").toLowerCase(),
+    ta_full: (row) => (Number(row.approved_count || 0) >= Number(row.maximum_number_of_tas_admitted || 0) ? 1 : 0),
+    status_filter: (row) => String(classOpenStatus(row)),
+    approved_count: (row) => Number(row.approved_count || 0),
+    application_count: (row) => Number(row.application_count || 0)
+  };
+  return rowsRaw
+    .filter((row) => !classCodeFilter || String(row.class_code || "").toLowerCase().includes(classCodeFilter))
+    .filter((row) => !classNameFilter || String(row.class_name || "").toLowerCase().includes(classNameFilter))
+    .filter((row) => !teacherFilter || String(row.teacher_name || "").toLowerCase().includes(teacherFilter))
+    .filter((row) => !statusFilter || classOpenStatus(row) === statusFilter)
+    .filter((row) => {
+      const isFull = Number(row.approved_count || 0) >= Number(row.maximum_number_of_tas_admitted || 0);
+      if (!taFullFilter) return true;
+      return taFullFilter === "Y" ? isFull : !isFull;
+    })
+    .sort((a, b) => {
+      const getter = sortValueMap[sortBy] || sortValueMap.class_code;
+      const av = getter(a);
+      const bv = getter(b);
+      if (av < bv) return sortOrder === "asc" ? -1 : 1;
+      if (av > bv) return sortOrder === "asc" ? 1 : -1;
+      return String(a.class_code || "").localeCompare(String(b.class_code || ""), "zh-Hans-CN");
+    });
+}
+
+function loadTaAdminClassRows(db, filters = {}) {
+  const professorFilter = String(filters.professor_name || "").trim().toLowerCase();
+  const classNameFilter = String(filters.class_name || "").trim().toLowerCase();
+  const taFullFilter = String(filters.ta_full || "").trim();
+  const hasPendingFilter = String(filters.has_pending || "").trim();
+  const rowsRaw = db.prepare(`
+    select c.*,
+      (select count(*) from applications a where a.class_id = c.class_id) as application_count,
+      (select count(*) from applications a where a.class_id = c.class_id and a.status = 'PendingTAAdmin') as pending_taadmin_count,
+      (select count(*) from applications a where a.class_id = c.class_id and a.status = 'PendingProfessor') as pending_professor_count,
+      (select count(*) from applications a where a.class_id = c.class_id and a.status = 'Approved') as approved_count,
+      (select group_concat(a.applier_name, '；') from applications a where a.class_id = c.class_id and a.status = 'Approved') as approved_ta_names
+    from classes c
+    order by c.semester, c.course_name, c.class_name
+  `).all();
+  for (const row of rowsRaw) {
+    if (isClassCapacityReached(row, row.approved_count) && row.ta_applications_allowed !== "N") {
+      row.ta_applications_allowed = "N";
+    }
+    if (Number(row.pending_taadmin_count || 0) > 0 && row.published_to_professor === "Y") {
+      row.published_to_professor = "N";
+      row.professor_notified_at = null;
+    }
+  }
+  return rowsRaw.filter((row) => {
+    const matchesProfessor = !professorFilter || String(row.teacher_name || "").toLowerCase().includes(professorFilter);
+    const matchesClassName = !classNameFilter || String(row.class_name || "").toLowerCase().includes(classNameFilter);
+    const isFull = isClassCapacityReached(row, row.approved_count);
+    const matchesTaFull = !taFullFilter || (taFullFilter === "Y" ? isFull : !isFull);
+    const hasPending = Number(row.pending_taadmin_count || 0) > 0;
+    const matchesPending = !hasPendingFilter || (hasPendingFilter === "Y" ? hasPending : !hasPending);
+    return matchesProfessor && matchesClassName && matchesTaFull && matchesPending;
+  });
+}
+
+function classTaExportWorkbookBufferFromRows(classRows, approvedApps) {
+  const classMap = new Map(classRows.map((row) => [Number(row.class_id), row]));
+  const matchRows = approvedApps.map((app) => {
+    const classRow = classMap.get(Number(app.class_id));
+    return {
+      class_id: classRow?.class_id ?? app.class_id,
+      class_code: classRow?.class_code || "",
+      class_abbr: classRow?.class_abbr || "",
+      course_name: classRow?.course_name || "",
+      class_name: classRow?.class_name || app.class_name || "",
+      semester: classRow?.semester || "",
+      teacher_name: classRow?.teacher_name || app.teacher_name || "",
+      maximum_number_of_tas_admitted: classRow?.maximum_number_of_tas_admitted || "",
+      published_to_professor: classRow?.published_to_professor || "",
+      ta_applications_allowed: classRow?.ta_applications_allowed || "",
+      ta_name: app.applier_name || "",
+      ta_login_name: app.ta_login_name || "",
+      ta_email: app.ta_email || "",
+      application_id: app.application_id,
+      approved_at: app.prof_acted_at || ""
+    };
+  });
+  const summaryRows = classRows.map((row) => ({
+    class_id: row.class_id,
+    class_code: row.class_code,
+    class_abbr: row.class_abbr || "",
+    course_name: row.course_name,
+    class_name: row.class_name,
+    semester: row.semester,
+    teacher_name: row.teacher_name,
+    maximum_number_of_tas_admitted: row.maximum_number_of_tas_admitted,
+    approved_count: row.approved_count || 0,
+    application_count: row.application_count || 0,
+    pending_taadmin_count: row.pending_taadmin_count || 0,
+    pending_professor_count: row.pending_professor_count || 0,
+    ta_full: isClassCapacityReached(row, row.approved_count) ? "Y" : "N",
+    published_to_professor: row.published_to_professor || "N",
+    ta_applications_allowed: row.ta_applications_allowed || "N",
+    is_conflict_allowed: row.is_conflict_allowed || "N"
+  }));
+  const workbook = XLSX.utils.book_new();
+  const matchesSheet = XLSX.utils.json_to_sheet(matchRows.length ? matchRows : [{
+    class_id: "",
+    class_code: "",
+    class_abbr: "",
+    course_name: "",
+    class_name: "",
+    semester: "",
+    teacher_name: "",
+    maximum_number_of_tas_admitted: "",
+    published_to_professor: "",
+    ta_applications_allowed: "",
+    ta_name: "",
+    ta_login_name: "",
+    ta_email: "",
+    application_id: "",
+    approved_at: ""
+  }]);
+  const summarySheet = XLSX.utils.json_to_sheet(summaryRows);
+  XLSX.utils.book_append_sheet(workbook, matchesSheet, "MatchedTA");
+  XLSX.utils.book_append_sheet(workbook, summarySheet, "ClassSummary");
+  return XLSX.write(workbook, { type: "buffer", bookType: "xlsx" });
+}
+
+function classTaExportWorkbookBuffer(db, classRows) {
+  const classIds = Array.from(new Set(classRows.map((row) => Number(row.class_id)).filter(Boolean)));
+  const approvedApps = classIds.length
+    ? db.prepare(`
+      select
+        a.application_id,
+        a.class_id,
+        a.class_name,
+        a.applier_user_id,
+        a.applier_name,
+        a.teacher_name,
+        a.prof_acted_at,
+        u.login_name as ta_login_name,
+        u.email as ta_email
+      from applications a
+      left join users u on u.user_id = a.applier_user_id
+      where a.status = 'Approved'
+        and a.class_id in (${classIds.map(() => "?").join(",")})
+      order by a.class_id, a.applier_name
+    `).all(...classIds)
+    : [];
+  return classTaExportWorkbookBufferFromRows(classRows, approvedApps);
+}
+
 function normalizeExamValue(value) {
   const raw = String(value || "").trim();
   if (!raw) return null;
@@ -2419,6 +2717,24 @@ function normalizeTeacherUserIds(value) {
   return parseDelimitedValues(value)
     .map((item) => Number(item))
     .filter((item) => Number.isInteger(item) && item > 0);
+}
+
+async function resolveProfessorSelectionGateway(rawValue) {
+  const ids = normalizeTeacherUserIds(rawValue);
+  if (!ids.length) {
+    throw new Error("请至少选择一位 Professor");
+  }
+  const professorRows = await dbGateway.getProfessorUsers();
+  const professorMap = new Map(professorRows.map((row) => [Number(row.user_id), row]));
+  const rows = ids.map((id) => professorMap.get(id)).filter(Boolean);
+  if (rows.length !== ids.length) {
+    throw new Error("Professor 不存在");
+  }
+  return {
+    ids: rows.map((row) => Number(row.user_id)),
+    idText: rows.map((row) => Number(row.user_id)).join(","),
+    nameText: rows.map((row) => row.user_name).join(" / ")
+  };
 }
 
 function parseScheduleLines(scheduleText) {
@@ -2891,7 +3207,116 @@ function scheduleLinesValue(rows) {
     .join("\n");
 }
 
-function taClassesPage(res, user, notice, filters = {}) {
+async function taClassesPage(res, user, notice, filters = {}) {
+  if (DB_CLIENT === "mysql") {
+    const snapshot = await dbGateway.getTaClassesSnapshot(user.user_id);
+    const latestApplicationMap = getLatestApplicationMapFromRows(snapshot.applications);
+    const scheduleMap = buildScheduleMapFromRows(snapshot.schedules);
+    const classMap = buildClassMapFromRows(snapshot.classMeta);
+    const applyStatusFilter = String(filters.apply_status || "").trim();
+    const professorFilter = String(filters.professor_name || "").trim().toLowerCase();
+    const courseFilter = String(filters.course_name || "").trim().toLowerCase();
+    const classNameFilter = String(filters.class_name || "").trim().toLowerCase();
+    const languageFilter = String(filters.teaching_language || "").trim();
+    const visibleClasses = snapshot.classes
+      .filter((row) => isClassOpenForApply(row))
+      .map((row) => {
+        const schedules = scheduleMap.get(row.class_id) || [];
+        const conflicts = getOpenClassConflictsFromData(snapshot.classes, snapshot.applications, scheduleMap, row.class_id);
+        const blockingConflicts = getAppliedConflictsFromData(snapshot.applications, classMap, scheduleMap, row.class_id);
+        const latestApplication = latestApplicationMap.get(row.class_id) || null;
+        const activeApplication = latestApplication && isActiveApplicationStatus(latestApplication.status) ? latestApplication : null;
+        const cardStatus = activeApplication
+          ? "已申请"
+          : (blockingConflicts.length && row.is_conflict_allowed !== "Y" ? "有冲突" : "可申请");
+        return {
+          ...row,
+          schedules,
+          conflicts,
+          latestApplication,
+          activeApplication,
+          cardStatus
+        };
+      })
+      .filter((row) => !applyStatusFilter || row.cardStatus === applyStatusFilter)
+      .filter((row) => !professorFilter || String(row.teacher_name || "").toLowerCase().includes(professorFilter))
+      .filter((row) => !courseFilter || String(row.course_name || "").toLowerCase().includes(courseFilter))
+      .filter((row) => !classNameFilter || String(row.class_name || "").toLowerCase().includes(classNameFilter))
+      .filter((row) => !languageFilter || String(row.teaching_language || "") === languageFilter);
+    const body = visibleClasses.map((row) => {
+      const labelClass = row.cardStatus === "有冲突" ? "pill bad" : row.cardStatus === "已申请" ? "pill" : "pill ok";
+      const cardClass = row.cardStatus === "有冲突" ? "card-soft-red" : row.cardStatus === "已申请" ? "card-soft-purple" : "";
+      const dialogId = `ta-conflicts-${row.class_id}`;
+      const actionHint = row.activeApplication
+        ? `<p class="compact-note">已提交申请，请到“我的申请”查看；若仍处于 TAAdmin 审批前，可在“我的申请”中撤销。</p>`
+        : "";
+      return `<article class="card class-card ${cardClass}">
+        <h3>${escapeHtml(row.course_name)} / ${escapeHtml(row.class_name)}</h3>
+        <p><span class="${labelClass}">${escapeHtml(row.cardStatus)}</span></p>
+        <div class="class-card-meta">
+          <span>${escapeHtml(row.teacher_name)}</span>
+          <span>${escapeHtml(row.teaching_language)}</span>
+          <span>${escapeHtml(row.semester)}</span>
+        </div>
+        <p>已通过：${row.approved_count} / ${row.maximum_number_of_tas_admitted}</p>
+        <p class="muted">开放申请：${escapeHtml(compactApplyWindowText(row))}</p>
+        ${actionHint}
+        <div class="actions">
+          <a class="button-link action-button" href="/ta/classes/${row.class_id}">查看详情</a>
+          <button class="secondary rect action-button" type="button" data-open-schedule="${dialogId}">查看冲突</button>
+        </div>
+        <dialog class="schedule-dialog" id="${dialogId}">
+          <div class="schedule-dialog-body">
+            <div class="actions" style="justify-content:space-between; align-items:center; margin-bottom:12px;">
+              <h3 style="margin:0;">${escapeHtml(row.class_name)}：排课与冲突</h3>
+              <button class="secondary rect" type="button" data-close-schedule="${dialogId}">关闭</button>
+            </div>
+            <section style="margin-bottom:14px;">
+              <h3 style="font-size:16px; margin-bottom:10px;">排课信息</h3>
+              ${compactScheduleList(row.schedules)}
+            </section>
+            <section>
+              <h3 style="font-size:16px; margin-bottom:10px;">冲突信息</h3>
+              ${compactConflictList(row.conflicts)}
+            </section>
+          </div>
+        </dialog>
+      </article>`;
+    }).join("");
+    return sendHtml(res, pageLayout("可申请教学班", `
+      <section class="card">
+        <h2>筛选教学班</h2>
+        <form method="get" action="/ta/classes">
+          <div class="filters-shell">
+          <div class="filters-grid">
+            <p><label>是否可申请<select name="apply_status">
+              <option value="" ${!filters.apply_status ? "selected" : ""}>全部</option>
+              <option value="可申请" ${filters.apply_status === "可申请" ? "selected" : ""}>可申请</option>
+              <option value="有冲突" ${filters.apply_status === "有冲突" ? "selected" : ""}>有冲突</option>
+              <option value="已申请" ${filters.apply_status === "已申请" ? "selected" : ""}>已申请</option>
+            </select></label></p>
+            <p><label>教授名<input name="professor_name" value="${escapeHtml(filters.professor_name || "")}" /></label></p>
+            <p><label>课程名称<input name="course_name" value="${escapeHtml(filters.course_name || "")}" /></label></p>
+            <p><label>教学班名称<input name="class_name" value="${escapeHtml(filters.class_name || "")}" /></label></p>
+            <p><label>授课语言<select name="teaching_language">
+              <option value="" ${!filters.teaching_language ? "selected" : ""}>全部</option>
+              ${["中文", "英文", "双语"].map((item) => `<option value="${item}" ${filters.teaching_language === item ? "selected" : ""}>${item}</option>`).join("")}
+            </select></label></p>
+            <div class="actions">
+              <button class="secondary action-button" type="submit">筛选</button>
+              <a class="button-link secondary action-button" href="/ta/classes">重置</a>
+            </div>
+          </div>
+          </div>
+        </form>
+      </section>
+      <section class="card">
+        <h2>开放教学班</h2>
+        <p class="muted">当前共匹配 <strong>${visibleClasses.length}</strong> 个教学班。浅紫色表示已申请，浅红色表示存在阻断性时间冲突。</p>
+        ${body ? `<div class="class-card-grid">${body}</div>` : `<p class="muted">当前没有符合条件的开放教学班。</p>`}
+      </section>
+    `, user, notice));
+  }
   const db = getDb();
   const classes = db.prepare(`
     select c.*,
@@ -3007,13 +3432,83 @@ function taClassesPage(res, user, notice, filters = {}) {
   `, user, notice));
 }
 
-function taClassDetailPage(res, user, classId, notice) {
+async function taClassDetailPage(res, user, classId, notice) {
+  if (DB_CLIENT === "mysql") {
+    const snapshot = await dbGateway.getTaClassesSnapshot(user.user_id);
+    const row = snapshot.classes.find((item) => item.class_id === classId) || null;
+    if (!row || !isClassOpenForApply(row)) {
+      return sendHtml(res, pageLayout("未找到", '<section class="card">教学班不存在，或当前不在开放申请时间内。</section>', user, notice), {}, 404);
+    }
+    const scheduleMap = buildScheduleMapFromRows(snapshot.schedules);
+    const classMap = buildClassMapFromRows(snapshot.classMeta);
+    const schedules = scheduleMap.get(classId) || [];
+    const appliedConflicts = getAppliedConflictsFromData(snapshot.applications, classMap, scheduleMap, classId);
+    const conflicts = getOpenClassConflictsFromData(snapshot.classes, snapshot.applications, scheduleMap, classId);
+    const existingApplication = (snapshot.applications || []).find((app) =>
+      app.class_id === classId &&
+      !["Withdrawn", "RejectedByTAAdmin", "RejectedByProfessor"].includes(app.status)
+    ) || null;
+    const hasBlockingConflicts = appliedConflicts.length > 0 && row.is_conflict_allowed !== "Y";
+    const canSubmit = Boolean(user.resume_path) && !hasBlockingConflicts && !existingApplication;
+    const resumeSection = user.resume_path
+      ? `<p>个人简历：${attachmentLink(user)}</p><p class="muted">提交申请时将自动带出当前个人简历。</p>`
+      : `<p class="bad">你还没有上传个人简历，请先到 <a href="/ta/profile">个人资料</a> 上传后再申请。</p>`;
+    const existingApplicationSection = existingApplication
+      ? `<div class="notice" style="margin: 0 0 16px; background: #f3ecff; border-color: #ddccff; color: #5b33a3;">
+          你已经提交过该教学班申请，当前状态为“${escapeHtml(statusLabels[existingApplication.status] || existingApplication.status)}”。为避免重复提交，当前按钮已停用。
+          ${existingApplication.status === "PendingTAAdmin" ? `在 TAAdmin 审批前，你可以进入 <a href="/ta/applications">我的申请</a> 模块撤销申请。` : `请进入 <a href="/ta/applications">我的申请</a> 模块查看当前状态。`}
+        </div>`
+      : "";
+    const submitGuardSection = hasBlockingConflicts
+      ? `<div class="notice" style="margin: 0 0 16px; background: #fce8e6; border-color: #f7c8c3; color: #a50e0e;">
+          检测到你已申请的教学班与当前教学班存在时间冲突，且本教学班未设置为允许冲突申请，因此当前不能提交申请。
+        </div>
+        <table><tr><th>已申请冲突教学班</th><th>当前状态</th><th>是否允许冲突申请</th><th>冲突时间</th></tr>${
+          appliedConflicts.map((app) => `<tr><td>${escapeHtml(app.class_name)}</td><td>${escapeHtml(statusLabels[app.status] || app.status)}</td><td>${escapeHtml(app.is_conflict_allowed || "N")}</td><td>${app.matches.map(escapeHtml).join("<br>")}</td></tr>`).join("")
+        }</table>`
+      : "";
+    const conflictSection = `
+        <div style="margin: 0 0 16px;">
+          <h3 style="margin-bottom:8px;">冲突信息</h3>
+          <p class="muted">以下展示当前教学班与所有开放教学班的冲突情况。</p>
+          ${compactConflictList(conflicts)}
+        </div>`;
+    return sendHtml(res, pageLayout("教学班详情", `
+      <section class="card">
+        <h2>${escapeHtml(row.course_name)} / ${escapeHtml(row.class_name)}</h2>
+        <p>教学班代码：${escapeHtml(row.class_code)}</p>
+        <p>教学班缩写：${escapeHtml(row.class_abbr || row.class_code)}</p>
+        <p>教授：${escapeHtml(row.teacher_name)} | 授课语言：${escapeHtml(row.teaching_language)} | 学期：${escapeHtml(row.semester)}</p>
+        <p>最大录取人数：${row.maximum_number_of_tas_admitted}</p>
+        <p>允许冲突申请：${escapeHtml(row.is_conflict_allowed || "N")}</p>
+        <p>开放申请时间：${applyWindowText(row)}</p>
+        <p>${escapeHtml(row.class_intro || "")}</p>
+        <p class="muted">${escapeHtml(row.memo || "")}</p>
+      </section>
+      <section class="card">
+        <h3>排课信息</h3>
+        ${schedulesTable(schedules)}
+      </section>
+      <section class="card">
+        <h3>提交申请</h3>
+        ${existingApplicationSection}
+        ${resumeSection}
+        ${conflictSection}
+        ${submitGuardSection}
+        <form method="post" action="/ta/applications" data-disable-on-submit="1" data-submit-hint-target="ta-submit-hint">
+          <input type="hidden" name="class_id" value="${row.class_id}" />
+          <p><label>申请原因<textarea name="application_reason" required></textarea></label></p>
+          <button type="submit" ${canSubmit ? "" : "disabled"}>提交申请</button>
+        </form>
+        <div class="submit-hint" id="ta-submit-hint">申请正在提交。提交后按钮会暂时停用，避免重复提交。在 TAAdmin 审批前，你可以进入“我的申请”模块撤销申请。</div>
+      </section>
+    `, user, notice));
+  }
   const db = getDb();
   const row = db.prepare("select * from classes where class_id = ?").get(classId);
   if (!row || !isClassOpenForApply(row)) {
     db.close();
-    res.writeHead(404, { "Content-Type": "text/html; charset=utf-8" });
-    res.end(pageLayout("未找到", '<section class="card">教学班不存在，或当前不在开放申请时间内。</section>', user, notice));
+    return sendHtml(res, pageLayout("未找到", '<section class="card">教学班不存在，或当前不在开放申请时间内。</section>', user, notice), {}, 404);
     return;
   }
   const schedules = fetchSchedules(db, classId);
@@ -3092,6 +3587,16 @@ async function createApplication(req, res, user) {
   const reason = String(fields.application_reason || "").trim();
   if (!reason) {
     return redirect(res, `/ta/classes/${classId}?notice=申请原因必填`);
+  }
+
+  if (DB_CLIENT === "mysql") {
+    const result = await dbGateway.createTaApplication(user, classId, reason, nowStr());
+    if (!result.ok) {
+      return redirect(res, result.redirect);
+    }
+    const emailJobs = (result.taAdmins || []).map((admin) => buildTaAdminNewApplicationEmail(admin, user, result.classRow));
+    const emailErrors = await sendEmailsAndCollectErrors(emailJobs);
+    return redirect(res, `/ta/applications?notice=${emailErrors.length ? "申请已提交，站内通知已发送，部分邮件发送失败" : "申请已提交，站内通知和邮件已发送"}`);
   }
 
   const db = getDb();
@@ -3284,8 +3789,7 @@ function taApplicationDetailPage(res, user, applicationId, notice) {
   const app = db.prepare("select * from applications where application_id = ? and applier_user_id = ?").get(applicationId, user.user_id);
   if (!app) {
     db.close();
-    res.writeHead(404, { "Content-Type": "text/html; charset=utf-8" });
-    res.end(pageLayout("未找到", '<section class="card">申请不存在。</section>', user, notice));
+    return sendHtml(res, pageLayout("未找到", '<section class="card">申请不存在。</section>', user, notice), {}, 404);
     return;
   }
   const logs = db.prepare("select * from approval_logs where application_id = ? order by acted_at").all(applicationId);
@@ -3334,7 +3838,95 @@ function withdrawApplication(res, user, applicationId) {
   redirect(res, "/ta/applications?notice=申请已撤销");
 }
 
-function taAdminPendingPage(res, user, notice, filters = {}) {
+async function taAdminPendingPage(res, user, notice, filters = {}) {
+  if (DB_CLIENT === "mysql") {
+    const apps = await dbGateway.getTaAdminPendingApplications(filters);
+    const rows = apps.map((app) => `<tr>
+      <td><input class="pending-app-select" type="checkbox" value="${app.application_id}" /></td>
+      <td>${escapeHtml(app.applier_name)}</td>
+      <td>${escapeHtml(app.class_name)}</td>
+      <td>${escapeHtml(app.teacher_name)}</td>
+      <td>${escapeHtml(app.submitted_at)}</td>
+      <td>${escapeHtml(app.application_reason)}</td>
+      <td class="table-action-cell"><div class="table-action-inner"><a class="button-link secondary action-button" href="/admin/ta/pending/${app.application_id}">详情</a></div></td>
+    </tr>`).join("");
+    return sendHtml(res, pageLayout("待初审申请", `
+      <section class="card">
+        <h2>筛选待审批申请</h2>
+        <form method="get" action="/admin/ta/pending">
+          <div class="filters-shell">
+          <div class="filters-grid">
+            <p><label>申请学生<input name="applier_name" value="${escapeHtml(filters.applier_name || "")}" /></label></p>
+            <p><label>教学班<input name="class_name" value="${escapeHtml(filters.class_name || "")}" /></label></p>
+            <p><label>教授<input name="teacher_name" value="${escapeHtml(filters.teacher_name || "")}" /></label></p>
+            <div class="actions">
+              <button class="secondary action-button" type="submit">筛选</button>
+              <a class="button-link secondary action-button" href="/admin/ta/pending">重置</a>
+            </div>
+          </div>
+          </div>
+        </form>
+      </section>
+      <section class="card">
+        <h2>批量审批</h2>
+        <form method="post" action="/admin/ta/pending/batch-approve" onsubmit="return submitSelectedPendingApplications(this);">
+          <input type="hidden" name="application_ids" value="" />
+          <div class="grid">
+            <p><label>审批结果
+              <select name="result">
+                <option value="Approved">通过</option>
+                <option value="Rejected">拒绝</option>
+              </select>
+            </label></p>
+            <p><label>审批备注<textarea name="comments"></textarea></label></p>
+          </div>
+          <div class="actions">
+            <button type="submit">批量审批</button>
+            <span class="muted">当前已选 <strong id="selected-pending-count">0</strong> 条申请</span>
+          </div>
+        </form>
+      </section>
+      <section class="card">
+        <h2>待 TAAdmin 审批</h2>
+        <div class="actions" style="margin-bottom:12px;">
+          <label><input type="checkbox" id="select-all-pending-apps" /> 全选当前列表</label>
+        </div>
+        <div class="table-wrap list-scroll"><table><tr><th style="width:56px;">选择</th><th>申请人</th><th>教学班</th><th>教授</th><th>申请时间</th><th>申请原因</th><th>操作</th></tr>${rows}</table></div>
+      </section>
+      <script>
+        (() => {
+          const checkboxes = Array.from(document.querySelectorAll('.pending-app-select'));
+          const selectAll = document.getElementById('select-all-pending-apps');
+          const countNode = document.getElementById('selected-pending-count');
+          const refresh = () => {
+            const checked = checkboxes.filter((item) => item.checked);
+            if (countNode) countNode.textContent = String(checked.length);
+            if (selectAll) {
+              selectAll.checked = checked.length > 0 && checked.length === checkboxes.length;
+              selectAll.indeterminate = checked.length > 0 && checked.length < checkboxes.length;
+            }
+          };
+          if (selectAll) {
+            selectAll.addEventListener('change', () => {
+              checkboxes.forEach((item) => { item.checked = selectAll.checked; });
+              refresh();
+            });
+          }
+          checkboxes.forEach((item) => item.addEventListener('change', refresh));
+          window.submitSelectedPendingApplications = (form) => {
+            const selected = checkboxes.filter((item) => item.checked).map((item) => item.value);
+            if (!selected.length) {
+              window.alert('请先勾选至少一条申请');
+              return false;
+            }
+            form.querySelector('input[name="application_ids"]').value = selected.join(',');
+            return true;
+          };
+          refresh();
+        })();
+      </script>
+    `, user, notice));
+  }
   const db = getDb();
   const studentFilter = String(filters.applier_name || "").trim().toLowerCase();
   const classFilter = String(filters.class_name || "").trim().toLowerCase();
@@ -3431,13 +4023,51 @@ function taAdminPendingPage(res, user, notice, filters = {}) {
   `, user, notice));
 }
 
-function taAdminDetailPage(res, user, applicationId, notice) {
+async function taAdminDetailPage(res, user, applicationId, notice) {
+  if (DB_CLIENT === "mysql") {
+    const app = await dbGateway.getApplicationById(applicationId);
+    if (!app) {
+      return sendHtml(res, pageLayout("未找到", '<section class="card">申请不存在。</section>', user, notice), {}, 404);
+    }
+    const conflictApps = await dbGateway.getApplicationConflicts(app.applier_user_id, app.class_id);
+    const auditRows = await dbGateway.getApplicationAuditRows(applicationId);
+    const conflictSection = conflictApps.length
+      ? `<section class="card">
+          <h3>该学生已申请的冲突教学班</h3>
+          <table><tr><th>教学班</th><th>当前状态</th><th>是否允许冲突申请</th><th>冲突时间</th></tr>${
+            conflictApps.map((conflictApp) => `<tr><td>${escapeHtml(conflictApp.class_name)}</td><td>${escapeHtml(statusLabels[conflictApp.status] || conflictApp.status)}</td><td>${escapeHtml(conflictApp.is_conflict_allowed || "N")}</td><td>${conflictApp.matches.map(escapeHtml).join("<br>")}</td></tr>`).join("")
+          }</table>
+        </section>`
+      : `<section class="card"><h3>该学生已申请的冲突教学班</h3><p class="muted">当前未发现该学生已申请的冲突教学班。</p></section>`;
+    return sendHtml(res, pageLayout("TAAdmin 审批", `
+      <section class="card">
+        <h2>${escapeHtml(app.applier_name)} - ${escapeHtml(app.class_name)}</h2>
+        <p>状态：${escapeHtml(statusLabels[app.status])}</p>
+        <p>申请原因：${escapeHtml(app.application_reason)}</p>
+        <p>简历：${attachmentLink(app)}</p>
+        ${app.status === "PendingTAAdmin" ? `
+          <form method="post" action="/admin/ta/pending/${applicationId}/approve">
+            <p><label>审批结果
+              <select name="result">
+                <option value="Approved">通过</option>
+                <option value="Rejected">拒绝</option>
+              </select>
+            </label></p>
+            <p><label>审批备注<textarea name="comments"></textarea></label></p>
+            <button type="submit">提交审批</button>
+          </form>
+        ` : `<p class="muted">该申请已完成处理，当前为只读状态。</p>`}
+      </section>
+      ${conflictSection}
+      ${renderApplicationAuditSection(auditRows)}
+      ${adminOverrideSection(`/admin/ta/applications/${applicationId}/override-status`, app.status)}
+    `, user, notice));
+  }
   const db = getDb();
   const app = db.prepare("select * from applications where application_id = ?").get(applicationId);
   if (!app) {
     db.close();
-    res.writeHead(404, { "Content-Type": "text/html; charset=utf-8" });
-    res.end(pageLayout("未找到", '<section class="card">申请不存在。</section>', user, notice));
+    return sendHtml(res, pageLayout("未找到", '<section class="card">申请不存在。</section>', user, notice), {}, 404);
     return;
   }
   const conflictApps = getAppliedConflicts(db, app.applier_user_id, app.class_id);
@@ -3508,6 +4138,25 @@ async function taAdminApprove(req, res, user, applicationId) {
   const body = await readBody(req);
   const result = String(body.result || "Rejected");
   const comments = String(body.comments || "").trim();
+  if (DB_CLIENT === "mysql") {
+    const decision = await dbGateway.applyTaAdminDecision(user, applicationId, result, comments, nowStr());
+    if (!decision.ok) {
+      return redirect(res, "/admin/ta/pending?notice=申请已被处理");
+    }
+    const emailErrors = await sendEmailsAndCollectErrors([buildTaDecisionEmail(decision.applicant, decision.app, result, comments)]);
+    if (emailErrors.length) {
+      await dbGateway.appendAuditLog({
+        actor: user,
+        actionType: "EMAIL_PARTIAL_FAILURE",
+        targetType: "Application",
+        targetId: applicationId,
+        targetName: decision.app.class_name,
+        details: `场景：TAAdmin单条审批\n失败邮件：\n${emailErrors.join("\n")}`,
+        createdAt: nowStr()
+      });
+    }
+    return redirect(res, `/admin/ta/pending?notice=${emailErrors.length ? "审批已完成，站内通知已发送，部分邮件发送失败" : "审批已完成，站内通知和邮件已发送"}`);
+  }
   const db = getDb();
   const app = db.prepare("select * from applications where application_id = ?").get(applicationId);
   if (!app || app.status !== "PendingTAAdmin") {
@@ -3545,6 +4194,23 @@ async function taAdminBatchApprove(req, res, user) {
   const comments = String(body.comments || "").trim();
   if (!applicationIds.length) {
     return redirect(res, "/admin/ta/pending?notice=请先勾选至少一条申请");
+  }
+  if (DB_CLIENT === "mysql") {
+    const batchResult = await dbGateway.batchApplyTaAdminDecision(user, applicationIds, result, comments, nowStr());
+    const emailJobs = batchResult.emailPayloads.map((item) => buildTaDecisionEmail(item.applicant, item.app, result, comments));
+    const emailErrors = await sendEmailsAndCollectErrors(emailJobs);
+    if (emailErrors.length) {
+      await dbGateway.appendAuditLog({
+        actor: user,
+        actionType: "EMAIL_PARTIAL_FAILURE",
+        targetType: "Application",
+        targetId: applicationIds.join(","),
+        targetName: "TAAdmin批量审批",
+        details: `场景：TAAdmin批量审批\n失败邮件：\n${emailErrors.join("\n")}`,
+        createdAt: nowStr()
+      });
+    }
+    return redirect(res, `/admin/ta/pending?notice=${emailErrors.length ? `批量审批完成：成功 ${batchResult.processed} 条，跳过 ${batchResult.skipped} 条；部分邮件发送失败` : `批量审批完成：成功 ${batchResult.processed} 条，跳过 ${batchResult.skipped} 条；站内通知和邮件已发送`}`);
   }
   const db = getDb();
   const selectApp = db.prepare("select * from applications where application_id = ?");
@@ -3736,18 +4402,11 @@ function notificationsPage(res, user, notice) {
   `, user, notice));
 }
 
-function courseAuditLogsPage(res, user, notice, filters = {}) {
+async function courseAuditLogsPage(res, user, notice, filters = {}) {
   const actionType = String(filters.action_type || "").trim();
   const actorName = String(filters.actor_name || "").trim().toLowerCase();
   const targetType = String(filters.target_type || "").trim();
-  const keyword = String(filters.keyword || "").trim().toLowerCase();
-  const db = getDb();
-  const rows = db.prepare("select * from audit_logs order by created_at desc, audit_log_id desc").all()
-    .filter((row) => !actionType || row.action_type === actionType)
-    .filter((row) => !targetType || row.target_type === targetType)
-    .filter((row) => !actorName || String(row.actor_name || "").toLowerCase().includes(actorName))
-    .filter((row) => !keyword || [row.target_name, row.details, row.target_id].some((value) => String(value || "").toLowerCase().includes(keyword)));
-  db.close();
+  const rows = await dbGateway.getAuditLogs(filters);
   const actionOptions = Object.entries(auditActionLabels)
     .map(([value, label]) => `<option value="${value}" ${actionType === value ? "selected" : ""}>${escapeHtml(label)}</option>`)
     .join("");
@@ -3868,7 +4527,79 @@ function applicationStatusPillClass(status) {
   return "pill muted";
 }
 
-function applicationLogListPage(res, user, notice, filters = {}, options) {
+async function applicationLogListPage(res, user, notice, filters = {}, options) {
+  if (DB_CLIENT === "mysql") {
+    const studentFilter = String(filters.applier_name || "").trim().toLowerCase();
+    const classFilter = String(filters.class_name || "").trim().toLowerCase();
+    const teacherFilter = String(filters.teacher_name || "").trim().toLowerCase();
+    const statusFilter = String(filters.status || "").trim();
+    const submittedFrom = String(filters.submitted_from || "").trim();
+    const submittedTo = String(filters.submitted_to || "").trim();
+    const [apps, auditRows] = await Promise.all([
+      dbGateway.getAllApplications(),
+      dbGateway.getAllApplicationAuditRows()
+    ]);
+    const auditMap = new Map();
+    auditRows.forEach((row) => {
+      const key = String(row.target_id || "");
+      if (!auditMap.has(key)) auditMap.set(key, []);
+      auditMap.get(key).push(row);
+    });
+    const rows = apps
+      .filter((app) => !studentFilter || String(app.applier_name || "").toLowerCase().includes(studentFilter))
+      .filter((app) => !classFilter || String(app.class_name || "").toLowerCase().includes(classFilter))
+      .filter((app) => !teacherFilter || String(app.teacher_name || "").toLowerCase().includes(teacherFilter))
+      .filter((app) => !statusFilter || String(app.status || "") === statusFilter)
+      .filter((app) => !submittedFrom || String(app.submitted_at || "").slice(0, 10) >= submittedFrom)
+      .filter((app) => !submittedTo || String(app.submitted_at || "").slice(0, 10) <= submittedTo)
+      .map((app) => ({ ...app, auditRows: auditMap.get(String(app.application_id)) || [] }));
+    const tableRows = rows.map((app) => {
+      const latest = app.auditRows[0];
+      return `<tr>
+        <td>${app.application_id}</td>
+        <td>${escapeHtml(app.applier_name)}</td>
+        <td>${escapeHtml(app.class_name)}</td>
+        <td>${escapeHtml(app.teacher_name)}</td>
+        <td><span class="${applicationStatusPillClass(app.status)}">${escapeHtml(statusLabels[app.status] || app.status)}</span></td>
+        <td>${latest ? `${renderAuditActionBadge(latest.action_type)}<div class="audit-summary-count">${escapeHtml(latest.created_at)}</div>` : '<span class="muted">暂无</span>'}</td>
+        <td>${renderApplicationAuditTimeline(app.auditRows)}</td>
+        <td class="table-action-cell"><div class="table-action-inner"><a class="button-link secondary action-button" href="${options.detailBasePath}/${app.application_id}">查看详情</a></div></td>
+      </tr>`;
+    }).join("");
+    return sendHtml(res, pageLayout(options.title, `
+      <section class="card">
+        <h2>筛选申请日志</h2>
+        <form method="get" action="${options.listPath}">
+          <div class="filters-shell">
+            <div class="filters-grid">
+              <p><label>申请学生<input name="applier_name" value="${escapeHtml(filters.applier_name || "")}" /></label></p>
+              <p><label>教学班<input name="class_name" value="${escapeHtml(filters.class_name || "")}" /></label></p>
+              <p><label>教授<input name="teacher_name" value="${escapeHtml(filters.teacher_name || "")}" /></label></p>
+              <p><label>状态<select name="status">
+                <option value="" ${!filters.status ? "selected" : ""}>全部</option>
+                ${Object.entries(statusLabels).map(([key, label]) => `<option value="${key}" ${filters.status === key ? "selected" : ""}>${escapeHtml(label)}</option>`).join("")}
+              </select></label></p>
+              <p><label>申请时间起<input type="date" name="submitted_from" value="${escapeHtml(filters.submitted_from || "")}" /></label></p>
+              <p><label>申请时间止<input type="date" name="submitted_to" value="${escapeHtml(filters.submitted_to || "")}" /></label></p>
+              <div class="actions">
+                <button class="secondary action-button" type="submit">筛选</button>
+                <a class="button-link secondary action-button" href="${options.listPath}">重置</a>
+              </div>
+            </div>
+          </div>
+        </form>
+      </section>
+      <section class="card">
+        <h2>${escapeHtml(options.heading)}</h2>
+        <div class="table-wrap list-scroll">
+          <table class="wide">
+            <tr><th>ID</th><th>申请人</th><th>教学班</th><th>教授</th><th>当前状态</th><th>最新动作</th><th>日志摘要</th><th>操作</th></tr>
+            ${tableRows || '<tr><td colspan="8" class="muted">暂无符合条件的申请日志。</td></tr>'}
+          </table>
+        </div>
+      </section>
+    `, user, notice));
+  }
   const studentFilter = String(filters.applier_name || "").trim().toLowerCase();
   const classFilter = String(filters.class_name || "").trim().toLowerCase();
   const teacherFilter = String(filters.teacher_name || "").trim().toLowerCase();
@@ -3962,7 +4693,36 @@ function toggleTaUser(res, actor, userId) {
   redirect(res, "/admin/ta/users?notice=TA 资格已更新");
 }
 
-function professorPendingPage(res, user, notice) {
+async function professorPendingPage(res, user, notice) {
+  if (DB_CLIENT === "mysql") {
+    const rows = await dbGateway.getProfessorPendingClassRows(user.user_id);
+    const schedules = await dbGateway.getSchedulesForClassIds ? await dbGateway.getSchedulesForClassIds(rows.map((row) => row.class_id)) : [];
+    const schedulesByClass = new Map();
+    for (const schedule of schedules) {
+      if (!schedulesByClass.has(schedule.class_id)) schedulesByClass.set(schedule.class_id, []);
+      schedulesByClass.get(schedule.class_id).push(schedule);
+    }
+    const body = rows.length
+      ? rows.map((row) => {
+        const remaining = Math.max(0, Number(row.maximum_number_of_tas_admitted) - Number(row.approved_count));
+        return `<section class="card">
+          <h2>${escapeHtml(row.course_name)} / ${escapeHtml(row.class_name)}</h2>
+          <div class="class-card-meta">
+            <span>${escapeHtml(row.semester)}</span>
+            <span>${escapeHtml(row.teacher_name)}</span>
+            <span>待审核 ${row.pending_count}</span>
+          </div>
+          <p class="muted">当前共有 <strong>${row.application_count}</strong> 份申请，其中待审核 <strong>${row.pending_count}</strong> 份，已通过 <strong>${row.approved_count}</strong> / ${row.maximum_number_of_tas_admitted}，剩余名额 <strong>${remaining}</strong> 个。</p>
+          <p class="muted">当你继续通过申请并达到该教学班 TA 上限时，系统会自动拒绝该教学班其余待审核申请，拒绝理由为“该课程TA已满”。</p>
+          ${scheduleSummary(schedulesByClass.get(row.class_id) || [], `professor-${row.class_id}`)}
+          <div class="actions" style="margin-top:12px;">
+            <a class="button-link rect" href="/professor/classes/${row.class_id}">进入教学班审核</a>
+          </div>
+        </section>`;
+      }).join("")
+      : '<section class="card"><h2>待教授审批</h2><p class="muted">当前没有待教授审核的教学班。</p></section>';
+    return sendHtml(res, pageLayout("待教授审批", body, user, notice));
+  }
   const db = getDb();
   const rows = db.prepare(`
     select c.*,
@@ -4018,19 +4778,80 @@ function professorPendingPage(res, user, notice) {
   sendHtml(res, pageLayout("待教授审批", body, user, notice));
 }
 
-function professorClassReviewPage(res, user, classId, notice) {
+async function professorClassReviewPage(res, user, classId, notice) {
+  if (DB_CLIENT === "mysql") {
+    const { classRow, schedules, apps, approvedCount } = await dbGateway.getProfessorClassReviewData(user.user_id, classId);
+    if (classRow && classRow.published_to_professor !== "Y") {
+      return sendHtml(res, pageLayout("未找到", '<section class="card">教学班尚未发布至 Professor。</section>', user, notice), {}, 404);
+    }
+    if (!classRow) {
+      return sendHtml(res, pageLayout("未找到", '<section class="card">教学班不存在，或你无权查看。</section>', user, notice), {}, 404);
+    }
+    const remaining = Math.max(0, Number(classRow.maximum_number_of_tas_admitted) - Number(approvedCount));
+    const rows = apps.map((app) => `<tr>
+      <td>${escapeHtml(app.applier_name)}</td>
+      <td>${escapeHtml(app.submitted_at)}</td>
+      <td>${escapeHtml(statusLabels[app.status] || app.status)}</td>
+      <td>${escapeHtml(app.ta_comment || "")}</td>
+      <td class="table-action-cell"><div class="table-action-inner"><a class="button-link secondary action-button" href="/professor/pending/${app.application_id}">查看申请</a></div></td>
+    </tr>`).join("");
+    const cards = apps.map((app) => `
+      <article class="mobile-data-card">
+        <h3>${escapeHtml(app.applier_name)}</h3>
+        <div class="mobile-meta">
+          <span>${escapeHtml(statusLabels[app.status] || app.status)}</span>
+          <span>${escapeHtml(app.submitted_at)}</span>
+        </div>
+        <div class="mobile-data-list">
+          <div class="mobile-data-row">
+            <div class="mobile-data-label">TA备注</div>
+            <div class="mobile-data-value">${escapeHtml(app.ta_comment || "-")}</div>
+          </div>
+        </div>
+        <div class="actions" style="margin-top:12px;">
+          <a class="button-link secondary action-button" href="/professor/pending/${app.application_id}">查看申请</a>
+        </div>
+      </article>
+    `).join("");
+    return sendHtml(res, pageLayout("教学班审核", `
+      <section class="card">
+        <h2>${escapeHtml(classRow.course_name)} / ${escapeHtml(classRow.class_name)}</h2>
+        <div class="class-card-meta">
+          <span>${escapeHtml(classRow.semester)}</span>
+          <span>${escapeHtml(classRow.teacher_name)}</span>
+        </div>
+        <p class="muted">当前已通过 <strong>${approvedCount}</strong> / ${classRow.maximum_number_of_tas_admitted}，剩余名额 <strong>${remaining}</strong> 个。</p>
+        <div class="notice" style="margin:16px 0 0;">
+          当你继续通过申请并达到该教学班 TA 上限时，系统会自动拒绝该教学班其余待审核申请，拒绝理由为“该课程TA已满”。
+        </div>
+      </section>
+      <section class="card">
+        <h3>排课安排</h3>
+        ${schedulesTable(schedules)}
+      </section>
+      <section class="card">
+        <h3>该教学班全部申请</h3>
+        <div class="desktop-only">
+          <div class="table-wrap list-scroll">
+            <table><tr><th>申请人</th><th>申请时间</th><th>状态</th><th>TAAdmin 备注</th><th>操作</th></tr>${rows}</table>
+          </div>
+        </div>
+        <div class="mobile-only">
+          ${cards ? `<div class="mobile-card-list">${cards}</div>` : `<p class="muted">当前没有申请记录。</p>`}
+        </div>
+      </section>
+    `, user, notice));
+  }
   const db = getDb();
   const classRow = db.prepare("select * from classes where class_id = ? and (',' || teacher_user_id || ',') like '%,' || ? || ',%'").get(classId, String(user.user_id));
   if (classRow && classRow.published_to_professor !== "Y") {
     db.close();
-    res.writeHead(404, { "Content-Type": "text/html; charset=utf-8" });
-    res.end(pageLayout("未找到", '<section class="card">教学班尚未发布至 Professor。</section>', user, notice));
+    return sendHtml(res, pageLayout("未找到", '<section class="card">教学班尚未发布至 Professor。</section>', user, notice), {}, 404);
     return;
   }
   if (!classRow) {
     db.close();
-    res.writeHead(404, { "Content-Type": "text/html; charset=utf-8" });
-    res.end(pageLayout("未找到", '<section class="card">教学班不存在，或你无权查看。</section>', user, notice));
+    return sendHtml(res, pageLayout("未找到", '<section class="card">教学班不存在，或你无权查看。</section>', user, notice), {}, 404);
     return;
   }
   const schedules = fetchSchedules(db, classId);
@@ -4099,7 +4920,43 @@ function professorClassReviewPage(res, user, classId, notice) {
   `, user, notice));
 }
 
-function professorDetailPage(res, user, applicationId, notice) {
+async function professorDetailPage(res, user, applicationId, notice) {
+  if (DB_CLIENT === "mysql") {
+    const { app, classRow, approvedCount, auditRows } = await dbGateway.getProfessorApplicationDetail(user.user_id, applicationId);
+    if (!app) {
+      return sendHtml(res, pageLayout("未找到", '<section class="card">申请不存在。</section>', user, notice), {}, 404);
+    }
+    const willAutoRejectOthers = approvedCount + (app.status === "PendingProfessor" ? 1 : 0) >= classRow.maximum_number_of_tas_admitted;
+    return sendHtml(res, pageLayout("教授审批", `
+      <section class="card">
+        <h2>${escapeHtml(app.applier_name)} - ${escapeHtml(app.class_name)}</h2>
+        <p>申请原因：${escapeHtml(app.application_reason)}</p>
+        <p>简历：${attachmentLink(app)}</p>
+        <p>TAAdmin 备注：${escapeHtml(app.ta_comment || "")}</p>
+        <p>当前录取人数：${approvedCount} / ${classRow.maximum_number_of_tas_admitted}</p>
+        <p class="muted">同一教学班当前共有 ${classRow.maximum_number_of_tas_admitted} 个 TA 名额。</p>
+        <div class="notice" style="margin:16px 0;">
+          ${willAutoRejectOthers
+            ? "提示：如果你现在通过这份申请，系统将达到该教学班 TA 上限，并自动拒绝该教学班其余待审核申请，拒绝理由为“该课程TA已满”。"
+            : "提示：当通过人数达到该教学班 TA 上限时，系统会自动拒绝该教学班其余待审核申请，拒绝理由为“该课程TA已满”。"}
+        </div>
+        <form method="post" action="/professor/pending/${applicationId}/approve">
+          <p><label>审批结果
+            <select name="result">
+              <option value="Approved">通过</option>
+              <option value="Rejected">拒绝</option>
+            </select>
+          </label></p>
+          <p><label>审批备注<textarea name="comments"></textarea></label></p>
+          <button type="submit">提交终审</button>
+        </form>
+        <div class="actions" style="margin-top:12px;">
+          <a class="button-link secondary rect" href="/professor/classes/${app.class_id}">返回教学班审核</a>
+        </div>
+      </section>
+      ${renderApplicationAuditSection(auditRows)}
+    `, user, notice));
+  }
   const db = getDb();
   const app = db.prepare(`
     select a.*
@@ -4112,8 +4969,7 @@ function professorDetailPage(res, user, applicationId, notice) {
   `).get(applicationId, String(user.user_id));
   if (!app) {
     db.close();
-    res.writeHead(404, { "Content-Type": "text/html; charset=utf-8" });
-    res.end(pageLayout("未找到", '<section class="card">申请不存在。</section>', user, notice));
+    return sendHtml(res, pageLayout("未找到", '<section class="card">申请不存在。</section>', user, notice), {}, 404);
     return;
   }
   const classRow = db.prepare("select * from classes where class_id = ?").get(app.class_id);
@@ -4156,6 +5012,27 @@ async function professorApprove(req, res, user, applicationId) {
   const body = await readBody(req);
   const result = String(body.result || "Rejected");
   const comments = String(body.comments || "").trim();
+  if (DB_CLIENT === "mysql") {
+    const decision = await dbGateway.applyProfessorDecision(user, applicationId, result, comments, nowStr());
+    if (!decision.ok) {
+      return redirect(res, decision.redirectToDetail ? `/professor/pending/${applicationId}?notice=${decision.notice}` : `/professor/pending?notice=${decision.notice}`);
+    }
+    const emailJobs = [buildProfessorDecisionEmail(decision.applicant, decision.app, result, comments)]
+      .concat(decision.autoRejected.map((item) => buildClassCapacityRejectedEmail(item.applicant, item.app)));
+    const emailErrors = await sendEmailsAndCollectErrors(emailJobs);
+    if (emailErrors.length) {
+      await dbGateway.appendAuditLog({
+        actor: user,
+        actionType: "EMAIL_PARTIAL_FAILURE",
+        targetType: "Application",
+        targetId: applicationId,
+        targetName: decision.app.class_name,
+        details: `场景：Professor审批\n失败邮件：\n${emailErrors.join("\n")}`,
+        createdAt: nowStr()
+      });
+    }
+    return redirect(res, `/professor/pending?notice=${emailErrors.length ? "终审已完成，站内通知已发送，部分邮件发送失败" : "终审已完成，站内通知和邮件已发送"}`);
+  }
   const db = getDb();
   const app = db.prepare(`
     select a.*
@@ -4286,60 +5163,45 @@ function resolveProfessorSelection(db, rawValue) {
   };
 }
 
-function courseClassesPage(res, user, notice, filters = {}) {
-  const db = getDb();
-  const classCodeFilter = String(filters.class_code || "").trim().toLowerCase();
-  const classNameFilter = String(filters.class_name || "").trim().toLowerCase();
-  const teacherFilter = String(filters.teacher_name || "").trim().toLowerCase();
+async function courseClassesPage(res, user, notice, filters = {}) {
   const statusFilter = String(filters.status_filter || "").trim();
-  const taFullFilter = String(filters.ta_full || "").trim();
   const sortBy = String(filters.sort_by || "class_code");
   const sortOrder = String(filters.sort_order || "asc").toLowerCase() === "desc" ? "desc" : "asc";
-  const rowsRaw = db.prepare(`
-    select c.*,
-      (select count(*) from applications a where a.class_id = c.class_id) as application_count,
-      (select count(*) from applications a where a.class_id = c.class_id and a.status = 'Approved') as approved_count
-    from classes c
-  `).all();
   const schedulesByClass = new Map();
-  const allSchedules = db.prepare(`
-    select class_id, lesson_date, start_time, end_time, section, is_exam
-    from class_schedules
-    order by lesson_date, start_time
-  `).all();
-  for (const schedule of allSchedules) {
-    if (!schedulesByClass.has(schedule.class_id)) {
-      schedulesByClass.set(schedule.class_id, []);
+
+  let rows;
+  if (DB_CLIENT === "mysql") {
+    rows = await dbGateway.getCourseAdminClassRows(filters);
+    const classIds = rows.map((row) => Number(row.class_id)).filter(Boolean);
+    const allSchedules = await dbGateway.getSchedulesForClassIds(classIds);
+    for (const schedule of allSchedules) {
+      if (!schedulesByClass.has(schedule.class_id)) {
+        schedulesByClass.set(schedule.class_id, []);
+      }
+      schedulesByClass.get(schedule.class_id).push(schedule);
     }
-    schedulesByClass.get(schedule.class_id).push(schedule);
-  }
-  const sortValueMap = {
-    class_code: (row) => String(row.class_code || "").toLowerCase(),
-    class_name: (row) => String(row.class_name || "").toLowerCase(),
-    teacher_name: (row) => String(row.teacher_name || "").toLowerCase(),
-    ta_full: (row) => (Number(row.approved_count || 0) >= Number(row.maximum_number_of_tas_admitted || 0) ? 1 : 0),
-    status_filter: (row) => String(classOpenStatus(row)),
-    approved_count: (row) => Number(row.approved_count || 0),
-    application_count: (row) => Number(row.application_count || 0)
-  };
-  const rows = rowsRaw
-    .filter((row) => !classCodeFilter || String(row.class_code || "").toLowerCase().includes(classCodeFilter))
-    .filter((row) => !classNameFilter || String(row.class_name || "").toLowerCase().includes(classNameFilter))
-    .filter((row) => !teacherFilter || String(row.teacher_name || "").toLowerCase().includes(teacherFilter))
-    .filter((row) => !statusFilter || classOpenStatus(row) === statusFilter)
-    .filter((row) => {
+    for (const row of rows) {
       const isFull = Number(row.approved_count || 0) >= Number(row.maximum_number_of_tas_admitted || 0);
-      if (!taFullFilter) return true;
-      return taFullFilter === "Y" ? isFull : !isFull;
-    })
-    .sort((a, b) => {
-      const getter = sortValueMap[sortBy] || sortValueMap.class_code;
-      const av = getter(a);
-      const bv = getter(b);
-      if (av < bv) return sortOrder === "asc" ? -1 : 1;
-      if (av > bv) return sortOrder === "asc" ? 1 : -1;
-      return String(a.class_code || "").localeCompare(String(b.class_code || ""), "zh-Hans-CN");
-    });
+      if (isFull && row.ta_applications_allowed !== "N") {
+        row.ta_applications_allowed = "N";
+      }
+    }
+  } else {
+    const db = getDb();
+    rows = loadCourseAdminClassRows(db, filters);
+    const allSchedules = db.prepare(`
+      select class_id, lesson_date, start_time, end_time, section, is_exam
+      from class_schedules
+      order by lesson_date, start_time
+    `).all();
+    for (const schedule of allSchedules) {
+      if (!schedulesByClass.has(schedule.class_id)) {
+        schedulesByClass.set(schedule.class_id, []);
+      }
+      schedulesByClass.get(schedule.class_id).push(schedule);
+    }
+    db.close();
+  }
   const headerFilters = {
     class_code: filters.class_code || "",
     class_name: filters.class_name || "",
@@ -4358,16 +5220,17 @@ function courseClassesPage(res, user, notice, filters = {}) {
     <td>${escapeHtml(row.class_name)}</td>
     <td>${escapeHtml(row.teacher_name)}</td>
     <td>${escapeHtml(row.semester)}</td>
-    <td>${escapeHtml(classOpenStatusLabel(row))}</td>
-    <td>${isFull ? "已满" : "-"}</td>
+    <td>${classOpenStatusPill(row)}</td>
+    <td>${classCapacityPill(isFull)}</td>
     <td>${scheduleRows.length}</td>
+    <td>${namePills(row.approved_ta_names || "-")}</td>
     <td>${scheduleSummary(scheduleRows, `course-${row.class_id}`, { showPreview: false })}</td>
-    <td>${row.approved_count} / ${row.maximum_number_of_tas_admitted}</td>
-    <td>${row.application_count}</td>
-    <td>${escapeHtml(row.ta_applications_allowed)}</td>
-    <td>${escapeHtml(row.is_conflict_allowed || "N")}</td>
-    <td>
-      <div class="actions">
+    <td>${metricPill(`${row.approved_count} / ${row.maximum_number_of_tas_admitted}`, isFull ? "gold" : "ok")}</td>
+    <td>${metricPill(row.application_count, "muted")}</td>
+    <td>${ynPill(row.ta_applications_allowed, "Y", "N")}</td>
+    <td>${ynPill(row.is_conflict_allowed || "N", "Y", "N")}</td>
+    <td class="table-action-cell">
+      <div class="table-action-inner table-actions-compact">
         <a class="button-link secondary action-button" href="/course/classes/${row.class_id}">修改</a>
         <a class="button-link secondary action-button" href="/course/classes/${row.class_id}/applications">查看</a>
         <a class="button-link danger action-button" href="/course/classes/${row.class_id}/delete">删除</a>
@@ -4382,7 +5245,7 @@ function courseClassesPage(res, user, notice, filters = {}) {
       <article class="mobile-data-card ${isFull ? "card-soft-purple" : ""}">
         <div class="actions" style="justify-content:space-between; align-items:center; margin-bottom:10px;">
           <label><input type="checkbox" class="class-select" value="${row.class_id}" /> 选择</label>
-          <span class="pill">${isFull ? "TA已满" : escapeHtml(classOpenStatusLabel(row))}</span>
+          ${isFull ? classCapacityPill(true) : classOpenStatusPill(row)}
         </div>
         <h3>${escapeHtml(row.course_name)} / ${escapeHtml(row.class_name)}</h3>
         <div class="mobile-meta">
@@ -4404,8 +5267,12 @@ function courseClassesPage(res, user, notice, filters = {}) {
             <div class="mobile-data-value">${row.application_count}</div>
           </div>
           <div class="mobile-data-row">
+            <div class="mobile-data-label">TA</div>
+            <div class="mobile-data-value">${namePills(row.approved_ta_names || "-")}</div>
+          </div>
+          <div class="mobile-data-row">
             <div class="mobile-data-label">开放申请</div>
-            <div class="mobile-data-value">${escapeHtml(row.ta_applications_allowed)} / 允许冲突 ${escapeHtml(row.is_conflict_allowed || "N")}</div>
+            <div class="mobile-data-value">${ynPill(row.ta_applications_allowed, "开放", "关闭")} / 允许冲突 ${ynPill(row.is_conflict_allowed || "N", "Y", "N")}</div>
           </div>
           <div class="mobile-data-row">
             <div class="mobile-data-label">排课安排</div>
@@ -4421,23 +5288,29 @@ function courseClassesPage(res, user, notice, filters = {}) {
       </article>
     `;
   }).join("");
-  db.close();
   sendHtml(res, pageLayout("教学班管理", `
     <section class="card">
-      <h2>导入教学班与排课</h2>
-      <form method="post" action="/course/classes/import" enctype="multipart/form-data">
-        <p><label>导入文件<input name="classes_file" type="file" accept=".xlsx,.xls,application/vnd.ms-excel,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" required /></label></p>
-        <div class="actions">
-          <button type="submit">导入 Excel</button>
-          <a class="button-link secondary" href="/course/classes/import/template">下载模板</a>
+      <details>
+        <summary style="cursor:pointer; font-weight:600; color:#174ea6;">展开导入教学班与排课</summary>
+        <div style="margin-top:16px;">
+          <section class="card" style="margin:0; box-shadow:none;">
+            <h3>导入教学班与排课</h3>
+            <form method="post" action="/course/classes/import" enctype="multipart/form-data">
+              <p><label>导入文件<input name="classes_file" type="file" accept=".xlsx,.xls,application/vnd.ms-excel,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" required /></label></p>
+              <div class="actions">
+                <button type="submit">导入 Excel</button>
+                <a class="button-link secondary" href="/course/classes/import/template">下载模板</a>
+              </div>
+            </form>
+            <p class="muted">当前导入格式为 Excel。同一个 class_code 可出现多行，每行代表一条排课。导入时按 class_code 覆盖教学班基础信息并重建该教学班的全部排课。</p>
+            <div class="field-order">
+              字段顺序：<br>
+              class_code, class_abbr, course_name, class_name, teaching_language, teacher_login_name, semester, maximum_number, ta_allowed, is_conflict_allowed<br>
+              apply_start_at, apply_end_at, lesson_date, start_time, end_time, section, is_exam, class_intro, memo
+            </div>
+          </section>
         </div>
-      </form>
-      <p class="muted">当前导入格式为 Excel。同一个 class_code 可出现多行，每行代表一条排课。导入时按 class_code 覆盖教学班基础信息并重建该教学班的全部排课。</p>
-      <div class="field-order">
-        字段顺序：<br>
-        class_code, class_abbr, course_name, class_name, teaching_language, teacher_login_name, semester, maximum_number, ta_allowed, is_conflict_allowed<br>
-        apply_start_at, apply_end_at, lesson_date, start_time, end_time, section, is_exam, class_intro, memo
-      </div>
+      </details>
     </section>
     <section class="card">
       <h2>筛选教学班</h2>
@@ -4462,6 +5335,7 @@ function courseClassesPage(res, user, notice, filters = {}) {
           </select></label></p>
           <div class="actions">
             <button class="secondary action-button" type="submit">筛选</button>
+            <a class="button-link secondary action-button" href="/course/classes/ta-export${buildQueryString({ class_code: filters.class_code || "", class_name: filters.class_name || "", teacher_name: filters.teacher_name || "", ta_full: filters.ta_full || "", status_filter: filters.status_filter || "", sort_by: sortBy, sort_order: sortOrder })}">导出教学班TA</a>
             <a class="button-link secondary action-button" href="/course/classes">重置</a>
           </div>
         </div>
@@ -4507,29 +5381,36 @@ function courseClassesPage(res, user, notice, filters = {}) {
       </details>
     </section>
     <section class="card">
-      <h2>新增教学班</h2>
-      <form method="post" action="/course/classes/create">
-        <div class="grid">
-          <p><label>ClassCode<input name="class_code" required /></label></p>
-          <p><label>教学班缩写<input name="class_abbr" required /></label></p>
-          <p><label>课程名<input name="course_name" required /></label></p>
-          <p><label>教学班名称<input name="class_name" required /></label></p>
-          <p><label>授课语言<select name="teaching_language"><option value="中文">中文</option><option value="英文">英文</option></select></label></p>
-          <p><label>Professor（可多选）<select name="teacher_user_id" multiple size="4">${professorMultiOptions([])}</select></label></p>
-          <p><label>学期<input name="semester" value="2026Fall" required /></label></p>
-          <p><label>最大录取人数<input name="maximum_number" type="number" value="1" min="1" required /></label></p>
-          <p><label>允许 TA 申请<select name="ta_allowed"><option value="Y">Y</option><option value="N">N</option></select></label></p>
-          <p><label>允许冲突申请<select name="is_conflict_allowed"><option value="N">N</option><option value="Y">Y</option></select></label></p>
-          <p><label>开放开始时间<input name="apply_start_at" type="datetime-local" value="2026-03-09T09:00" required /></label></p>
-          <p><label>开放结束时间<input name="apply_end_at" type="datetime-local" value="2026-12-31T23:59" required /></label></p>
-        </div>
-        <p><label>课程介绍<textarea name="class_intro"></textarea></label></p>
-        <p><label>备注<textarea name="memo"></textarea></label></p>
-        <p><label>排课记录<textarea name="schedule_lines" required>2026-09-15,18:30,20:30,晚上
+      <details>
+        <summary style="cursor:pointer; font-weight:600; color:#174ea6;">展开新增教学班</summary>
+        <div style="margin-top:16px;">
+          <section class="card" style="margin:0; box-shadow:none;">
+            <h3>新增教学班</h3>
+            <form method="post" action="/course/classes/create">
+              <div class="grid">
+                <p><label>ClassCode<input name="class_code" required /></label></p>
+                <p><label>教学班缩写<input name="class_abbr" required /></label></p>
+                <p><label>课程名<input name="course_name" required /></label></p>
+                <p><label>教学班名称<input name="class_name" required /></label></p>
+                <p><label>授课语言<select name="teaching_language"><option value="中文">中文</option><option value="英文">英文</option></select></label></p>
+                <p><label>Professor（可多选）<select name="teacher_user_id" multiple size="4">${professorMultiOptions([])}</select></label></p>
+                <p><label>学期<input name="semester" value="2026Fall" required /></label></p>
+                <p><label>最大录取人数<input name="maximum_number" type="number" value="1" min="1" required /></label></p>
+                <p><label>允许 TA 申请<select name="ta_allowed"><option value="Y">Y</option><option value="N">N</option></select></label></p>
+                <p><label>允许冲突申请<select name="is_conflict_allowed"><option value="N">N</option><option value="Y">Y</option></select></label></p>
+                <p><label>开放开始时间<input name="apply_start_at" type="datetime-local" value="2026-03-09T09:00" required /></label></p>
+                <p><label>开放结束时间<input name="apply_end_at" type="datetime-local" value="2026-12-31T23:59" required /></label></p>
+              </div>
+              <p><label>课程介绍<textarea name="class_intro"></textarea></label></p>
+              <p><label>备注<textarea name="memo"></textarea></label></p>
+              <p><label>排课记录<textarea name="schedule_lines" required>2026-09-15,18:30,20:30,晚上
 2026-09-22,18:30,20:30,晚上</textarea></label></p>
-        <p class="muted">一行一条排课，格式：YYYY-MM-DD,HH:MM,HH:MM,节次[,考试类型]。节次仅支持“上午/下午/晚上”，考试类型可留空或填写“期中考试/期末考试”。</p>
-        <button type="submit">创建教学班</button>
-      </form>
+              <p class="muted">一行一条排课，格式：YYYY-MM-DD,HH:MM,HH:MM,节次[,考试类型]。节次仅支持“上午/下午/晚上”，考试类型可留空或填写“期中考试/期末考试”。</p>
+              <button type="submit">创建教学班</button>
+            </form>
+          </section>
+        </div>
+      </details>
     </section>
     <section class="card">
       <h2>教学班列表</h2>
@@ -4542,23 +5423,24 @@ function courseClassesPage(res, user, notice, filters = {}) {
           <table class="wide compact-table fixed-layout">
             <colgroup>
               <col style="width:56px;" />
-              <col style="width:120px;" />
-              <col style="width:96px;" />
-              <col style="width:140px;" />
-              <col style="width:180px;" />
-              <col style="width:160px;" />
-              <col style="width:96px;" />
-              <col style="width:96px;" />
-              <col style="width:84px;" />
-              <col style="width:68px;" />
-              <col style="width:108px;" />
-              <col style="width:112px;" />
-              <col style="width:84px;" />
+              <col style="width:110px;" />
+              <col style="width:82px;" />
+              <col style="width:124px;" />
+              <col style="width:168px;" />
+              <col style="width:148px;" />
+              <col style="width:92px;" />
               <col style="width:88px;" />
-              <col style="width:96px;" />
-              <col style="width:260px;" />
+              <col style="width:76px;" />
+              <col style="width:64px;" />
+              <col style="width:150px;" />
+              <col style="width:98px;" />
+              <col style="width:98px;" />
+              <col style="width:78px;" />
+              <col style="width:82px;" />
+              <col style="width:86px;" />
+              <col style="width:210px;" />
             </colgroup>
-            <tr><th>选择</th><th>${sortableHeader("教学班代码", "class_code", "/course/classes", headerFilters, sortBy, sortOrder)}</th><th>缩写</th><th>课程名</th><th>${sortableHeader("教学班名称", "class_name", "/course/classes", headerFilters, sortBy, sortOrder)}</th><th>${sortableHeader("教授", "teacher_name", "/course/classes", headerFilters, sortBy, sortOrder)}</th><th>学期</th><th>${sortableHeader("开放状态", "status_filter", "/course/classes", headerFilters, sortBy, sortOrder)}</th><th>${sortableHeader("TA已满", "ta_full", "/course/classes", headerFilters, sortBy, sortOrder)}</th><th>排课数</th><th>排课安排</th><th>${sortableHeader("已通过/上限", "approved_count", "/course/classes", headerFilters, sortBy, sortOrder)}</th><th>${sortableHeader("申请数", "application_count", "/course/classes", headerFilters, sortBy, sortOrder)}</th><th>开放申请</th><th>允许冲突</th><th>单条操作</th></tr>${tableRows}
+            <tr><th>选择</th><th>${sortableHeader("教学班代码", "class_code", "/course/classes", headerFilters, sortBy, sortOrder)}</th><th>缩写</th><th>课程名</th><th>${sortableHeader("教学班名称", "class_name", "/course/classes", headerFilters, sortBy, sortOrder)}</th><th>${sortableHeader("教授", "teacher_name", "/course/classes", headerFilters, sortBy, sortOrder)}</th><th>学期</th><th>${sortableHeader("开放状态", "status_filter", "/course/classes", headerFilters, sortBy, sortOrder)}</th><th>${sortableHeader("TA已满", "ta_full", "/course/classes", headerFilters, sortBy, sortOrder)}</th><th>排课数</th><th>TA</th><th>排课安排</th><th>${sortableHeader("已通过/上限", "approved_count", "/course/classes", headerFilters, sortBy, sortOrder)}</th><th>${sortableHeader("申请数", "application_count", "/course/classes", headerFilters, sortBy, sortOrder)}</th><th>开放申请</th><th>允许冲突</th><th>单条操作</th></tr>${tableRows}
           </table>
         </div>
       </div>
@@ -4651,7 +5533,26 @@ function taAdminAllApplicationsPage(res, user, notice, filters = {}) {
   `, user, notice));
 }
 
-function courseAdminAllApplicationsPage(res, user, notice) {
+async function courseAdminAllApplicationsPage(res, user, notice) {
+  if (DB_CLIENT === "mysql") {
+    const rows = await dbGateway.getAllApplications();
+    const tableRows = rows.map((app) => `<tr>
+      <td>${app.application_id}</td>
+      <td>${escapeHtml(app.applier_name)}</td>
+      <td>${escapeHtml(app.class_name)}</td>
+      <td>${escapeHtml(app.teacher_name)}</td>
+      <td>${escapeHtml(app.submitted_at)}</td>
+      <td>${escapeHtml(statusLabels[app.status] || app.status)}</td>
+      <td>${attachmentLink(app)}</td>
+      <td class="table-action-cell"><div class="table-action-inner"><a class="button-link secondary action-button" href="/course/applications/${app.application_id}">详情</a></div></td>
+    </tr>`).join("");
+    return sendHtml(res, pageLayout("全部申请", `
+      <section class="card">
+        <h2>全部 TA 申请</h2>
+        <div class="table-wrap list-scroll"><table><tr><th>ID</th><th>申请人</th><th>教学班</th><th>教授</th><th>申请时间</th><th>状态</th><th>简历</th><th>操作</th></tr>${tableRows}</table></div>
+      </section>
+    `, user, notice));
+  }
   const db = getDb();
   const rows = db.prepare("select * from applications order by submitted_at desc").all();
   db.close();
@@ -4691,23 +5592,23 @@ function courseAdminApplicationLogsPage(res, user, notice, filters = {}) {
   });
 }
 
-function courseReportsPage(res, user, notice, filters = {}) {
+async function buildCourseReportData(filters = {}) {
   const submittedFrom = String(filters.submitted_from || "").trim();
   const submittedTo = String(filters.submitted_to || "").trim();
-  const db = getDb();
-  const applications = db.prepare("select * from applications order by submitted_at desc, application_id desc").all()
+  const semesterFilter = String(filters.semester || "").trim();
+  const teacherFilter = String(filters.teacher_name || "").trim().toLowerCase();
+  const snapshot = await dbGateway.getCourseReportSnapshot(filters);
+  const classes = snapshot.classes;
+  const allowedClassIds = new Set(classes.map((row) => row.class_id));
+  const allApplications = snapshot.applications;
+  const applications = allApplications
+    .filter((app) => allowedClassIds.has(app.class_id))
     .filter((app) => !submittedFrom || String(app.submitted_at || "").slice(0, 10) >= submittedFrom)
-    .filter((app) => !submittedTo || String(app.submitted_at || "").slice(0, 10) <= submittedTo);
-  const classes = db.prepare(`
-    select c.*,
-      (select count(*) from applications a where a.class_id = c.class_id) as application_count,
-      (select count(*) from applications a where a.class_id = c.class_id and a.status = 'Approved') as approved_count,
-      (select count(*) from applications a where a.class_id = c.class_id and a.status = 'PendingTAAdmin') as pending_taadmin_count,
-      (select count(*) from applications a where a.class_id = c.class_id and a.status = 'PendingProfessor') as pending_professor_count
-    from classes c
-    order by c.class_code
-  `).all();
-  db.close();
+    .filter((app) => !submittedTo || String(app.submitted_at || "").slice(0, 10) <= submittedTo)
+    .filter((app) => !teacherFilter || String(app.teacher_name || "").toLowerCase().includes(teacherFilter));
+  const semesterOptions = Array.from(new Set(
+    classes.map((row) => String(row.semester || "").trim()).filter(Boolean)
+  )).sort((a, b) => a.localeCompare(b));
 
   const statusCounts = {
     PendingTAAdmin: 0,
@@ -4731,9 +5632,28 @@ function courseReportsPage(res, user, notice, filters = {}) {
   const pendingProfessor = statusCounts.PendingProfessor;
   const approvedApplications = statusCounts.Approved;
   const rejectedApplications = statusCounts.RejectedByTAAdmin + statusCounts.RejectedByProfessor;
+  const withdrawnApplications = statusCounts.Withdrawn;
+  const uniqueApplicants = new Set(applications.map((app) => app.applier_user_id)).size;
+  const approvalRate = totalApplications ? Math.round((approvedApplications / totalApplications) * 100) : 0;
+  const averagePerClass = totalClasses ? (totalApplications / totalClasses).toFixed(1) : "0.0";
 
   const topClasses = [...classes]
     .sort((a, b) => Number(b.application_count || 0) - Number(a.application_count || 0) || String(a.class_name || "").localeCompare(String(b.class_name || "")))
+    .slice(0, 8);
+
+  const capacityTopClasses = [...classes]
+    .map((row) => {
+      const taLimit = Number(row.maximum_number_of_tas_admitted || 0);
+      const approvedCount = Number(row.approved_count || 0);
+      const usageRate = taLimit > 0 ? Math.round((approvedCount / taLimit) * 100) : 0;
+      return {
+        ...row,
+        ta_limit: taLimit,
+        approved_count_number: approvedCount,
+        usage_rate: usageRate
+      };
+    })
+    .sort((a, b) => b.usage_rate - a.usage_rate || b.approved_count_number - a.approved_count_number || String(a.class_name || "").localeCompare(String(b.class_name || "")))
     .slice(0, 8);
 
   const professorSummaryMap = new Map();
@@ -4752,6 +5672,21 @@ function courseReportsPage(res, user, notice, filters = {}) {
     .sort((a, b) => b.application_count - a.application_count || b.pending_professor_count - a.pending_professor_count)
     .slice(0, 8);
 
+  const applicantSummaryMap = new Map();
+  applications.forEach((app) => {
+    const key = String(app.applier_name || "未知申请人");
+    if (!applicantSummaryMap.has(key)) {
+      applicantSummaryMap.set(key, { applier_name: key, application_count: 0, approved_count: 0, pending_count: 0 });
+    }
+    const item = applicantSummaryMap.get(key);
+    item.application_count += 1;
+    if (app.status === "Approved") item.approved_count += 1;
+    if (app.status === "PendingTAAdmin" || app.status === "PendingProfessor") item.pending_count += 1;
+  });
+  const applicantSummary = Array.from(applicantSummaryMap.values())
+    .sort((a, b) => b.application_count - a.application_count || b.approved_count - a.approved_count)
+    .slice(0, 8);
+
   const dayMap = new Map();
   applications.forEach((app) => {
     const day = String(app.submitted_at || "").slice(0, 10);
@@ -4764,12 +5699,14 @@ function courseReportsPage(res, user, notice, filters = {}) {
   const maxDayCount = Math.max(1, ...recentDays.map(([, count]) => count));
 
   const topClassMax = Math.max(1, ...topClasses.map((row) => Number(row.application_count || 0)));
+  const capacityUsageMax = Math.max(1, ...capacityTopClasses.map((row) => Number(row.usage_rate || 0)));
   const professorMax = Math.max(1, ...professorSummary.map((row) => Number(row.application_count || 0)));
+  const applicantMax = Math.max(1, ...applicantSummary.map((row) => Number(row.application_count || 0)));
 
   const topClassRows = topClasses.map((row) => `
     <div class="report-row">
       <div class="report-row-main">
-        <div class="report-row-title">${escapeHtml(row.class_name)}</div>
+        <div class="report-row-title"><a href="/course/classes/${row.class_id}/applications">${escapeHtml(row.class_name)}</a></div>
         <div class="report-row-meta">${escapeHtml(row.class_code)} · ${escapeHtml(row.teacher_name)} · 已通过 ${row.approved_count}/${row.maximum_number_of_tas_admitted}</div>
         <div class="bar-track"><div class="bar-fill" style="width:${Math.max(8, Math.round(Number(row.application_count || 0) / topClassMax * 100))}%"></div></div>
       </div>
@@ -4780,9 +5717,31 @@ function courseReportsPage(res, user, notice, filters = {}) {
   const professorRows = professorSummary.map((row) => `
     <div class="report-row">
       <div class="report-row-main">
-        <div class="report-row-title">${escapeHtml(row.teacher_name)}</div>
+        <div class="report-row-title"><a href="/course/classes?teacher_name=${encodeURIComponent(row.teacher_name)}">${escapeHtml(row.teacher_name)}</a></div>
         <div class="report-row-meta">教学班 ${row.class_count} · 待教授审批 ${row.pending_professor_count} · 已通过 ${row.approved_count}</div>
         <div class="bar-track"><div class="bar-fill gold" style="width:${Math.max(8, Math.round(Number(row.application_count || 0) / professorMax * 100))}%"></div></div>
+      </div>
+      <div class="report-row-side">${row.application_count} 份申请</div>
+    </div>
+  `).join("");
+
+  const capacityRows = capacityTopClasses.map((row) => `
+    <div class="report-row">
+      <div class="report-row-main">
+        <div class="report-row-title"><a href="/course/classes/${row.class_id}">${escapeHtml(row.class_name)}</a></div>
+        <div class="report-row-meta">${escapeHtml(row.class_code)} · ${escapeHtml(row.teacher_name)} · 已通过 ${row.approved_count_number}/${row.ta_limit}</div>
+        <div class="bar-track"><div class="bar-fill gold" style="width:${Math.max(8, Math.round(Number(row.usage_rate || 0) / capacityUsageMax * 100))}%"></div></div>
+      </div>
+      <div class="report-row-side">${row.usage_rate}%</div>
+    </div>
+  `).join("");
+
+  const applicantRows = applicantSummary.map((row) => `
+    <div class="report-row">
+      <div class="report-row-main">
+        <div class="report-row-title"><a href="/course/application-logs?applier_name=${encodeURIComponent(row.applier_name)}">${escapeHtml(row.applier_name)}</a></div>
+        <div class="report-row-meta">申请 ${row.application_count} · 已通过 ${row.approved_count} · 待处理 ${row.pending_count}</div>
+        <div class="bar-track"><div class="bar-fill" style="width:${Math.max(8, Math.round(Number(row.application_count || 0) / applicantMax * 100))}%"></div></div>
       </div>
       <div class="report-row-side">${row.application_count} 份申请</div>
     </div>
@@ -4798,6 +5757,235 @@ function courseReportsPage(res, user, notice, filters = {}) {
     </div>
   `).join("");
 
+  return {
+    submittedFrom,
+    submittedTo,
+    semesterFilter,
+    teacherFilter,
+    semesterOptions,
+    applications,
+    classes,
+    statusCounts,
+    totalApplications,
+    totalClasses,
+    openClasses,
+    fullClasses,
+    publishedClasses,
+    pendingTaAdmin,
+    pendingProfessor,
+    approvedApplications,
+    rejectedApplications,
+    withdrawnApplications,
+    uniqueApplicants,
+    approvalRate,
+    averagePerClass,
+    topClasses,
+    capacityTopClasses,
+    professorSummary,
+    applicantSummary,
+    recentDays,
+    topClassRows,
+    capacityRows,
+    professorRows,
+    applicantRows,
+    dayRows
+  };
+}
+
+async function courseReportsExport(res, filters = {}) {
+  const report = await buildCourseReportData(filters);
+  const workbook = XLSX.utils.book_new();
+  const filterRows = [
+    { 条件: "申请时间起", 值: report.submittedFrom || "全部" },
+    { 条件: "申请时间止", 值: report.submittedTo || "全部" },
+    { 条件: "学期", 值: report.semesterFilter || "全部" },
+    { 条件: "教授", 值: filters.teacher_name || "全部" }
+  ];
+  const summaryRows = [
+    { 指标: "申请总数", 数值: report.totalApplications },
+    { 指标: "待TAAdmin审批", 数值: report.pendingTaAdmin },
+    { 指标: "待Professor审批", 数值: report.pendingProfessor },
+    { 指标: "已通过申请", 数值: report.approvedApplications },
+    { 指标: "已拒绝申请", 数值: report.rejectedApplications },
+    { 指标: "已撤销申请", 数值: report.withdrawnApplications },
+    { 指标: "教学班总数", 数值: report.totalClasses },
+    { 指标: "开放中教学班", 数值: report.openClasses },
+    { 指标: "TA已满教学班", 数值: report.fullClasses },
+    { 指标: "已发布至Professor", 数值: report.publishedClasses },
+    { 指标: "申请TA人数", 数值: report.uniqueApplicants },
+    { 指标: "最终通过率", 数值: `${report.approvalRate}%` },
+    { 指标: "班均申请数", 数值: report.averagePerClass }
+  ];
+  const classRows = report.classes.map((row) => ({
+    教学班ID: row.class_id,
+    教学班代码: row.class_code,
+    教学班缩写: row.class_abbr || "",
+    课程名称: row.course_name,
+    教学班名称: row.class_name,
+    教授: row.teacher_name,
+    学期: row.semester,
+    开放状态: classOpenStatusLabel(row),
+    TA已满: Number(row.approved_count || 0) >= Number(row.maximum_number_of_tas_admitted || 0) ? "是" : "否",
+    已通过人数: Number(row.approved_count || 0),
+    TA上限: Number(row.maximum_number_of_tas_admitted || 0),
+    申请总数: Number(row.application_count || 0),
+    待TAAdmin审批: Number(row.pending_taadmin_count || 0),
+    待Professor审批: Number(row.pending_professor_count || 0),
+    已发布至Professor: row.published_to_professor === "Y" ? "是" : "否",
+    开放申请: row.ta_applications_allowed === "Y" ? "是" : "否",
+    允许冲突申请: row.is_conflict_allowed === "Y" ? "是" : "否"
+  }));
+  const applicationRows = report.applications.map((app) => ({
+    申请ID: app.application_id,
+    申请学生: app.applier_name,
+    学生用户ID: app.applier_user_id,
+    教学班名称: app.class_name,
+    教授: app.teacher_name,
+    申请时间: app.submitted_at,
+    当前状态: statusLabels[app.status] || app.status,
+    TAAdmin备注: app.ta_comment || "",
+    Professor备注: app.prof_comment || ""
+  }));
+  const professorRows = report.professorSummary.map((row) => ({
+    教授: row.teacher_name,
+    教学班数量: row.class_count,
+    申请总数: row.application_count,
+    待Professor审批: row.pending_professor_count,
+    已通过数量: row.approved_count
+  }));
+  const capacityRows = report.capacityTopClasses.map((row) => ({
+    教学班代码: row.class_code,
+    教学班名称: row.class_name,
+    教授: row.teacher_name,
+    已通过人数: row.approved_count_number,
+    TA上限: row.ta_limit,
+    名额使用率: `${row.usage_rate}%`
+  }));
+  const applicantRows = report.applicantSummary.map((row) => ({
+    申请学生: row.applier_name,
+    申请总数: row.application_count,
+    已通过数量: row.approved_count,
+    待处理数量: row.pending_count
+  }));
+  const trendRows = report.recentDays.map(([day, count]) => ({
+    日期: day,
+    申请数量: count
+  }));
+
+  const filterSheet = XLSX.utils.json_to_sheet(filterRows);
+  const filterSummaryText = `当前筛选：申请时间 ${report.submittedFrom || "全部"} 至 ${report.submittedTo || "全部"}；学期 ${report.semesterFilter || "全部"}；教授 ${filters.teacher_name || "全部"}`;
+  const summaryAoa = [
+    ["TA选课系统报表摘要"],
+    [`导出时间：${nowStr()}`],
+    [filterSummaryText],
+    [],
+    ["筛选条件", ""],
+    ["申请时间起", report.submittedFrom || "全部"],
+    ["申请时间止", report.submittedTo || "全部"],
+    ["学期", report.semesterFilter || "全部"],
+    ["教授", filters.teacher_name || "全部"],
+    [],
+    ["核心指标", "", "核心指标", ""]
+  ];
+  for (let index = 0; index < summaryRows.length; index += 2) {
+    const left = summaryRows[index];
+    const right = summaryRows[index + 1];
+    summaryAoa.push([
+      left?.指标 || "",
+      left?.数值 || "",
+      right?.指标 || "",
+      right?.数值 || ""
+    ]);
+  }
+  const summarySheet = XLSX.utils.aoa_to_sheet(summaryAoa);
+  const classSheet = XLSX.utils.json_to_sheet(classRows);
+  const applicationSheet = XLSX.utils.json_to_sheet(applicationRows);
+  const professorSheet = XLSX.utils.json_to_sheet(professorRows);
+  const capacitySheet = XLSX.utils.json_to_sheet(capacityRows);
+  const applicantSheet = XLSX.utils.json_to_sheet(applicantRows);
+  const trendSheet = XLSX.utils.json_to_sheet(trendRows);
+
+  summarySheet["!cols"] = [
+    { wch: 20 },
+    { wch: 14 },
+    { wch: 20 },
+    { wch: 14 }
+  ];
+  summarySheet["!merges"] = [
+    { s: { r: 0, c: 0 }, e: { r: 0, c: 3 } },
+    { s: { r: 1, c: 0 }, e: { r: 1, c: 3 } },
+    { s: { r: 2, c: 0 }, e: { r: 2, c: 3 } },
+    { s: { r: 4, c: 0 }, e: { r: 4, c: 1 } },
+    { s: { r: 10, c: 0 }, e: { r: 10, c: 1 } },
+    { s: { r: 10, c: 2 }, e: { r: 10, c: 3 } }
+  ];
+
+  classSheet["!cols"] = [
+    { wch: 10 },
+    { wch: 18 },
+    { wch: 14 },
+    { wch: 18 },
+    { wch: 24 },
+    { wch: 20 },
+    { wch: 14 },
+    { wch: 12 },
+    { wch: 10 },
+    { wch: 12 },
+    { wch: 10 },
+    { wch: 10 },
+    { wch: 14 },
+    { wch: 16 },
+    { wch: 14 },
+    { wch: 12 },
+    { wch: 14 }
+  ];
+  applicationSheet["!cols"] = [
+    { wch: 10 },
+    { wch: 14 },
+    { wch: 12 },
+    { wch: 24 },
+    { wch: 20 },
+    { wch: 20 },
+    { wch: 16 },
+    { wch: 24 },
+    { wch: 24 }
+  ];
+
+  XLSX.utils.book_append_sheet(workbook, filterSheet, "筛选条件");
+  XLSX.utils.book_append_sheet(workbook, summarySheet, "汇总指标");
+  XLSX.utils.book_append_sheet(workbook, classSheet, "教学班报表");
+  XLSX.utils.book_append_sheet(workbook, applicationSheet, "申请明细");
+  XLSX.utils.book_append_sheet(workbook, professorSheet, "教授维度");
+  XLSX.utils.book_append_sheet(workbook, capacitySheet, "名额使用率");
+  XLSX.utils.book_append_sheet(workbook, applicantSheet, "TA活跃度");
+  XLSX.utils.book_append_sheet(workbook, trendSheet, "申请趋势");
+  const buffer = XLSX.write(workbook, { type: "buffer", bookType: "xlsx" });
+  const filename = `course_reports_${nowStr().slice(0, 10)}.xlsx`;
+  res.writeHead(200, {
+    "Content-Type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "Content-Disposition": `attachment; filename="${filename}"`
+  });
+  res.end(buffer);
+}
+
+async function courseReportsPage(res, user, notice, filters = {}) {
+  const report = await buildCourseReportData(filters);
+  const exportQuery = querystring.stringify({
+    submitted_from: report.submittedFrom,
+    submitted_to: report.submittedTo,
+    semester: report.semesterFilter,
+    teacher_name: filters.teacher_name || ""
+  });
+  const statusReportLink = (status) => {
+    const query = querystring.stringify({
+      status,
+      submitted_from: report.submittedFrom,
+      submitted_to: report.submittedTo,
+      teacher_name: filters.teacher_name || ""
+    });
+    return `/course/application-logs${query ? `?${query}` : ""}`;
+  };
+
   sendHtml(res, pageLayout("报表视图", `
     <section class="card card-brand">
       <h2>CourseAdmin 报表视图</h2>
@@ -4805,10 +5993,16 @@ function courseReportsPage(res, user, notice, filters = {}) {
       <form method="get" action="/course/reports">
         <div class="filters-shell">
           <div class="filters-grid">
-            <p><label>申请时间起<input type="date" name="submitted_from" value="${escapeHtml(submittedFrom)}" /></label></p>
-            <p><label>申请时间止<input type="date" name="submitted_to" value="${escapeHtml(submittedTo)}" /></label></p>
+            <p><label>申请时间起<input type="date" name="submitted_from" value="${escapeHtml(report.submittedFrom)}" /></label></p>
+            <p><label>申请时间止<input type="date" name="submitted_to" value="${escapeHtml(report.submittedTo)}" /></label></p>
+            <p><label>学期<select name="semester">
+              <option value="">全部学期</option>
+              ${report.semesterOptions.map((item) => `<option value="${escapeHtml(item)}" ${report.semesterFilter === item ? "selected" : ""}>${escapeHtml(item)}</option>`).join("")}
+            </select></label></p>
+            <p><label>教授<input name="teacher_name" value="${escapeHtml(filters.teacher_name || "")}" placeholder="按教授名过滤" /></label></p>
             <div class="actions">
               <button class="secondary action-button" type="submit">更新报表</button>
+              <a class="button-link secondary action-button" href="/course/reports/export${exportQuery ? `?${exportQuery}` : ""}">导出Excel</a>
               <a class="button-link secondary action-button" href="/course/reports">重置</a>
             </div>
           </div>
@@ -4817,15 +6011,19 @@ function courseReportsPage(res, user, notice, filters = {}) {
     </section>
 
     <section class="stats-grid">
-      <article class="stat-card"><div class="stat-label">申请总数</div><div class="stat-value">${totalApplications}</div><div class="stat-footnote">当前筛选范围内全部 TA 申请</div></article>
-      <article class="stat-card"><div class="stat-label">待 TAAdmin 审批</div><div class="stat-value">${pendingTaAdmin}</div><div class="stat-footnote">仍停留在初审阶段</div></article>
-      <article class="stat-card"><div class="stat-label">待 Professor 审批</div><div class="stat-value">${pendingProfessor}</div><div class="stat-footnote">已初审通过，待终审</div></article>
-      <article class="stat-card"><div class="stat-label">已通过申请</div><div class="stat-value">${approvedApplications}</div><div class="stat-footnote">最终通过的申请数量</div></article>
-      <article class="stat-card"><div class="stat-label">已拒绝申请</div><div class="stat-value">${rejectedApplications}</div><div class="stat-footnote">TAAdmin 或 Professor 拒绝合计</div></article>
-      <article class="stat-card"><div class="stat-label">教学班总数</div><div class="stat-value">${totalClasses}</div><div class="stat-footnote">系统内全部教学班</div></article>
-      <article class="stat-card"><div class="stat-label">开放中教学班</div><div class="stat-value">${openClasses}</div><div class="stat-footnote">当前开放且可申请</div></article>
-      <article class="stat-card"><div class="stat-label">TA 已满教学班</div><div class="stat-value">${fullClasses}</div><div class="stat-footnote">已通过人数达到上限</div></article>
-      <article class="stat-card"><div class="stat-label">已发布至 Professor</div><div class="stat-value">${publishedClasses}</div><div class="stat-footnote">已发送教授邮件的教学班</div></article>
+      <article class="stat-card"><div class="stat-label">申请总数</div><div class="stat-value">${report.totalApplications}</div><div class="stat-footnote">当前筛选范围内全部 TA 申请</div></article>
+      <article class="stat-card"><div class="stat-label">待 TAAdmin 审批</div><div class="stat-value">${report.pendingTaAdmin}</div><div class="stat-footnote">仍停留在初审阶段</div></article>
+      <article class="stat-card"><div class="stat-label">待 Professor 审批</div><div class="stat-value">${report.pendingProfessor}</div><div class="stat-footnote">已初审通过，待终审</div></article>
+      <article class="stat-card"><div class="stat-label">已通过申请</div><div class="stat-value">${report.approvedApplications}</div><div class="stat-footnote">最终通过的申请数量</div></article>
+      <article class="stat-card"><div class="stat-label">已拒绝申请</div><div class="stat-value">${report.rejectedApplications}</div><div class="stat-footnote">TAAdmin 或 Professor 拒绝合计</div></article>
+      <article class="stat-card"><div class="stat-label">已撤销申请</div><div class="stat-value">${report.withdrawnApplications}</div><div class="stat-footnote">学生主动撤销的申请</div></article>
+      <article class="stat-card"><div class="stat-label">教学班总数</div><div class="stat-value">${report.totalClasses}</div><div class="stat-footnote">系统内全部教学班</div></article>
+      <article class="stat-card"><div class="stat-label">开放中教学班</div><div class="stat-value">${report.openClasses}</div><div class="stat-footnote">当前开放且可申请</div></article>
+      <article class="stat-card"><div class="stat-label">TA 已满教学班</div><div class="stat-value">${report.fullClasses}</div><div class="stat-footnote">已通过人数达到上限</div></article>
+      <article class="stat-card"><div class="stat-label">已发布至 Professor</div><div class="stat-value">${report.publishedClasses}</div><div class="stat-footnote">已发送教授邮件的教学班</div></article>
+      <article class="stat-card"><div class="stat-label">申请 TA 人数</div><div class="stat-value">${report.uniqueApplicants}</div><div class="stat-footnote">当前筛选范围内的唯一申请学生</div></article>
+      <article class="stat-card"><div class="stat-label">最终通过率</div><div class="stat-value">${report.approvalRate}%</div><div class="stat-footnote">已通过申请占全部申请比例</div></article>
+      <article class="stat-card"><div class="stat-label">班均申请数</div><div class="stat-value">${report.averagePerClass}</div><div class="stat-footnote">平均每个教学班收到的申请数量</div></article>
     </section>
 
     <section class="report-grid">
@@ -4833,14 +6031,28 @@ function courseReportsPage(res, user, notice, filters = {}) {
         <div class="report-kicker">热门教学班</div>
         <h3>申请量最高的教学班</h3>
         <div class="report-list">
-          ${topClassRows || '<div class="muted">暂无数据</div>'}
+          ${report.topClassRows || '<div class="muted">暂无数据</div>'}
+        </div>
+      </article>
+      <article class="report-card">
+        <div class="report-kicker">名额使用率</div>
+        <h3>Top N 教学班</h3>
+        <div class="report-list">
+          ${report.capacityRows || '<div class="muted">暂无数据</div>'}
         </div>
       </article>
       <article class="report-card">
         <div class="report-kicker">教授维度</div>
         <h3>教授名下申请分布</h3>
         <div class="report-list">
-          ${professorRows || '<div class="muted">暂无数据</div>'}
+          ${report.professorRows || '<div class="muted">暂无数据</div>'}
+        </div>
+      </article>
+      <article class="report-card">
+        <div class="report-kicker">TA活跃度</div>
+        <h3>申请最活跃的 TA</h3>
+        <div class="report-list">
+          ${report.applicantRows || '<div class="muted">暂无数据</div>'}
         </div>
       </article>
     </section>
@@ -4851,26 +6063,103 @@ function courseReportsPage(res, user, notice, filters = {}) {
         <h3>申请状态概览</h3>
         <table>
           <tr><th>状态</th><th>数量</th></tr>
-          <tr><td><span class="${applicationStatusPillClass("PendingTAAdmin")}">${escapeHtml(statusLabels.PendingTAAdmin)}</span></td><td>${statusCounts.PendingTAAdmin}</td></tr>
-          <tr><td><span class="${applicationStatusPillClass("PendingProfessor")}">${escapeHtml(statusLabels.PendingProfessor)}</span></td><td>${statusCounts.PendingProfessor}</td></tr>
-          <tr><td><span class="${applicationStatusPillClass("Approved")}">${escapeHtml(statusLabels.Approved)}</span></td><td>${statusCounts.Approved}</td></tr>
-          <tr><td><span class="${applicationStatusPillClass("RejectedByTAAdmin")}">${escapeHtml(statusLabels.RejectedByTAAdmin)}</span></td><td>${statusCounts.RejectedByTAAdmin}</td></tr>
-          <tr><td><span class="${applicationStatusPillClass("RejectedByProfessor")}">${escapeHtml(statusLabels.RejectedByProfessor)}</span></td><td>${statusCounts.RejectedByProfessor}</td></tr>
-          <tr><td><span class="${applicationStatusPillClass("Withdrawn")}">${escapeHtml(statusLabels.Withdrawn)}</span></td><td>${statusCounts.Withdrawn}</td></tr>
+          <tr><td><a href="${statusReportLink("PendingTAAdmin")}"><span class="${applicationStatusPillClass("PendingTAAdmin")}">${escapeHtml(statusLabels.PendingTAAdmin)}</span></a></td><td>${report.statusCounts.PendingTAAdmin}</td></tr>
+          <tr><td><a href="${statusReportLink("PendingProfessor")}"><span class="${applicationStatusPillClass("PendingProfessor")}">${escapeHtml(statusLabels.PendingProfessor)}</span></a></td><td>${report.statusCounts.PendingProfessor}</td></tr>
+          <tr><td><a href="${statusReportLink("Approved")}"><span class="${applicationStatusPillClass("Approved")}">${escapeHtml(statusLabels.Approved)}</span></a></td><td>${report.statusCounts.Approved}</td></tr>
+          <tr><td><a href="${statusReportLink("RejectedByTAAdmin")}"><span class="${applicationStatusPillClass("RejectedByTAAdmin")}">${escapeHtml(statusLabels.RejectedByTAAdmin)}</span></a></td><td>${report.statusCounts.RejectedByTAAdmin}</td></tr>
+          <tr><td><a href="${statusReportLink("RejectedByProfessor")}"><span class="${applicationStatusPillClass("RejectedByProfessor")}">${escapeHtml(statusLabels.RejectedByProfessor)}</span></a></td><td>${report.statusCounts.RejectedByProfessor}</td></tr>
+          <tr><td><a href="${statusReportLink("Withdrawn")}"><span class="${applicationStatusPillClass("Withdrawn")}">${escapeHtml(statusLabels.Withdrawn)}</span></a></td><td>${report.statusCounts.Withdrawn}</td></tr>
         </table>
       </article>
       <article class="report-card">
         <div class="report-kicker">近 7 个申请日</div>
         <h3>申请提交趋势</h3>
         <div class="report-list">
-          ${dayRows || '<div class="muted">暂无数据</div>'}
+          ${report.dayRows || '<div class="muted">暂无数据</div>'}
         </div>
       </article>
     </section>
   `, user, notice));
 }
 
-function courseAdminApplicationDetailPage(res, user, applicationId, notice) {
+async function courseClassTaExport(res, filters = {}) {
+  let buffer;
+  if (DB_CLIENT === "mysql") {
+    const rows = await dbGateway.getCourseAdminClassRows(filters);
+    const classIds = rows.map((row) => Number(row.class_id)).filter(Boolean);
+    const approvedApps = await dbGateway.getApprovedApplicationsForClasses(classIds);
+    buffer = classTaExportWorkbookBufferFromRows(rows, approvedApps);
+  } else {
+    const db = getDb();
+    const rows = loadCourseAdminClassRows(db, filters);
+    buffer = classTaExportWorkbookBuffer(db, rows);
+    db.close();
+  }
+  const filename = `class_ta_export_${nowStr().slice(0, 10)}.xlsx`;
+  res.writeHead(200, {
+    "Content-Type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "Content-Disposition": `attachment; filename="${filename}"`
+  });
+  res.end(buffer);
+}
+
+async function taAdminClassTaExport(res, filters = {}) {
+  let buffer;
+  if (DB_CLIENT === "mysql") {
+    const rows = await dbGateway.getTaAdminClassRows(filters);
+    const classIds = rows.map((row) => Number(row.class_id)).filter(Boolean);
+    const approvedApps = await dbGateway.getApprovedApplicationsForClasses(classIds);
+    buffer = classTaExportWorkbookBufferFromRows(rows, approvedApps);
+  } else {
+    const db = getDb();
+    const rows = loadTaAdminClassRows(db, filters);
+    buffer = classTaExportWorkbookBuffer(db, rows);
+    db.close();
+  }
+  const filename = `class_ta_export_${nowStr().slice(0, 10)}.xlsx`;
+  res.writeHead(200, {
+    "Content-Type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "Content-Disposition": `attachment; filename="${filename}"`
+  });
+  res.end(buffer);
+}
+
+async function courseAdminApplicationDetailPage(res, user, applicationId, notice) {
+  if (DB_CLIENT === "mysql") {
+    const [app, logs, auditRows] = await Promise.all([
+      dbGateway.getApplicationById(applicationId),
+      dbGateway.getApprovalLogs(applicationId),
+      dbGateway.getApplicationAuditRows(applicationId)
+    ]);
+    if (!app) {
+      return sendHtml(res, pageLayout("未找到", '<section class="card">申请不存在。</section>', user, notice), {}, 404);
+    }
+    const logRows = logs.map((log) => `<tr>
+      <td>${escapeHtml(log.approval_stage)}</td>
+      <td>${escapeHtml(log.approver_name)}</td>
+      <td>${escapeHtml(log.result)}</td>
+      <td>${escapeHtml(log.comments || "")}</td>
+      <td>${escapeHtml(log.acted_at)}</td>
+    </tr>`).join("");
+    return sendHtml(res, pageLayout("申请详情", `
+      <section class="card">
+        <h2>${escapeHtml(app.applier_name)} - ${escapeHtml(app.class_name)}</h2>
+        <p>教授：${escapeHtml(app.teacher_name)}</p>
+        <p>状态：${escapeHtml(statusLabels[app.status] || app.status)}</p>
+        <p>申请时间：${escapeHtml(app.submitted_at)}</p>
+        <p>申请原因：${escapeHtml(app.application_reason)}</p>
+        <p>简历：${attachmentLink(app)}</p>
+        <p>TAAdmin 备注：${escapeHtml(app.ta_comment || "")}</p>
+        <p>Professor 备注：${escapeHtml(app.prof_comment || "")}</p>
+      </section>
+      <section class="card">
+        <h3>审批记录</h3>
+        <table><tr><th>阶段</th><th>审批人</th><th>结果</th><th>备注</th><th>时间</th></tr>${logRows || "<tr><td colspan=\"5\">暂无审批记录</td></tr>"}</table>
+      </section>
+      ${renderApplicationAuditSection(auditRows)}
+      ${adminOverrideSection(`/course/applications/${applicationId}/override-status`, app.status)}
+    `, user, notice));
+  }
   const db = getDb();
   const app = db.prepare("select * from applications where application_id = ?").get(applicationId);
   const logs = db.prepare(`
@@ -4882,8 +6171,7 @@ function courseAdminApplicationDetailPage(res, user, applicationId, notice) {
   const auditRows = applicationAuditRows(db, applicationId);
   db.close();
   if (!app) {
-    res.writeHead(404, { "Content-Type": "text/html; charset=utf-8" });
-    res.end(pageLayout("未找到", '<section class="card">申请不存在。</section>', user, notice));
+    return sendHtml(res, pageLayout("未找到", '<section class="card">申请不存在。</section>', user, notice), {}, 404);
     return;
   }
   const logRows = logs.map((log) => `<tr>
@@ -4916,8 +6204,7 @@ function courseAdminApplicationDetailPage(res, user, applicationId, notice) {
 function classesImportResultPage(res, user, reportId, notice) {
   const report = importReports.get(reportId);
   if (!report) {
-    res.writeHead(404, { "Content-Type": "text/html; charset=utf-8" });
-    res.end(pageLayout("未找到", '<section class="card">导入结果不存在或已过期。</section>', user, notice));
+    return sendHtml(res, pageLayout("未找到", '<section class="card">导入结果不存在或已过期。</section>', user, notice), {}, 404);
     return;
   }
   if (report.status === "failed") {
@@ -4966,8 +6253,7 @@ function classesImportResultPage(res, user, reportId, notice) {
 function usersImportResultPage(res, user, reportId, notice) {
   const report = importReports.get(reportId);
   if (!report) {
-    res.writeHead(404, { "Content-Type": "text/html; charset=utf-8" });
-    res.end(pageLayout("未找到", '<section class="card">导入结果不存在或已过期。</section>', user, notice));
+    return sendHtml(res, pageLayout("未找到", '<section class="card">导入结果不存在或已过期。</section>', user, notice), {}, 404);
     return;
   }
   if (report.status === "failed") {
@@ -5012,59 +6298,52 @@ function usersImportResultPage(res, user, reportId, notice) {
   `, user, notice));
 }
 
-function taAdminAllClassesPage(res, user, notice, filters = {}) {
-  const db = getDb();
-  const professorFilter = String(filters.professor_name || "").trim().toLowerCase();
-  const classNameFilter = String(filters.class_name || "").trim().toLowerCase();
-  const taFullFilter = String(filters.ta_full || "").trim();
-  const hasPendingFilter = String(filters.has_pending || "").trim();
-  const rowsRaw = db.prepare(`
-    select c.*,
-      (select count(*) from applications a where a.class_id = c.class_id) as application_count,
-      (select count(*) from applications a where a.class_id = c.class_id and a.status = 'PendingTAAdmin') as pending_taadmin_count,
-      (select count(*) from applications a where a.class_id = c.class_id and a.status = 'PendingProfessor') as pending_professor_count,
-      (select count(*) from applications a where a.class_id = c.class_id and a.status = 'Approved') as approved_count
-    from classes c
-    order by c.semester, c.course_name, c.class_name
-  `).all();
-  for (const row of rowsRaw) {
-    if (isClassCapacityReached(row, row.approved_count) && row.ta_applications_allowed !== "N") {
-      db.prepare("update classes set ta_applications_allowed = 'N' where class_id = ?").run(row.class_id);
-      row.ta_applications_allowed = "N";
+async function taAdminAllClassesPage(res, user, notice, filters = {}) {
+  let rows;
+  let schedulesByClass = new Map();
+  if (DB_CLIENT === "mysql") {
+    rows = await dbGateway.getTaAdminClassRows(filters);
+    const classIds = rows.map((row) => Number(row.class_id)).filter(Boolean);
+    const allSchedules = await dbGateway.getSchedulesForClassIds(classIds);
+    for (const schedule of allSchedules) {
+      if (!schedulesByClass.has(schedule.class_id)) {
+        schedulesByClass.set(schedule.class_id, []);
+      }
+      schedulesByClass.get(schedule.class_id).push(schedule);
     }
-    if (Number(row.pending_taadmin_count || 0) > 0 && row.published_to_professor === "Y") {
-      db.prepare("update classes set published_to_professor = 'N', professor_notified_at = null where class_id = ?").run(row.class_id);
-      row.published_to_professor = "N";
-      row.professor_notified_at = null;
+  } else {
+    const db = getDb();
+    const rowsRaw = loadTaAdminClassRows(db, filters);
+    for (const row of rowsRaw) {
+      if (isClassCapacityReached(row, row.approved_count) && row.ta_applications_allowed !== "N") {
+        db.prepare("update classes set ta_applications_allowed = 'N' where class_id = ?").run(row.class_id);
+        row.ta_applications_allowed = "N";
+      }
+      if (Number(row.pending_taadmin_count || 0) > 0 && row.published_to_professor === "Y") {
+        db.prepare("update classes set published_to_professor = 'N', professor_notified_at = null where class_id = ?").run(row.class_id);
+        row.published_to_professor = "N";
+        row.professor_notified_at = null;
+      }
     }
+    const professors = db.prepare("select user_id, email from users where role = 'Professor'").all();
+    const professorEmailMap = new Map(professors.map((row) => [row.user_id, row.email]));
+    rows = rowsRaw.map((row) => ({
+      ...row,
+      professor_emails: normalizeTeacherUserIds(row.teacher_user_id).map((id) => professorEmailMap.get(id)).filter(Boolean).join(",")
+    }));
+    const allSchedules = db.prepare(`
+      select class_id, lesson_date, start_time, end_time, section, is_exam
+      from class_schedules
+      order by lesson_date, start_time
+    `).all();
+    for (const schedule of allSchedules) {
+      if (!schedulesByClass.has(schedule.class_id)) {
+        schedulesByClass.set(schedule.class_id, []);
+      }
+      schedulesByClass.get(schedule.class_id).push(schedule);
+    }
+    db.close();
   }
-  const professors = db.prepare("select user_id, email from users where role = 'Professor'").all();
-  const professorEmailMap = new Map(professors.map((row) => [row.user_id, row.email]));
-  const rows = rowsRaw.filter((row) => {
-    const matchesProfessor = !professorFilter || String(row.teacher_name || "").toLowerCase().includes(professorFilter);
-    const matchesClassName = !classNameFilter || String(row.class_name || "").toLowerCase().includes(classNameFilter);
-    const isFull = isClassCapacityReached(row, row.approved_count);
-    const matchesTaFull = !taFullFilter || (taFullFilter === "Y" ? isFull : !isFull);
-    const hasPending = Number(row.pending_taadmin_count || 0) > 0;
-    const matchesPending = !hasPendingFilter || (hasPendingFilter === "Y" ? hasPending : !hasPending);
-    return matchesProfessor && matchesClassName && matchesTaFull && matchesPending;
-  }).map((row) => ({
-    ...row,
-    professor_emails: normalizeTeacherUserIds(row.teacher_user_id).map((id) => professorEmailMap.get(id)).filter(Boolean).join(",")
-  }));
-  const schedulesByClass = new Map();
-  const allSchedules = db.prepare(`
-    select class_id, lesson_date, start_time, end_time, section, is_exam
-    from class_schedules
-    order by lesson_date, start_time
-  `).all();
-  for (const schedule of allSchedules) {
-    if (!schedulesByClass.has(schedule.class_id)) {
-      schedulesByClass.set(schedule.class_id, []);
-    }
-    schedulesByClass.get(schedule.class_id).push(schedule);
-  }
-  db.close();
   const tableRows = rows.map((row) => {
     const scheduleRows = schedulesByClass.get(row.class_id) || [];
     const isFull = isClassCapacityReached(row, row.approved_count);
@@ -5076,17 +6355,18 @@ function taAdminAllClassesPage(res, user, notice, filters = {}) {
       <td>${escapeHtml(row.class_name)}</td>
       <td>${escapeHtml(row.teacher_name)}</td>
       <td>${escapeHtml(row.semester)}</td>
-      <td>${classOpenStatusLabel(row)}</td>
-      <td>${isFull ? "已满" : "-"}</td>
+      <td>${classOpenStatusPill(row)}</td>
+      <td>${classCapacityPill(isFull)}</td>
       <td>${scheduleRows.length}</td>
+      <td>${namePills(row.approved_ta_names || "-")}</td>
       <td>${scheduleSummary(scheduleRows, `taadmin-${row.class_id}`, { showPreview: false })}</td>
-      <td>${row.approved_count} / ${row.maximum_number_of_tas_admitted}</td>
-      <td>${row.application_count}</td>
-      <td>${row.pending_taadmin_count}</td>
-      <td>${row.published_to_professor === "Y" ? "已发送" : "否"}</td>
-      <td>${escapeHtml(row.ta_applications_allowed)}</td>
-      <td>${escapeHtml(row.is_conflict_allowed || "N")}</td>
-      <td><a class="button-link secondary rect action-button" href="/admin/ta/classes/${row.class_id}/applications">审核</a></td>
+      <td>${metricPill(`${row.approved_count} / ${row.maximum_number_of_tas_admitted}`, isFull ? "gold" : "ok")}</td>
+      <td>${metricPill(row.application_count, "muted")}</td>
+      <td>${metricPill(row.pending_taadmin_count, Number(row.pending_taadmin_count || 0) > 0 ? "gold" : "muted")}</td>
+      <td>${ynPill(row.published_to_professor, "已发送", "否")}</td>
+      <td>${ynPill(row.ta_applications_allowed, "Y", "N")}</td>
+      <td>${ynPill(row.is_conflict_allowed || "N", "Y", "N")}</td>
+      <td class="table-action-cell"><div class="table-action-inner table-actions-compact"><a class="button-link secondary rect action-button" href="/admin/ta/classes/${row.class_id}/applications">审核</a></div></td>
     </tr>`;
   }).join("");
   const mobileCards = rows.map((row) => {
@@ -5096,7 +6376,7 @@ function taAdminAllClassesPage(res, user, notice, filters = {}) {
       <article class="mobile-data-card ${isFull ? "card-soft-purple" : ""}">
         <div class="actions" style="justify-content:space-between; align-items:center; margin-bottom:10px;">
           <label><input type="checkbox" class="ta-class-select" value="${row.class_id}" /> 选择</label>
-          <span class="pill">${row.published_to_professor === "Y" ? "已发送" : "未发送"}</span>
+          ${ynPill(row.published_to_professor, "已发送", "未发送")}
         </div>
         <h3>${escapeHtml(row.course_name)} / ${escapeHtml(row.class_name)}</h3>
         <div class="mobile-meta">
@@ -5111,7 +6391,7 @@ function taAdminAllClassesPage(res, user, notice, filters = {}) {
           </div>
           <div class="mobile-data-row">
             <div class="mobile-data-label">开放状态</div>
-            <div class="mobile-data-value">${escapeHtml(classOpenStatusLabel(row))}</div>
+            <div class="mobile-data-value">${classOpenStatusPill(row)}</div>
           </div>
           <div class="mobile-data-row">
             <div class="mobile-data-label">已通过/上限</div>
@@ -5122,12 +6402,16 @@ function taAdminAllClassesPage(res, user, notice, filters = {}) {
             <div class="mobile-data-value">总申请 ${row.application_count}，待TAAdmin ${row.pending_taadmin_count}</div>
           </div>
           <div class="mobile-data-row">
+            <div class="mobile-data-label">TA</div>
+            <div class="mobile-data-value">${namePills(row.approved_ta_names || "-")}</div>
+          </div>
+          <div class="mobile-data-row">
             <div class="mobile-data-label">发布至教授</div>
-            <div class="mobile-data-value">${row.published_to_professor === "Y" ? "已发送" : "否"}</div>
+            <div class="mobile-data-value">${ynPill(row.published_to_professor, "已发送", "否")}</div>
           </div>
           <div class="mobile-data-row">
             <div class="mobile-data-label">开放申请</div>
-            <div class="mobile-data-value">${escapeHtml(row.ta_applications_allowed)} / 允许冲突 ${escapeHtml(row.is_conflict_allowed || "N")}</div>
+            <div class="mobile-data-value">${ynPill(row.ta_applications_allowed, "开放", "关闭")} / 允许冲突 ${ynPill(row.is_conflict_allowed || "N", "Y", "N")}</div>
           </div>
           <div class="mobile-data-row">
             <div class="mobile-data-label">排课安排</div>
@@ -5162,6 +6446,7 @@ function taAdminAllClassesPage(res, user, notice, filters = {}) {
         </div>
         <div class="actions" style="margin-top:12px;">
           <button class="secondary action-button" type="submit">筛选</button>
+          <a class="button-link secondary rect action-button" href="/admin/ta/classes/ta-export${buildQueryString({ professor_name: filters.professor_name || "", class_name: filters.class_name || "", ta_full: filters.ta_full || "", has_pending: filters.has_pending || "" })}">导出教学班TA</a>
           <a class="button-link secondary rect action-button" href="/admin/ta/classes">重置</a>
         </div>
         </div>
@@ -5202,25 +6487,26 @@ function taAdminAllClassesPage(res, user, notice, filters = {}) {
           <table class="wide compact-table fixed-layout">
             <colgroup>
               <col style="width:56px;" />
+              <col style="width:106px;" />
+              <col style="width:80px;" />
               <col style="width:120px;" />
-              <col style="width:96px;" />
-              <col style="width:140px;" />
-              <col style="width:180px;" />
               <col style="width:160px;" />
-              <col style="width:96px;" />
-              <col style="width:96px;" />
-              <col style="width:84px;" />
-              <col style="width:68px;" />
-              <col style="width:108px;" />
-              <col style="width:112px;" />
-              <col style="width:84px;" />
-              <col style="width:110px;" />
-              <col style="width:96px;" />
+              <col style="width:142px;" />
               <col style="width:88px;" />
+              <col style="width:86px;" />
+              <col style="width:74px;" />
+              <col style="width:62px;" />
+              <col style="width:148px;" />
               <col style="width:96px;" />
               <col style="width:96px;" />
+              <col style="width:76px;" />
+              <col style="width:104px;" />
+              <col style="width:92px;" />
+              <col style="width:82px;" />
+              <col style="width:86px;" />
+              <col style="width:92px;" />
             </colgroup>
-            <tr><th>选择</th><th>代码</th><th>缩写</th><th>课程名</th><th>教学班</th><th>教授</th><th>学期</th><th>开放状态</th><th>TA已满</th><th>排课数</th><th>排课安排</th><th>已通过/上限</th><th>申请数</th><th>待TAAdmin审批</th><th>发布至教授</th><th>开放申请</th><th>允许冲突</th><th>操作</th></tr>${tableRows}
+            <tr><th>选择</th><th>代码</th><th>缩写</th><th>课程名</th><th>教学班</th><th>教授</th><th>学期</th><th>开放状态</th><th>TA已满</th><th>排课数</th><th>TA</th><th>排课安排</th><th>已通过/上限</th><th>申请数</th><th>待TAAdmin审批</th><th>发布至教授</th><th>开放申请</th><th>允许冲突</th><th>操作</th></tr>${tableRows}
           </table>
         </div>
       </div>
@@ -5268,6 +6554,60 @@ async function taAdminProfessorEmailPreview(req, res, user, notice) {
   const refs = parseBatchClassRefs(body.class_refs);
   if (!refs.length) {
     return redirect(res, "/admin/ta/classes?notice=请先勾选至少一个教学班");
+  }
+  if (DB_CLIENT === "mysql") {
+    const selectedClasses = await dbGateway.getClassRowsByRefs(refs);
+    if (!selectedClasses.length) {
+      return redirect(res, "/admin/ta/classes?notice=未匹配到任何教学班");
+    }
+    const classRows = selectedClasses.map((row) => `<tr><td>${escapeHtml(row.class_code)}</td><td>${escapeHtml(row.course_name)}</td><td>${escapeHtml(row.class_name)}</td><td>${escapeHtml(row.teacher_name)}</td></tr>`).join("");
+    const professorRows = await dbGateway.getProfessorUsers();
+    const professorMap = new Map(professorRows.map((row) => [Number(row.user_id), row]));
+    const grouped = new Map();
+    for (const classRow of selectedClasses) {
+      for (const professorId of normalizeTeacherUserIds(classRow.teacher_user_id)) {
+        const professor = professorMap.get(professorId);
+        if (!professor || !professor.email) continue;
+        if (!grouped.has(professor.user_id)) {
+          grouped.set(professor.user_id, { professor, classes: [] });
+        }
+        grouped.get(professor.user_id).classes.push(classRow);
+      }
+    }
+    const baseUrl = getExternalBaseUrl(req);
+    const draftCards = [];
+    for (const { professor, classes } of grouped.values()) {
+      const token = await dbGateway.createLoginTokenRecord(professor.user_id, "/professor/pending");
+      const accessLink = `${baseUrl}/magic-login?token=${token}`;
+      const emailDraft = buildProfessorEmailDraft(professor, classes, accessLink);
+      draftCards.push(`
+        <section class="card">
+          <h3>${escapeHtml(professor.user_name)}</h3>
+          <p>收件人：${escapeHtml(emailDraft.to)}</p>
+          <p>抄送：${escapeHtml(user.email || "未设置")}</p>
+          <p>主题：${escapeHtml(emailDraft.subject)}</p>
+          <pre style="white-space:pre-wrap;">${escapeHtml(emailDraft.text)}</pre>
+        </section>
+      `);
+    }
+    return sendHtml(res, pageLayout("邮件预览", `
+      <section class="card">
+        <h2>Professor 邮件预览</h2>
+        <p class="muted">系统会按教授分别生成专属邮件和免登录审核链接，并 CC 当前 TAAdmin。请勿转发邮件内容和链接。</p>
+        <form method="post" action="/admin/ta/classes/send-email">
+          <input type="hidden" name="class_refs" value="${escapeHtml(selectedClasses.map((row) => row.class_id).join(","))}" />
+          <div class="actions">
+            <button type="submit">发送邮件</button>
+            <a class="button-link secondary" href="/admin/ta/classes">返回全部教学班</a>
+          </div>
+        </form>
+      </section>
+      ${draftCards.join("") || `<section class="card"><p class="muted">所选教学班未匹配到可用的 Professor 邮箱。</p></section>`}
+      <section class="card">
+        <h3>本次邮件包含的教学班</h3>
+        <table><tr><th>代码</th><th>课程名</th><th>教学班</th><th>教授</th></tr>${classRows}</table>
+      </section>
+    `, user, notice));
   }
   const db = getDb();
   const selectedClasses = loadClassRowsByRefs(db, refs);
@@ -5330,6 +6670,68 @@ async function taAdminSendProfessorEmails(req, res, user) {
   if (!refs.length) {
     return redirect(res, "/admin/ta/classes?notice=请先勾选至少一个教学班");
   }
+  if (DB_CLIENT === "mysql") {
+    const selectedClasses = await dbGateway.getClassRowsByRefs(refs);
+    if (!selectedClasses.length) {
+      return redirect(res, "/admin/ta/classes?notice=未匹配到任何教学班");
+    }
+    const professorRows = await dbGateway.getProfessorUsers();
+    const professorMap = new Map(professorRows.map((row) => [Number(row.user_id), row]));
+    const grouped = new Map();
+    for (const classRow of selectedClasses) {
+      for (const professorId of normalizeTeacherUserIds(classRow.teacher_user_id)) {
+        const professor = professorMap.get(professorId);
+        if (!professor || !professor.email) continue;
+        if (!grouped.has(professor.user_id)) {
+          grouped.set(professor.user_id, { professor, classes: [] });
+        }
+        grouped.get(professor.user_id).classes.push(classRow);
+      }
+    }
+    if (!grouped.size) {
+      return redirect(res, "/admin/ta/classes?notice=所选教学班未匹配到可用的 Professor 邮箱");
+    }
+    const transporter = createMailer();
+    const fromAddress = String(process.env.SMTP_FROM || process.env.SMTP_USER || "").trim();
+    if (!fromAddress && String(process.env.SMTP_HOST || "").trim()) {
+      return redirect(res, "/admin/ta/classes?notice=已配置 SMTP，但缺少 SMTP_FROM 发件人地址");
+    }
+    const baseUrl = getExternalBaseUrl(req);
+    const professorSummaries = [];
+    try {
+      for (const { professor, classes } of grouped.values()) {
+        const token = await dbGateway.createLoginTokenRecord(professor.user_id, "/professor/pending");
+        const accessLink = `${baseUrl}/magic-login?token=${token}`;
+        const emailDraft = buildProfessorEmailDraft(professor, classes, accessLink);
+        const message = {
+          to: emailDraft.to,
+          subject: emailDraft.subject,
+          text: emailDraft.text,
+          html: emailDraft.html
+        };
+        if (fromAddress) message.from = fromAddress;
+        if (user?.email) message.cc = user.email;
+        await transporter.sendMail(message);
+        professorSummaries.push({
+          user_id: professor.user_id,
+          classSummary: classes.map((row) => row.class_name).filter(Boolean).join("、")
+        });
+      }
+      await dbGateway.markClassesPublishedToProfessor(user, selectedClasses, professorSummaries, nowStr());
+    } catch (error) {
+      await dbGateway.appendAuditLog({
+        actor: user,
+        actionType: "PROFESSOR_EMAIL_SEND_FAILED",
+        targetType: "Class",
+        targetId: selectedClasses.map((row) => row.class_id).join(","),
+        targetName: "发布至Professor失败",
+        details: `教学班数：${selectedClasses.length}\n失败原因：${error.message}`,
+        createdAt: nowStr()
+      });
+      return redirect(res, `/admin/ta/classes?notice=${error.message}`);
+    }
+    return redirect(res, "/admin/ta/classes?notice=邮件已发送，教学班已发布至 Professor");
+  }
   const db = getDb();
   const selectedClasses = loadClassRowsByRefs(db, refs);
   if (!selectedClasses.length) {
@@ -5362,6 +6764,14 @@ async function batchUpdateProfessorPublishStatus(req, res, user) {
   if (!refs.length) {
     return redirect(res, "/admin/ta/classes?notice=请先勾选至少一个教学班");
   }
+  if (DB_CLIENT === "mysql") {
+    const selectedClasses = await dbGateway.getClassRowsByRefs(refs);
+    if (!selectedClasses.length) {
+      return redirect(res, "/admin/ta/classes?notice=未匹配到任何教学班");
+    }
+    await dbGateway.updateProfessorPublishStatus(user, selectedClasses, nextValue, nowStr());
+    return redirect(res, `/admin/ta/classes?notice=已批量更新 ${selectedClasses.length} 个教学班的发布状态`);
+  }
   const db = getDb();
   const selectedClasses = loadClassRowsByRefs(db, refs);
   if (!selectedClasses.length) {
@@ -5384,27 +6794,43 @@ async function batchUpdateProfessorPublishStatus(req, res, user) {
   redirect(res, `/admin/ta/classes?notice=已批量更新 ${selectedClasses.length} 个教学班的发布状态`);
 }
 
-function taAdminClassApplicationsPage(res, user, classId, notice) {
-  const db = getDb();
-  const classRow = db.prepare("select * from classes where class_id = ?").get(classId);
-  if (!classRow) {
-    db.close();
-    res.writeHead(404, { "Content-Type": "text/html; charset=utf-8" });
-    res.end(pageLayout("未找到", '<section class="card">教学班不存在。</section>', user, notice));
-    return;
-  }
-  const apps = db.prepare(`
-    select *
-    from applications
-    where class_id = ?
-    order by submitted_at desc
-  `).all(classId);
+async function taAdminClassApplicationsPage(res, user, classId, notice) {
+  let classRow;
+  let apps;
   const statusPillClass = (status) => {
     if (status === "PendingTAAdmin") return "pill gold";
     if (status === "Approved" || status === "PendingProfessor") return "pill ok";
     if (status === "RejectedByTAAdmin" || status === "RejectedByProfessor") return "pill bad";
     return "pill muted";
   };
+  if (DB_CLIENT === "mysql") {
+    const classData = await dbGateway.getCourseClassApplications(classId);
+    classRow = classData.classRow;
+    apps = classData.apps;
+    if (!classRow) {
+      return sendHtml(res, pageLayout("未找到", '<section class="card">教学班不存在。</section>', user, notice), {}, 404);
+    }
+  } else {
+    const db = getDb();
+    classRow = db.prepare("select * from classes where class_id = ?").get(classId);
+    if (!classRow) {
+      db.close();
+      return sendHtml(res, pageLayout("未找到", '<section class="card">教学班不存在。</section>', user, notice), {}, 404);
+    }
+    apps = db.prepare(`
+      select *
+      from applications
+      where class_id = ?
+      order by submitted_at desc
+    `).all(classId);
+    db.close();
+  }
+  const conflictMap = new Map();
+  if (DB_CLIENT === "mysql") {
+    for (const app of apps) {
+      conflictMap.set(app.application_id, await dbGateway.getApplicationConflicts(app.applier_user_id, classId));
+    }
+  }
   const rows = apps.map((app) => `<tr>
     <td>${app.application_id}</td>
     <td>${escapeHtml(app.applier_name)}</td>
@@ -5412,7 +6838,14 @@ function taAdminClassApplicationsPage(res, user, classId, notice) {
     <td><span class="${statusPillClass(app.status)}">${escapeHtml(statusLabels[app.status] || app.status)}</span></td>
     <td>${escapeHtml(app.application_reason)}</td>
     <td>${(() => {
-      const conflicts = getAppliedConflicts(db, app.applier_user_id, classId);
+      const conflicts = DB_CLIENT === "mysql"
+        ? (conflictMap.get(app.application_id) || [])
+        : (() => {
+            const db = getDb();
+            const rows = getAppliedConflicts(db, app.applier_user_id, classId);
+            db.close();
+            return rows;
+          })();
       if (!conflicts.length) {
         return "<span class='muted'>无冲突</span>";
       }
@@ -5422,7 +6855,6 @@ function taAdminClassApplicationsPage(res, user, classId, notice) {
     <td>${escapeHtml(app.ta_comment || "")}</td>
     <td class="table-action-cell"><div class="table-action-inner">${app.status === "PendingTAAdmin" ? `<a class="button-link secondary rect action-button" href="/admin/ta/pending/${app.application_id}">单独审批</a>` : `<span class="pill muted">已处理</span>`}</div></td>
   </tr>`).join("");
-  db.close();
   const pendingCount = apps.filter((app) => app.status === "PendingTAAdmin").length;
   sendHtml(res, pageLayout("教学班申请审批", `
     <section class="card">
@@ -5468,6 +6900,34 @@ async function taAdminBatchApproveByClass(req, res, user, classId) {
   const body = await readBody(req);
   const result = String(body.result || "Rejected");
   const comments = String(body.comments || "").trim();
+  if (DB_CLIENT === "mysql") {
+    const classData = await dbGateway.getCourseClassApplications(classId);
+    if (!classData.classRow) {
+      return redirect(res, "/admin/ta/classes?notice=教学班不存在");
+    }
+    const pendingIds = classData.apps
+      .filter((app) => app.status === "PendingTAAdmin")
+      .map((app) => Number(app.application_id))
+      .filter(Boolean);
+    if (!pendingIds.length) {
+      return redirect(res, `/admin/ta/classes/${classId}/applications?notice=当前教学班没有待审批申请`);
+    }
+    const batchResult = await dbGateway.batchApplyTaAdminDecision(user, pendingIds, result, comments, nowStr());
+    const emailJobs = batchResult.emailPayloads.map((item) => buildTaDecisionEmail(item.applicant, item.app, result, comments));
+    const emailErrors = await sendEmailsAndCollectErrors(emailJobs);
+    if (emailErrors.length) {
+      await dbGateway.appendAuditLog({
+        actor: user,
+        actionType: "EMAIL_PARTIAL_FAILURE",
+        targetType: "Application",
+        targetId: pendingIds.join(","),
+        targetName: "TAAdmin按教学班批量审批",
+        details: `场景：TAAdmin按教学班批量审批\n失败邮件：\n${emailErrors.join("\n")}`,
+        createdAt: nowStr()
+      });
+    }
+    return redirect(res, `/admin/ta/classes/${classId}/applications?notice=${emailErrors.length ? "批量审批已完成，部分邮件发送失败" : "批量审批已完成，站内通知和邮件已发送"}`);
+  }
   const db = getDb();
   const selectApplicant = db.prepare("select user_id, user_name, email from users where user_id = ?");
   const apps = db.prepare(`
@@ -5496,24 +6956,14 @@ async function taAdminBatchApproveByClass(req, res, user, classId) {
   redirect(res, `/admin/ta/classes/${classId}/applications?notice=${emailErrors.length ? "批量审批已完成，部分邮件发送失败" : "批量审批已完成，站内通知和邮件已发送"}`);
 }
 
-function courseClassDetailPage(res, user, classId, notice) {
-  const db = getDb();
-  const row = db.prepare("select * from classes where class_id = ?").get(classId);
+async function courseClassDetailPage(res, user, classId, notice) {
+  const { classRow: row, schedules, applicationCount, approvedCount } = await dbGateway.getCourseClassDetail(classId);
   if (!row) {
-    db.close();
-    res.writeHead(404, { "Content-Type": "text/html; charset=utf-8" });
-    res.end(pageLayout("未找到", '<section class="card">教学班不存在。</section>', user, notice));
-    return;
+    return sendHtml(res, pageLayout("未找到", '<section class="card">教学班不存在。</section>', user, notice), {}, 404);
   }
-  const schedules = db.prepare(`
-    select lesson_date, start_time, end_time, section, is_exam
-    from class_schedules
-    where class_id = ?
-    order by lesson_date, start_time
-  `).all(classId);
-  const applicationCount = db.prepare("select count(*) as count from applications where class_id = ?").get(classId).count;
-  const approvedCount = db.prepare("select count(*) as count from applications where class_id = ? and status = 'Approved'").get(classId).count;
-  db.close();
+  const professorRows = await dbGateway.getProfessorUsers();
+  const selectedProfessorIds = new Set(normalizeTeacherUserIds(row.teacher_user_id));
+  const professorOptionsMarkup = professorRows.map((professor) => `<option value="${professor.user_id}" ${selectedProfessorIds.has(Number(professor.user_id)) ? "selected" : ""}>${escapeHtml(professor.user_name)}</option>`).join("");
   sendHtml(res, pageLayout("编辑教学班", `
     <section class="card">
       <h2>编辑教学班</h2>
@@ -5530,7 +6980,7 @@ function courseClassDetailPage(res, user, classId, notice) {
           <p><label>课程名<input name="course_name" value="${escapeHtml(row.course_name)}" required /></label></p>
           <p><label>教学班名称<input name="class_name" value="${escapeHtml(row.class_name)}" required /></label></p>
           <p><label>授课语言<select name="teaching_language"><option value="中文" ${row.teaching_language === "中文" ? "selected" : ""}>中文</option><option value="英文" ${row.teaching_language === "英文" ? "selected" : ""}>英文</option></select></label></p>
-          <p><label>Professor（可多选）<select name="teacher_user_id" multiple size="4">${professorMultiOptions(row.teacher_user_id)}</select></label></p>
+          <p><label>Professor（可多选）<select name="teacher_user_id" multiple size="4">${professorOptionsMarkup}</select></label></p>
           <p><label>学期<input name="semester" value="${escapeHtml(row.semester)}" required /></label></p>
           <p><label>最大录取人数<input name="maximum_number" type="number" value="${row.maximum_number_of_tas_admitted}" min="1" required /></label></p>
           <p><label>允许 TA 申请<select name="ta_allowed"><option value="Y" ${row.ta_applications_allowed === "Y" ? "selected" : ""}>Y</option><option value="N" ${row.ta_applications_allowed === "N" ? "selected" : ""}>N</option></select></label></p>
@@ -5552,22 +7002,11 @@ function courseClassDetailPage(res, user, classId, notice) {
   `, user, notice));
 }
 
-function courseClassApplicationsPage(res, user, classId, notice) {
-  const db = getDb();
-  const classRow = db.prepare("select * from classes where class_id = ?").get(classId);
+async function courseClassApplicationsPage(res, user, classId, notice) {
+  const { classRow, apps } = await dbGateway.getCourseClassApplications(classId);
   if (!classRow) {
-    db.close();
-    res.writeHead(404, { "Content-Type": "text/html; charset=utf-8" });
-    res.end(pageLayout("未找到", '<section class="card">教学班不存在。</section>', user, notice));
-    return;
+    return sendHtml(res, pageLayout("未找到", '<section class="card">教学班不存在。</section>', user, notice), {}, 404);
   }
-  const apps = db.prepare(`
-    select *
-    from applications
-    where class_id = ?
-    order by submitted_at desc
-  `).all(classId);
-  db.close();
   const rows = apps.map((app) => `<tr>
     <td>${app.application_id}</td>
     <td>${escapeHtml(app.applier_name)}</td>
@@ -5590,17 +7029,12 @@ function courseClassApplicationsPage(res, user, classId, notice) {
   `, user, notice));
 }
 
-function courseClassDeleteConfirmPage(res, user, classId, notice) {
-  const db = getDb();
-  const classRow = db.prepare("select * from classes where class_id = ?").get(classId);
+async function courseClassDeleteConfirmPage(res, user, classId, notice) {
+  const { classRow } = await dbGateway.getCourseClassDetail(classId);
   if (!classRow) {
-    db.close();
-    res.writeHead(404, { "Content-Type": "text/html; charset=utf-8" });
-    res.end(pageLayout("未找到", '<section class="card">教学班不存在。</section>', user, notice));
-    return;
+    return sendHtml(res, pageLayout("未找到", '<section class="card">教学班不存在。</section>', user, notice), {}, 404);
   }
-  const impact = classDeleteImpact(db, classId);
-  db.close();
+  const impact = await dbGateway.getClassDeleteImpact(classId);
   sendHtml(res, pageLayout("确认删除教学班", `
     <section class="card">
       <h2>确认删除教学班</h2>
@@ -5692,51 +7126,11 @@ async function batchDeleteClassesConfirmPage(req, res, user, notice) {
   `, user, notice));
 }
 
-function courseUsersPage(res, user, notice, filters = {}) {
-  const db = getDb();
+async function courseUsersPage(res, user, notice, filters = {}) {
   const roleFilter = String(filters.role || "").trim();
-  const userNameFilter = String(filters.user_name || "").trim().toLowerCase();
-  const loginNameFilter = String(filters.login_name || "").trim().toLowerCase();
-  const emailFilter = String(filters.email || "").trim().toLowerCase();
-  const taAllowedFilter = String(filters.is_allowed_to_apply || "").trim();
   const sortBy = String(filters.sort_by || "user_name");
   const sortOrder = String(filters.sort_order || "asc").toLowerCase() === "desc" ? "desc" : "asc";
-  const usersRaw = db.prepare(`
-    select u.*,
-      (select count(*) from applications a where a.applier_user_id = u.user_id) as application_count,
-      (select count(*) from classes c where (',' || c.teacher_user_id || ',') like '%,' || u.user_id || ',%') as class_count
-    from users u
-  `).all();
-  db.close();
-  const roleWeight = (role) => ({
-    CourseAdmin: 1,
-    TAAdmin: 2,
-    Professor: 3,
-    TA: 4
-  }[role] || 9);
-  const sortValueMap = {
-    user_name: (row) => String(row.user_name || "").toLowerCase(),
-    login_name: (row) => String(row.login_name || "").toLowerCase(),
-    email: (row) => String(row.email || "").toLowerCase(),
-    role: (row) => roleWeight(row.role),
-    is_allowed_to_apply: (row) => String(row.is_allowed_to_apply || ""),
-    application_count: (row) => Number(row.application_count || 0),
-    class_count: (row) => Number(row.class_count || 0)
-  };
-  const users = usersRaw
-    .filter((row) => !roleFilter || row.role === roleFilter)
-    .filter((row) => !userNameFilter || String(row.user_name || "").toLowerCase().includes(userNameFilter))
-    .filter((row) => !loginNameFilter || String(row.login_name || "").toLowerCase().includes(loginNameFilter))
-    .filter((row) => !emailFilter || String(row.email || "").toLowerCase().includes(emailFilter))
-    .filter((row) => !taAllowedFilter || String(row.is_allowed_to_apply || "") === taAllowedFilter)
-    .sort((a, b) => {
-      const getter = sortValueMap[sortBy] || sortValueMap.user_name;
-      const av = getter(a);
-      const bv = getter(b);
-      if (av < bv) return sortOrder === "asc" ? -1 : 1;
-      if (av > bv) return sortOrder === "asc" ? 1 : -1;
-      return String(a.user_name || "").localeCompare(String(b.user_name || ""), "zh-Hans-CN");
-    });
+  const users = await dbGateway.getCourseUsers(filters);
   const headerFilters = {
     user_name: filters.user_name || "",
     login_name: filters.login_name || "",
@@ -5840,18 +7234,11 @@ function courseUsersPage(res, user, notice, filters = {}) {
   `, user, notice));
 }
 
-function courseUserDetailPage(res, user, userId, notice) {
-  const db = getDb();
-  const target = db.prepare("select * from users where user_id = ?").get(userId);
+async function courseUserDetailPage(res, user, userId, notice) {
+  const { target, classes, applications } = await dbGateway.getCourseUserDetail(userId);
   if (!target) {
-    db.close();
-    res.writeHead(404, { "Content-Type": "text/html; charset=utf-8" });
-    res.end(pageLayout("未找到", '<section class="card">人员不存在。</section>', user, notice));
-    return;
+    return sendHtml(res, pageLayout("未找到", '<section class="card">人员不存在。</section>', user, notice), {}, 404);
   }
-  const classes = db.prepare("select class_code, class_name from classes where (',' || teacher_user_id || ',') like '%,' || ? || ',%' order by class_name").all(String(userId));
-  const applications = db.prepare("select application_id, class_name, status from applications where applier_user_id = ? order by application_id desc").all(userId);
-  db.close();
   const classList = classes.length
     ? `<ul>${classes.map((row) => `<li>${escapeHtml(row.class_code)} / ${escapeHtml(row.class_name)}</li>`).join("")}</ul>`
     : "<p class='muted'>当前没有授课教学班。</p>";
@@ -5888,6 +7275,21 @@ async function createCourseUser(req, res, user) {
   const body = await readBody(req);
   const role = String(body.role || "TA");
   const isAllowed = role === "TA" ? String(body.is_allowed_to_apply || "N") : "N";
+  if (DB_CLIENT === "mysql") {
+    try {
+      await dbGateway.createCourseUser(user, {
+        user_name: String(body.user_name || "").trim(),
+        login_name: String(body.login_name || "").trim(),
+        email: String(body.email || "").trim(),
+        password: String(body.password || "123456").trim(),
+        role,
+        is_allowed_to_apply: isAllowed
+      });
+    } catch (error) {
+      return redirect(res, "/course/users?notice=创建失败，登录名可能已存在");
+    }
+    return redirect(res, "/course/users?notice=人员已创建");
+  }
   const db = getDb();
   try {
     const result = db.prepare(`
@@ -5941,22 +7343,58 @@ async function importCourseUsers(req, res, user) {
   try {
     importedUsers = parseImportedUsersWorkbook(file);
   } catch (error) {
-    const failedDb = getDb();
-    createAuditLog(failedDb, {
-      actor: user,
-      actionType: "USER_IMPORT_FAILED",
-      targetType: "Import",
-      targetId: file.filename,
-      targetName: "人员导入失败",
-      details: `文件名：${file.filename}\n失败原因：${error.message}`
-    });
-    failedDb.close();
+    if (DB_CLIENT === "mysql") {
+      await dbGateway.appendAuditLog({
+        actor: user,
+        actionType: "USER_IMPORT_FAILED",
+        targetType: "Import",
+        targetId: file.filename,
+        targetName: "人员导入失败",
+        details: `文件名：${file.filename}\n失败原因：${error.message}`
+      });
+    } else {
+      const failedDb = getDb();
+      createAuditLog(failedDb, {
+        actor: user,
+        actionType: "USER_IMPORT_FAILED",
+        targetType: "Import",
+        targetId: file.filename,
+        targetName: "人员导入失败",
+        details: `文件名：${file.filename}\n失败原因：${error.message}`
+      });
+      failedDb.close();
+    }
     const reportId = saveImportReport({
       status: "failed",
       errorMessage: error.message,
       errors: error.importErrors || [error.message]
     });
     return redirect(res, `/course/users/import/result/${reportId}?notice=导入失败`);
+  }
+  if (DB_CLIENT === "mysql") {
+    try {
+      const result = await dbGateway.upsertImportedUsers(user, importedUsers, file.filename);
+      const reportId = saveImportReport({
+        status: "success",
+        ...result
+      });
+      return redirect(res, `/course/users/import/result/${reportId}?notice=导入完成`);
+    } catch (error) {
+      await dbGateway.appendAuditLog({
+        actor: user,
+        actionType: "USER_IMPORT_FAILED",
+        targetType: "Import",
+        targetId: file.filename,
+        targetName: "人员导入失败",
+        details: `文件名：${file.filename}\n失败原因：${error.message}`
+      });
+      const reportId = saveImportReport({
+        status: "failed",
+        errorMessage: error.message,
+        errors: error.importErrors || [error.message]
+      });
+      return redirect(res, `/course/users/import/result/${reportId}?notice=导入失败`);
+    }
   }
   const db = getDb();
   try {
@@ -5998,6 +7436,27 @@ async function updateCourseUser(req, res, user, userId) {
   const body = await readBody(req);
   const role = String(body.role || "TA");
   const isAllowed = role === "TA" ? String(body.is_allowed_to_apply || "N") : "N";
+  if (DB_CLIENT === "mysql") {
+    try {
+      const result = await dbGateway.updateCourseUser(user, userId, {
+        user_name: String(body.user_name || "").trim(),
+        login_name: String(body.login_name || "").trim(),
+        email: String(body.email || "").trim(),
+        password: String(body.password || "123456").trim(),
+        role,
+        is_allowed_to_apply: isAllowed
+      });
+      if (result?.notFound) {
+        return redirect(res, "/course/users?notice=人员不存在");
+      }
+      if (result?.roleConflict) {
+        return redirect(res, `/course/users/${userId}?notice=该用户已关联教学班，不能改为非 Professor`);
+      }
+    } catch (error) {
+      return redirect(res, `/course/users/${userId}?notice=更新失败，登录名可能已存在`);
+    }
+    return redirect(res, `/course/users/${userId}?notice=人员信息已更新`);
+  }
   const db = getDb();
   const target = db.prepare("select * from users where user_id = ?").get(userId);
   if (!target) {
@@ -6048,7 +7507,21 @@ async function updateCourseUser(req, res, user, userId) {
   redirect(res, `/course/users/${userId}?notice=人员信息已更新`);
 }
 
-function deleteCourseUser(res, user, userId) {
+async function deleteCourseUser(res, user, userId) {
+  if (DB_CLIENT === "mysql") {
+    try {
+      const result = await dbGateway.deleteCourseUser(user, userId);
+      if (result?.notFound) {
+        return redirect(res, "/course/users?notice=人员不存在");
+      }
+      if (result?.blocked) {
+        return redirect(res, "/course/users?notice=该用户已有关联业务数据，当前不允许删除");
+      }
+    } catch (error) {
+      return redirect(res, "/course/users?notice=删除失败");
+    }
+    return redirect(res, "/course/users?notice=人员已删除");
+  }
   const db = getDb();
   const target = db.prepare("select * from users where user_id = ?").get(userId);
   if (!target) {
@@ -6081,29 +7554,55 @@ async function createClass(req, res, user) {
   const isConflictAllowed = String(body.is_conflict_allowed || "N");
   let applyStartAt;
   let applyEndAt;
-  const db = getDb();
   if (!["Y", "N"].includes(isConflictAllowed)) {
-    db.close();
     return redirect(res, "/course/classes?notice=允许冲突申请取值不合法");
   }
   let professorSelection;
-  try {
-    professorSelection = resolveProfessorSelection(db, body.teacher_user_id);
-  } catch (error) {
-    db.close();
-    return redirect(res, `/course/classes?notice=${error.message}`);
-  }
   try {
     applyStartAt = normalizeDateTimeInput(body.apply_start_at);
     applyEndAt = normalizeDateTimeInput(body.apply_end_at);
     validateApplyWindow(applyStartAt, applyEndAt);
   } catch (error) {
-    db.close();
     return redirect(res, `/course/classes?notice=${error.message}`);
   }
   let scheduleRows;
   try {
     scheduleRows = parseScheduleLines(body.schedule_lines);
+  } catch (error) {
+    return redirect(res, `/course/classes?notice=${error.message}`);
+  }
+  if (DB_CLIENT === "mysql") {
+    try {
+      professorSelection = await resolveProfessorSelectionGateway(body.teacher_user_id);
+    } catch (error) {
+      return redirect(res, `/course/classes?notice=${error.message}`);
+    }
+    try {
+      await dbGateway.createCourseClass(user, {
+        class_code: String(body.class_code || "").trim(),
+        class_abbr: String(body.class_abbr || body.class_code || "").trim(),
+        class_name: String(body.class_name || "").trim(),
+        course_name: String(body.course_name || "").trim(),
+        teaching_language: String(body.teaching_language || "中文"),
+        teacher_user_id: professorSelection.idText,
+        teacher_name: professorSelection.nameText,
+        class_intro: String(body.class_intro || "").trim(),
+        memo: String(body.memo || "").trim(),
+        maximum_number_of_tas_admitted: maximumNumber,
+        ta_applications_allowed: String(body.ta_allowed || "Y"),
+        is_conflict_allowed: isConflictAllowed,
+        apply_start_at: applyStartAt,
+        apply_end_at: applyEndAt,
+        semester: String(body.semester || "").trim()
+      }, scheduleRows);
+    } catch (error) {
+      return redirect(res, "/course/classes?notice=ClassCode 已存在或字段非法");
+    }
+    return redirect(res, "/course/classes?notice=教学班已创建");
+  }
+  const db = getDb();
+  try {
+    professorSelection = resolveProfessorSelection(db, body.teacher_user_id);
   } catch (error) {
     db.close();
     return redirect(res, `/course/classes?notice=${error.message}`);
@@ -6187,22 +7686,58 @@ async function importClasses(req, res, user) {
   try {
     importedClasses = parseImportedClassesWorkbook(file);
   } catch (error) {
-    const failedDb = getDb();
-    createAuditLog(failedDb, {
-      actor: user,
-      actionType: "CLASS_IMPORT_FAILED",
-      targetType: "Import",
-      targetId: file.filename,
-      targetName: "教学班导入失败",
-      details: `文件名：${file.filename}\n失败原因：${error.message}`
-    });
-    failedDb.close();
+    if (DB_CLIENT === "mysql") {
+      await dbGateway.appendAuditLog({
+        actor: user,
+        actionType: "CLASS_IMPORT_FAILED",
+        targetType: "Import",
+        targetId: file.filename,
+        targetName: "教学班导入失败",
+        details: `文件名：${file.filename}\n失败原因：${error.message}`
+      });
+    } else {
+      const failedDb = getDb();
+      createAuditLog(failedDb, {
+        actor: user,
+        actionType: "CLASS_IMPORT_FAILED",
+        targetType: "Import",
+        targetId: file.filename,
+        targetName: "教学班导入失败",
+        details: `文件名：${file.filename}\n失败原因：${error.message}`
+      });
+      failedDb.close();
+    }
     const reportId = saveImportReport({
       status: "failed",
       errorMessage: error.message,
       errors: error.importErrors || [error.message]
     });
     return redirect(res, `/course/classes/import/result/${reportId}?notice=导入失败`);
+  }
+  if (DB_CLIENT === "mysql") {
+    try {
+      const result = await dbGateway.upsertImportedClasses(user, importedClasses, file.filename);
+      const reportId = saveImportReport({
+        status: "success",
+        ...result
+      });
+      return redirect(res, `/course/classes/import/result/${reportId}?notice=导入完成`);
+    } catch (error) {
+      await dbGateway.appendAuditLog({
+        actor: user,
+        actionType: "CLASS_IMPORT_FAILED",
+        targetType: "Import",
+        targetId: file.filename,
+        targetName: "教学班导入失败",
+        details: `文件名：${file.filename}\n失败原因：${error.message}`
+      });
+      const reportId = saveImportReport({
+        status: "failed",
+        errorMessage: error.message,
+        errors: error.importErrors || [error.message]
+      });
+      return redirect(res, `/course/classes/import/result/${reportId}?notice=导入失败`);
+    }
   }
   const db = getDb();
   try {
@@ -6246,34 +7781,64 @@ async function updateClass(req, res, user, classId) {
   const isConflictAllowed = String(body.is_conflict_allowed || "N");
   let applyStartAt;
   let applyEndAt;
-  const db = getDb();
-  const currentClass = db.prepare("select * from classes where class_id = ?").get(classId);
-  if (!currentClass) {
-    db.close();
-    return redirect(res, "/course/classes?notice=教学班不存在");
-  }
   if (!["Y", "N"].includes(isConflictAllowed)) {
-    db.close();
     return redirect(res, `/course/classes/${classId}?notice=允许冲突申请取值不合法`);
-  }
-  let professorSelection;
-  try {
-    professorSelection = resolveProfessorSelection(db, body.teacher_user_id);
-  } catch (error) {
-    db.close();
-    return redirect(res, `/course/classes/${classId}?notice=${error.message}`);
   }
   try {
     applyStartAt = normalizeDateTimeInput(body.apply_start_at);
     applyEndAt = normalizeDateTimeInput(body.apply_end_at);
     validateApplyWindow(applyStartAt, applyEndAt);
   } catch (error) {
-    db.close();
     return redirect(res, `/course/classes/${classId}?notice=${error.message}`);
   }
   let scheduleRows;
   try {
     scheduleRows = parseScheduleLines(body.schedule_lines);
+  } catch (error) {
+    return redirect(res, `/course/classes/${classId}?notice=${error.message}`);
+  }
+  if (DB_CLIENT === "mysql") {
+    let professorSelection;
+    try {
+      professorSelection = await resolveProfessorSelectionGateway(body.teacher_user_id);
+    } catch (error) {
+      return redirect(res, `/course/classes/${classId}?notice=${error.message}`);
+    }
+    try {
+      const result = await dbGateway.updateCourseClass(user, classId, {
+        class_code: String(body.class_code || "").trim(),
+        class_abbr: String(body.class_abbr || body.class_code || "").trim(),
+        class_name: String(body.class_name || "").trim(),
+        course_name: String(body.course_name || "").trim(),
+        teaching_language: String(body.teaching_language || "中文"),
+        teacher_user_id: professorSelection.idText,
+        teacher_name: professorSelection.nameText,
+        class_intro: String(body.class_intro || "").trim(),
+        memo: String(body.memo || "").trim(),
+        maximum_number_of_tas_admitted: maximumNumber,
+        ta_applications_allowed: String(body.ta_allowed || "Y"),
+        is_conflict_allowed: isConflictAllowed,
+        apply_start_at: applyStartAt,
+        apply_end_at: applyEndAt,
+        semester: String(body.semester || "").trim()
+      }, scheduleRows);
+      if (result?.notFound) {
+        return redirect(res, "/course/classes?notice=教学班不存在");
+      }
+    } catch (error) {
+      return redirect(res, `/course/classes/${classId}?notice=更新失败，ClassCode 可能已存在`);
+    }
+    return redirect(res, `/course/classes/${classId}?notice=教学班已更新`);
+  }
+  const db = getDb();
+  const currentClass = db.prepare("select * from classes where class_id = ?").get(classId);
+  if (!currentClass) {
+    db.close();
+    return redirect(res, "/course/classes?notice=教学班不存在");
+  }
+  let professorSelection;
+  try {
+    professorSelection = resolveProfessorSelection(db, body.teacher_user_id);
   } catch (error) {
     db.close();
     return redirect(res, `/course/classes/${classId}?notice=${error.message}`);
@@ -6347,6 +7912,13 @@ async function batchUpdateClassWindow(req, res, user) {
   if (!refs.length) {
     return redirect(res, "/course/classes?notice=请填写至少一个教学班 ID 或 ClassCode");
   }
+  if (DB_CLIENT === "mysql") {
+    const result = await dbGateway.batchUpdateCourseClassWindow(user, refs, applyStartAt, applyEndAt);
+    if (result.changed === 0) {
+      return redirect(res, "/course/classes?notice=未匹配到任何教学班");
+    }
+    return redirect(res, `/course/classes?notice=已批量更新 ${result.changed} 个教学班的开放申请时间`);
+  }
   const db = getDb();
   const updateStmt = db.prepare(`
     update classes
@@ -6387,6 +7959,13 @@ async function batchToggleClassApply(req, res, user) {
   if (!refs.length) {
     return redirect(res, "/course/classes?notice=请填写至少一个教学班 ID 或 ClassCode");
   }
+  if (DB_CLIENT === "mysql") {
+    const result = await dbGateway.batchToggleCourseClassApply(user, refs, taAllowed);
+    if (result.changed === 0) {
+      return redirect(res, "/course/classes?notice=未匹配到任何教学班");
+    }
+    return redirect(res, `/course/classes?notice=已批量更新 ${result.changed} 个教学班的申请权限`);
+  }
   const db = getDb();
   const updateStmt = db.prepare(`
     update classes
@@ -6425,6 +8004,9 @@ function deleteClassesByIds(classIds, actor = null) {
   ));
   if (!ids.length) {
     return { deletedCount: 0 };
+  }
+  if (DB_CLIENT === "mysql") {
+    throw new Error("deleteClassesByIds must use deleteClassesByIdsAsync in mysql mode");
   }
   const db = getDb();
   const selectApps = db.prepare("select application_id, resume_path from applications where class_id = ?");
@@ -6466,8 +8048,21 @@ function deleteClassesByIds(classIds, actor = null) {
   return { deletedCount };
 }
 
-function deleteClass(res, user, classId) {
-  const result = deleteClassesByIds([classId], user);
+async function deleteClassesByIdsAsync(classIds, actor = null) {
+  if (DB_CLIENT === "mysql") {
+    const result = await dbGateway.deleteCourseClasses(actor, classIds);
+    for (const filePath of result.filesToDelete || []) {
+      if (fs.existsSync(filePath)) {
+        fs.unlinkSync(filePath);
+      }
+    }
+    return { deletedCount: result.deletedCount || 0 };
+  }
+  return deleteClassesByIds(classIds, actor);
+}
+
+async function deleteClass(res, user, classId) {
+  const result = await deleteClassesByIdsAsync([classId], user);
   if (result.deletedCount === 0) {
     return redirect(res, "/course/classes?notice=教学班不存在");
   }
@@ -6480,13 +8075,18 @@ async function batchDeleteClasses(req, res, user) {
   if (!refs.length) {
     return redirect(res, "/course/classes?notice=请先勾选至少一个教学班");
   }
-  const db = getDb();
-  const classRows = loadClassRowsByRefs(db, refs);
-  db.close();
+  let classRows;
+  if (DB_CLIENT === "mysql") {
+    classRows = await dbGateway.getClassRowsByRefs(refs);
+  } else {
+    const db = getDb();
+    classRows = loadClassRowsByRefs(db, refs);
+    db.close();
+  }
   if (!classRows.length) {
     return redirect(res, "/course/classes?notice=未匹配到任何教学班");
   }
-  const result = deleteClassesByIds(classRows.map((row) => row.class_id), user);
+  const result = await deleteClassesByIdsAsync(classRows.map((row) => row.class_id), user);
   if (result.deletedCount === 0) {
     return redirect(res, "/course/classes?notice=未删除任何教学班");
   }
@@ -6498,7 +8098,7 @@ async function handleRequest(req, res) {
   const url = new URL(req.url, `http://${req.headers.host}`);
   const pathname = url.pathname;
   const notice = url.searchParams.get("notice");
-  const user = getCurrentUser(req);
+  const user = await getCurrentUser(req);
 
   if (pathname.startsWith("/assets/")) {
     const fileName = path.basename(decodeURIComponent(pathname.replace("/assets/", "")));
@@ -6549,9 +8149,7 @@ async function handleRequest(req, res) {
 
   if (pathname === "/login" && req.method === "POST") {
     const body = await readBody(req);
-    const db = getDb();
-    const row = db.prepare("select * from users where login_name = ? and password = ?").get(String(body.login_name || ""), String(body.password || ""));
-    db.close();
+    const row = await dbGateway.findUserByLoginAndPassword(String(body.login_name || ""), String(body.password || ""));
     if (!row) {
       return loginPage(res, "账号或密码错误");
     }
@@ -6670,6 +8268,15 @@ async function handleRequest(req, res) {
       has_pending: url.searchParams.get("has_pending") || ""
     });
   }
+  if (pathname === "/admin/ta/classes/ta-export") {
+    if (!requireRole(res, user, ["TAAdmin"])) return;
+    return taAdminClassTaExport(res, {
+      professor_name: url.searchParams.get("professor_name") || "",
+      class_name: url.searchParams.get("class_name") || "",
+      ta_full: url.searchParams.get("ta_full") || "",
+      has_pending: url.searchParams.get("has_pending") || ""
+    });
+  }
   if (/^\/admin\/ta\/classes\/\d+\/applications$/.test(pathname)) {
     if (!requireRole(res, user, ["TAAdmin"])) return;
     return taAdminClassApplicationsPage(res, user, Number(pathname.split("/")[4]), notice);
@@ -6740,11 +8347,34 @@ async function handleRequest(req, res) {
       sort_order: url.searchParams.get("sort_order") || "asc"
     });
   }
+  if (pathname === "/course/classes/ta-export") {
+    if (!requireRole(res, user, ["CourseAdmin"])) return;
+    return courseClassTaExport(res, {
+      class_code: url.searchParams.get("class_code") || "",
+      class_name: url.searchParams.get("class_name") || "",
+      teacher_name: url.searchParams.get("teacher_name") || "",
+      ta_full: url.searchParams.get("ta_full") || "",
+      status_filter: url.searchParams.get("status_filter") || "",
+      sort_by: url.searchParams.get("sort_by") || "class_code",
+      sort_order: url.searchParams.get("sort_order") || "asc"
+    });
+  }
   if (pathname === "/course/reports") {
     if (!requireRole(res, user, ["CourseAdmin"])) return;
     return courseReportsPage(res, user, notice, {
       submitted_from: url.searchParams.get("submitted_from") || "",
-      submitted_to: url.searchParams.get("submitted_to") || ""
+      submitted_to: url.searchParams.get("submitted_to") || "",
+      semester: url.searchParams.get("semester") || "",
+      teacher_name: url.searchParams.get("teacher_name") || ""
+    });
+  }
+  if (pathname === "/course/reports/export") {
+    if (!requireRole(res, user, ["CourseAdmin"])) return;
+    return courseReportsExport(res, {
+      submitted_from: url.searchParams.get("submitted_from") || "",
+      submitted_to: url.searchParams.get("submitted_to") || "",
+      semester: url.searchParams.get("semester") || "",
+      teacher_name: url.searchParams.get("teacher_name") || ""
     });
   }
   if (pathname === "/course/audit-logs") {
@@ -6950,23 +8580,29 @@ async function handleRequest(req, res) {
     return deleteCourseUser(res, user, Number(pathname.split("/")[3]));
   }
 
-  res.writeHead(404, { "Content-Type": "text/html; charset=utf-8" });
-  res.end(pageLayout("未找到", '<section class="card">页面不存在。</section>', user, notice));
+  return sendHtml(res, pageLayout("未找到", '<section class="card">页面不存在。</section>', user, notice), {}, 404);
 }
 
 initDb();
 const server = http.createServer((req, res) => {
   handleRequest(req, res).catch((error) => {
     fs.writeFileSync(path.join(BASE_DIR, "server-error.log"), `${nowStr()} ${error.stack}\n`, { flag: "a" });
-    res.writeHead(500, { "Content-Type": "text/html; charset=utf-8" });
-    res.end(pageLayout("错误", `<section class="card"><h2>服务异常</h2><pre>${escapeHtml(error.stack)}</pre></section>`, getCurrentUser(req)));
+    sendHtml(res, getCurrentUser(req).then((user) =>
+      pageLayout("错误", `<section class="card"><h2>服务异常</h2><pre>${escapeHtml(error.stack)}</pre></section>`, user)
+    ), {}, 500);
   });
 });
 
 if (require.main === module) {
-server.listen(PORT, HOST, () => {
-  console.log(`TA system MVP running at http://${HOST}:${PORT}`);
-});
+  server.listen(PORT, HOST, () => {
+    console.log(`TA system MVP running at http://${HOST}:${PORT}`);
+    if (DB_CLIENT === "mysql") {
+      console.log("[db] 默认数据库：MySQL。当前主流程、管理主链、报表、审计与导入已切换到 MySQL。");
+      console.log("[db] 如需临时回退 SQLite，可在启动前显式设置 DB_CLIENT=sqlite。");
+    } else {
+      console.log("[db] 当前显式使用 SQLite 兼容模式运行。");
+    }
+  });
 }
 
 module.exports = { initDb, handleRequest, server };
