@@ -42,6 +42,23 @@ function formatDateTime(date) {
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
 }
 
+function normalizeDisplayDate(value) {
+  if (!value) return "";
+  if (value instanceof Date && !Number.isNaN(value.getTime())) {
+    return formatDateTime(value).slice(0, 10);
+  }
+  const raw = String(value).trim();
+  if (!raw) return "";
+  if (/^\d{4}-\d{2}-\d{2}/.test(raw)) {
+    return raw.slice(0, 10);
+  }
+  const parsed = new Date(raw);
+  if (!Number.isNaN(parsed.getTime())) {
+    return formatDateTime(parsed).slice(0, 10);
+  }
+  return raw.slice(0, 10);
+}
+
 function isClassOpenForApply(classRow) {
   if (!classRow || classRow.ta_applications_allowed !== "Y") return false;
   if (!classRow.apply_start_at || !classRow.apply_end_at) return false;
@@ -87,8 +104,8 @@ function getBlockingConflicts(applications, classMetaById, schedulesByClass, cla
     const matches = [];
     for (const t of target) {
       for (const e of existing) {
-        if (t.lesson_date === e.lesson_date && hasTimeConflict(t.start_time, t.end_time, e.start_time, e.end_time)) {
-          matches.push(`${t.lesson_date} ${t.start_time}-${t.end_time} vs ${e.start_time}-${e.end_time}`);
+        if (normalizeDisplayDate(t.lesson_date) === normalizeDisplayDate(e.lesson_date) && hasTimeConflict(t.start_time, t.end_time, e.start_time, e.end_time)) {
+          matches.push(`${normalizeDisplayDate(t.lesson_date)} ${t.start_time}-${t.end_time} vs ${e.start_time}-${e.end_time}`);
         }
       }
     }
@@ -107,7 +124,8 @@ async function getTaClassesSnapshot(taUserId) {
   if (DB_CLIENT === "mysql") {
     const classes = await mysqlDb.query(`
       select c.*,
-        (select count(*) from applications a where a.class_id = c.class_id and a.status = 'Approved') as approved_count
+        (select count(*) from applications a where a.class_id = c.class_id and a.status = 'Approved') as approved_count,
+        (select count(*) from applications a where a.class_id = c.class_id and a.status = 'PendingTAAdmin') as pending_taadmin_count
       from classes c
       where c.ta_applications_allowed = 'Y'
       order by c.semester, c.course_name, c.class_name
@@ -141,7 +159,8 @@ async function getTaClassesSnapshot(taUserId) {
   try {
     const classes = db.prepare(`
       select c.*,
-        (select count(*) from applications a where a.class_id = c.class_id and a.status = 'Approved') as approved_count
+        (select count(*) from applications a where a.class_id = c.class_id and a.status = 'Approved') as approved_count,
+        (select count(*) from applications a where a.class_id = c.class_id and a.status = 'PendingTAAdmin') as pending_taadmin_count
       from classes c
       where c.ta_applications_allowed = 'Y'
       order by c.semester, c.course_name, c.class_name
@@ -274,7 +293,7 @@ async function createTaApplication(user, classId, reason, submittedAt) {
       "Application",
       String(applicationId),
       `${classRow.course_name} / ${classRow.class_name}`,
-      `申请人：${user.user_name}\n教学班：${classRow.class_name}\n教授：${classRow.teacher_name}\n申请原因：${reason}`,
+      `申请人：${user.user_name}\n教学班：${classRow.class_name}\n教授：${classRow.teacher_name}${reason ? `\n申请原因：${reason}` : ""}`,
       submittedAt
     ]);
 
@@ -336,6 +355,27 @@ async function getApplicationConflicts(applierUserId, classId) {
     const classMeta = db.prepare("select class_id, class_code, class_name, course_name, teacher_name, is_conflict_allowed from classes").all();
     const schedules = db.prepare("select * from class_schedules order by lesson_date, start_time").all();
     return getBlockingConflicts(applications, buildClassMetaById(classMeta), buildSchedulesByClass(schedules), classId);
+  } finally {
+    db.close();
+  }
+}
+
+async function updateTaResume(userId, resumeName, resumePath) {
+  if (DB_CLIENT === "mysql") {
+    return mysqlDb.withTransaction(async (conn) => {
+      const [currentRows] = await conn.execute("select resume_path from users where user_id = ?", [userId]);
+      const current = currentRows[0] || null;
+      await conn.execute("update users set resume_name = ?, resume_path = ? where user_id = ?", [resumeName, resumePath, userId]);
+      await conn.execute("update applications set resume_name = ?, resume_path = ? where applier_user_id = ?", [resumeName, resumePath, userId]);
+      return { previousResumePath: current?.resume_path || "" };
+    });
+  }
+  const db = getSqliteDb();
+  try {
+    const current = db.prepare("select resume_path from users where user_id = ?").get(userId);
+    db.prepare("update users set resume_name = ?, resume_path = ? where user_id = ?").run(resumeName, resumePath, userId);
+    db.prepare("update applications set resume_name = ?, resume_path = ? where applier_user_id = ?").run(resumeName, resumePath, userId);
+    return { previousResumePath: current?.resume_path || "" };
   } finally {
     db.close();
   }
@@ -573,6 +613,18 @@ async function findUserById(userId) {
   }
 }
 
+async function findUserByLoginName(loginName) {
+  if (DB_CLIENT === "mysql") {
+    return mysqlDb.one("select * from users where login_name = ?", [String(loginName || "")]);
+  }
+  const db = getSqliteDb();
+  try {
+    return db.prepare("select * from users where login_name = ?").get(String(loginName || "")) ?? null;
+  } finally {
+    db.close();
+  }
+}
+
 async function findUnusedLoginToken(token) {
   if (DB_CLIENT === "mysql") {
     return mysqlDb.one("select * from login_tokens where token = ? and used_at is null", [token]);
@@ -609,6 +661,37 @@ async function unreadNotificationCountByUser(userId) {
   try {
     const row = db.prepare("select count(*) as count from notifications where user_id = ? and is_read = 'N'").get(userId);
     return Number(row?.count || 0);
+  } finally {
+    db.close();
+  }
+}
+
+async function getNotificationsByUser(userId) {
+  if (DB_CLIENT === "mysql") {
+    return mysqlDb.query(
+      "select * from notifications where user_id = ? order by created_at desc, notification_id desc",
+      [userId]
+    );
+  }
+  const db = getSqliteDb();
+  try {
+    return db.prepare("select * from notifications where user_id = ? order by created_at desc, notification_id desc").all(userId);
+  } finally {
+    db.close();
+  }
+}
+
+async function markNotificationReadById(notificationId, userId) {
+  if (DB_CLIENT === "mysql") {
+    await mysqlDb.execute(
+      "update notifications set is_read = 'Y' where notification_id = ? and user_id = ?",
+      [notificationId, userId]
+    );
+    return;
+  }
+  const db = getSqliteDb();
+  try {
+    db.prepare("update notifications set is_read = 'Y' where notification_id = ? and user_id = ?").run(notificationId, userId);
   } finally {
     db.close();
   }
@@ -659,6 +742,195 @@ async function getAllApplications() {
   const db = getSqliteDb();
   try {
     return db.prepare("select * from applications order by submitted_at desc, application_id desc").all();
+  } finally {
+    db.close();
+  }
+}
+
+async function getTaUsersManagementRows() {
+  if (DB_CLIENT === "mysql") {
+    return mysqlDb.query(`
+      select u.*,
+        (select count(*) from applications a where a.applier_user_id = u.user_id) as application_count,
+        (select count(*) from applications a where a.applier_user_id = u.user_id and a.status = 'Approved') as approved_count
+      from users u
+      where u.role = 'TA'
+      order by u.user_name, u.user_id
+    `);
+  }
+  const db = getSqliteDb();
+  try {
+    return db.prepare(`
+      select u.*,
+        (select count(*) from applications a where a.applier_user_id = u.user_id) as application_count,
+        (select count(*) from applications a where a.applier_user_id = u.user_id and a.status = 'Approved') as approved_count
+      from users u
+      where u.role = 'TA'
+      order by u.user_name, u.user_id
+    `).all();
+  } finally {
+    db.close();
+  }
+}
+
+async function toggleTaUserApplyQualification(actor, userId) {
+  if (DB_CLIENT === "mysql") {
+    return mysqlDb.withTransaction(async (conn) => {
+      const [rows] = await conn.execute("select * from users where user_id = ? and role = 'TA'", [userId]);
+      const row = rows[0] || null;
+      if (!row) return { ok: false, notice: "TA 不存在" };
+      const nextValue = row.is_allowed_to_apply === "Y" ? "N" : "Y";
+      await conn.execute("update users set is_allowed_to_apply = ? where user_id = ?", [nextValue, userId]);
+      await conn.execute(`
+        insert into audit_logs (
+          actor_user_id, actor_name, actor_role, action_type, target_type, target_id, target_name, details, created_at
+        ) values (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `, [
+        actor.user_id,
+        actor.user_name,
+        actor.role,
+        "TA_TOGGLE_APPLY_QUALIFICATION",
+        "User",
+        String(userId),
+        row.user_name,
+        `登录名：${row.login_name}\n新允许申请状态：${nextValue}`,
+        nowMinuteStr() + ":00"
+      ]);
+      return { ok: true, notice: "TA 资格已更新" };
+    });
+  }
+  const db = getSqliteDb();
+  try {
+    const row = db.prepare("select * from users where user_id = ? and role = 'TA'").get(userId);
+    if (!row) return { ok: false, notice: "TA 不存在" };
+    const nextValue = row.is_allowed_to_apply === "Y" ? "N" : "Y";
+    db.prepare("update users set is_allowed_to_apply = ? where user_id = ?").run(nextValue, userId);
+    db.prepare(`
+      insert into audit_logs (
+        actor_user_id, actor_name, actor_role, action_type, target_type, target_id, target_name, details, created_at
+      ) values (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      actor.user_id,
+      actor.user_name,
+      actor.role,
+      "TA_TOGGLE_APPLY_QUALIFICATION",
+      "User",
+      String(userId),
+      row.user_name,
+      `登录名：${row.login_name}\n新允许申请状态：${nextValue}`,
+      nowMinuteStr() + ":00"
+    );
+    return { ok: true, notice: "TA 资格已更新" };
+  } finally {
+    db.close();
+  }
+}
+
+async function getTaApplications(applierUserId) {
+  if (DB_CLIENT === "mysql") {
+    return mysqlDb.query(
+      `select a.*, c.credit as class_credit
+       from applications a
+       left join classes c on c.class_id = a.class_id
+       where a.applier_user_id = ?
+       order by a.submitted_at desc, a.application_id desc`,
+      [applierUserId]
+    );
+  }
+  const db = getSqliteDb();
+  try {
+    return db.prepare(`
+      select a.*, c.credit as class_credit
+      from applications a
+      left join classes c on c.class_id = a.class_id
+      where a.applier_user_id = ?
+      order by a.submitted_at desc, a.application_id desc
+    `).all(applierUserId);
+  } finally {
+    db.close();
+  }
+}
+
+async function getTaApplicationDetail(applicationId, applierUserId) {
+  if (DB_CLIENT === "mysql") {
+    const [app, logs, auditRows] = await Promise.all([
+      mysqlDb.one("select * from applications where application_id = ? and applier_user_id = ?", [applicationId, applierUserId]),
+      mysqlDb.query("select * from approval_logs where application_id = ? order by acted_at, approval_log_id", [applicationId]),
+      getApplicationAuditRows(applicationId)
+    ]);
+    return { app, logs, auditRows };
+  }
+  const db = getSqliteDb();
+  try {
+    const app = db.prepare("select * from applications where application_id = ? and applier_user_id = ?").get(applicationId, applierUserId) ?? null;
+    const logs = app ? db.prepare("select * from approval_logs where application_id = ? order by acted_at, approval_log_id").all(applicationId) : [];
+    const auditRows = app ? db.prepare(`
+      select created_at, actor_name, actor_role, action_type, target_name, details
+      from audit_logs
+      where target_type = 'Application' and target_id = ?
+      order by created_at, audit_log_id
+    `).all(String(applicationId)) : [];
+    return { app, logs, auditRows };
+  } finally {
+    db.close();
+  }
+}
+
+async function withdrawTaApplication(user, applicationId) {
+  if (DB_CLIENT === "mysql") {
+    return mysqlDb.withTransaction(async (conn) => {
+      const [rows] = await conn.execute(
+        "select * from applications where application_id = ? and applier_user_id = ?",
+        [applicationId, user.user_id]
+      );
+      const app = rows[0] || null;
+      if (!app) {
+        return { ok: false, notice: "申请不存在" };
+      }
+      if (app.status !== "PendingTAAdmin") {
+        return { ok: false, notice: "当前状态不可撤销" };
+      }
+      await conn.execute("update applications set status = 'Withdrawn' where application_id = ?", [applicationId]);
+      await conn.execute(`
+        insert into audit_logs (
+          actor_user_id, actor_name, actor_role, action_type, target_type, target_id, target_name, details, created_at
+        ) values (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `, [
+        user.user_id,
+        user.user_name,
+        user.role,
+        "TA_WITHDRAW",
+        "Application",
+        String(applicationId),
+        app.class_name,
+        `申请人：${app.applier_name}\n原状态：${app.status}\n操作结果：已撤销`,
+        nowMinuteStr() + ":00"
+      ]);
+      return { ok: true };
+    });
+  }
+  const db = getSqliteDb();
+  try {
+    const app = db.prepare("select * from applications where application_id = ? and applier_user_id = ?").get(applicationId, user.user_id);
+    if (!app) return { ok: false, notice: "申请不存在" };
+    if (app.status !== "PendingTAAdmin") return { ok: false, notice: "当前状态不可撤销" };
+    db.prepare("update applications set status = 'Withdrawn' where application_id = ?").run(applicationId);
+    db.prepare(`
+      insert into audit_logs (
+        actor_user_id, actor_name, actor_role, action_type, target_type, target_id, target_name, details, created_at
+      ) values (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      user.user_id,
+      user.user_name,
+      user.role,
+      "TA_WITHDRAW",
+      "Application",
+      String(applicationId),
+      app.class_name,
+      `申请人：${app.applier_name}\n原状态：${app.status}\n操作结果：已撤销`,
+      nowMinuteStr() + ":00"
+    );
+    return { ok: true };
   } finally {
     db.close();
   }
@@ -772,12 +1044,11 @@ async function getTaAdminClassRows(filters = {}) {
       order by c.semester, c.course_name, c.class_name
     `);
     for (const row of rowsRaw) {
-      if (Number(row.approved_count || 0) >= Number(row.maximum_number_of_tas_admitted || 0) && row.ta_applications_allowed !== "N") {
+      if (row.published_to_professor === "Y") {
         row.ta_applications_allowed = "N";
       }
-      if (Number(row.pending_taadmin_count || 0) > 0 && row.published_to_professor === "Y") {
-        row.published_to_professor = "N";
-        row.professor_notified_at = null;
+      if (Number(row.approved_count || 0) >= Number(row.maximum_number_of_tas_admitted || 0) && row.ta_applications_allowed !== "N") {
+        row.ta_applications_allowed = "N";
       }
     }
     return rowsRaw.filter((row) => {
@@ -804,12 +1075,11 @@ async function getTaAdminClassRows(filters = {}) {
       order by c.semester, c.course_name, c.class_name
     `).all();
     for (const row of rowsRaw) {
-      if (Number(row.approved_count || 0) >= Number(row.maximum_number_of_tas_admitted || 0) && row.ta_applications_allowed !== "N") {
+      if (row.published_to_professor === "Y") {
         row.ta_applications_allowed = "N";
       }
-      if (Number(row.pending_taadmin_count || 0) > 0 && row.published_to_professor === "Y") {
-        row.published_to_professor = "N";
-        row.professor_notified_at = null;
+      if (Number(row.approved_count || 0) >= Number(row.maximum_number_of_tas_admitted || 0) && row.ta_applications_allowed !== "N") {
+        row.ta_applications_allowed = "N";
       }
     }
     return rowsRaw.filter((row) => {
@@ -893,8 +1163,8 @@ async function updateProfessorPublishStatus(actor, classRows, nextValue, actedAt
     return mysqlDb.withTransaction(async (conn) => {
       for (const row of rows) {
         await conn.execute(
-          "update classes set published_to_professor = ?, professor_notified_at = ? where class_id = ?",
-          [nextValue, nextValue === "Y" ? actedAt : null, row.class_id]
+          "update classes set published_to_professor = ?, professor_notified_at = ?, ta_applications_allowed = case when ? = 'Y' then 'N' else ta_applications_allowed end where class_id = ?",
+          [nextValue, nextValue === "Y" ? actedAt : null, nextValue, row.class_id]
         );
         await conn.execute(`
           insert into audit_logs (
@@ -915,9 +1185,9 @@ async function updateProfessorPublishStatus(actor, classRows, nextValue, actedAt
   }
   const db = getSqliteDb();
   try {
-    const updateStmt = db.prepare("update classes set published_to_professor = ?, professor_notified_at = ? where class_id = ?");
+    const updateStmt = db.prepare("update classes set published_to_professor = ?, professor_notified_at = ?, ta_applications_allowed = case when ? = 'Y' then 'N' else ta_applications_allowed end where class_id = ?");
     for (const row of rows) {
-      updateStmt.run(nextValue, nextValue === "Y" ? actedAt : null, row.class_id);
+      updateStmt.run(nextValue, nextValue === "Y" ? actedAt : null, nextValue, row.class_id);
       db.prepare(`
         insert into audit_logs (
           actor_user_id, actor_name, actor_role, action_type, target_type, target_id, target_name, details, created_at
@@ -945,7 +1215,7 @@ async function markClassesPublishedToProfessor(actor, classRows, professorSummar
     return mysqlDb.withTransaction(async (conn) => {
       for (const row of rows) {
         await conn.execute(
-          "update classes set published_to_professor = 'Y', professor_notified_at = ? where class_id = ?",
+          "update classes set published_to_professor = 'Y', professor_notified_at = ?, ta_applications_allowed = 'N' where class_id = ?",
           [actedAt, row.class_id]
         );
         await conn.execute(`
@@ -973,7 +1243,7 @@ async function markClassesPublishedToProfessor(actor, classRows, professorSummar
   }
   const db = getSqliteDb();
   try {
-    const updateStmt = db.prepare("update classes set published_to_professor = 'Y', professor_notified_at = ? where class_id = ?");
+    const updateStmt = db.prepare("update classes set published_to_professor = 'Y', professor_notified_at = ?, ta_applications_allowed = 'N' where class_id = ?");
     for (const row of rows) {
       updateStmt.run(actedAt, row.class_id);
       db.prepare(`
@@ -1000,6 +1270,37 @@ async function markClassesPublishedToProfessor(actor, classRows, professorSummar
   } finally {
     db.close();
   }
+}
+
+async function batchUpdateCourseClassConflict(actor, refs, isConflictAllowed) {
+  const rows = await getClassRowsByRefs(refs);
+  if (!rows.length) return { changed: 0, changedRows: [] };
+  if (DB_CLIENT === "mysql") {
+    return mysqlDb.withTransaction(async (conn) => {
+      for (const row of rows) {
+        await conn.execute(`
+          update classes
+          set is_conflict_allowed = ?
+          where class_id = ?
+        `, [isConflictAllowed, row.class_id]);
+        await conn.execute(`
+          insert into audit_logs (
+            actor_user_id, actor_name, actor_role, action_type, target_type, target_id, target_name, details, created_at
+          ) values (?, ?, ?, 'CLASS_CONFLICT_TOGGLE', 'Class', ?, ?, ?, ?)
+        `, [
+          actor?.user_id ?? null,
+          actor?.user_name ?? "系统",
+          actor?.role ?? "System",
+          String(row.class_id),
+          `${row.course_name} / ${row.class_name}`,
+          `教学班代码：${row.class_code}\n新允许冲突状态：${isConflictAllowed}`,
+          nowMinuteStr()
+        ]);
+      }
+      return { changed: rows.length, changedRows: rows };
+    });
+  }
+  throw new Error("batchUpdateCourseClassConflict only supports mysql during migration");
 }
 
 async function getCourseUsers(filters = {}) {
@@ -1483,7 +1784,7 @@ async function upsertImportedClasses(actor, importedClasses, sourceName = "class
           await conn.execute(`
             update classes
             set class_abbr = ?, class_name = ?, course_name = ?, teaching_language = ?, teacher_user_id = ?,
-                teacher_name = ?, class_intro = ?, memo = ?, maximum_number_of_tas_admitted = ?,
+                teacher_name = ?, class_intro = ?, memo = ?, credit = ?, maximum_number_of_tas_admitted = ?,
                 ta_applications_allowed = ?, is_conflict_allowed = ?, apply_start_at = ?, apply_end_at = ?, semester = ?
             where class_id = ?
           `, [
@@ -1495,6 +1796,7 @@ async function upsertImportedClasses(actor, importedClasses, sourceName = "class
             teacherNames,
             item.classIntro,
             item.memo,
+            item.credit,
             item.maximumNumber,
             item.taAllowed,
             item.isConflictAllowed,
@@ -1521,10 +1823,10 @@ async function upsertImportedClasses(actor, importedClasses, sourceName = "class
           const [insertResult] = await conn.execute(`
             insert into classes (
               class_code, class_abbr, class_name, course_name, teaching_language, teacher_user_id,
-              teacher_name, class_intro, memo, maximum_number_of_tas_admitted,
+              teacher_name, class_intro, memo, credit, maximum_number_of_tas_admitted,
               ta_applications_allowed, is_conflict_allowed, apply_start_at, apply_end_at, semester,
               published_to_professor, professor_notified_at
-            ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'N', null)
+            ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'N', null)
           `, [
             item.classCode,
             item.classAbbr,
@@ -1535,6 +1837,7 @@ async function upsertImportedClasses(actor, importedClasses, sourceName = "class
             teacherNames,
             item.classIntro,
             item.memo,
+            item.credit,
             item.maximumNumber,
             item.taAllowed,
             item.isConflictAllowed,
@@ -1701,11 +2004,11 @@ async function getApprovedApplicationsForClasses(classIds) {
 
 async function getProfessorUsers() {
   if (DB_CLIENT === "mysql") {
-    return mysqlDb.query("select user_id, user_name from users where role = 'Professor' order by user_name");
+    return mysqlDb.query("select user_id, user_name, login_name, email, role from users where role = 'Professor' order by user_name");
   }
   const db = getSqliteDb();
   try {
-    return db.prepare("select user_id, user_name from users where role = 'Professor' order by user_name").all();
+    return db.prepare("select user_id, user_name, login_name, email, role from users where role = 'Professor' order by user_name").all();
   } finally {
     db.close();
   }
@@ -1818,10 +2121,10 @@ async function createCourseClass(actor, payload, scheduleRows) {
       const [insertResult] = await conn.execute(`
         insert into classes (
           class_code, class_abbr, class_name, course_name, teaching_language, teacher_user_id,
-          teacher_name, class_intro, memo, maximum_number_of_tas_admitted,
+          teacher_name, class_intro, memo, credit, maximum_number_of_tas_admitted,
           ta_applications_allowed, is_conflict_allowed, apply_start_at, apply_end_at, semester,
           published_to_professor, professor_notified_at
-        ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'N', null)
+        ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'N', null)
       `, [
         payload.class_code,
         payload.class_abbr,
@@ -1832,6 +2135,7 @@ async function createCourseClass(actor, payload, scheduleRows) {
         payload.teacher_name,
         payload.class_intro,
         payload.memo,
+        payload.credit,
         payload.maximum_number_of_tas_admitted,
         payload.ta_applications_allowed,
         payload.is_conflict_allowed,
@@ -1863,7 +2167,7 @@ async function createCourseClass(actor, payload, scheduleRows) {
         actor?.role ?? "System",
         String(classId),
         `${payload.course_name} / ${payload.class_name}`,
-        `教学班代码：${payload.class_code}\n教授：${payload.teacher_name}\n学期：${payload.semester}\nTA上限：${payload.maximum_number_of_tas_admitted}\n排课数：${scheduleRows.length}`,
+        `教学班代码：${payload.class_code}\n教授：${payload.teacher_name}\n学期：${payload.semester}\n学分：${payload.credit}\nTA上限：${payload.maximum_number_of_tas_admitted}\n排课数：${scheduleRows.length}`,
         nowMinuteStr()
       ]);
       return { classId };
@@ -1882,7 +2186,7 @@ async function updateCourseClass(actor, classId, payload, scheduleRows) {
       await conn.execute(`
         update classes
         set class_code = ?, class_abbr = ?, class_name = ?, course_name = ?, teaching_language = ?, teacher_user_id = ?,
-            teacher_name = ?, class_intro = ?, memo = ?, maximum_number_of_tas_admitted = ?, ta_applications_allowed = ?, is_conflict_allowed = ?, apply_start_at = ?, apply_end_at = ?, semester = ?
+            teacher_name = ?, class_intro = ?, memo = ?, credit = ?, maximum_number_of_tas_admitted = ?, ta_applications_allowed = ?, is_conflict_allowed = ?, apply_start_at = ?, apply_end_at = ?, semester = ?
         where class_id = ?
       `, [
         payload.class_code,
@@ -1894,6 +2198,7 @@ async function updateCourseClass(actor, classId, payload, scheduleRows) {
         payload.teacher_name,
         payload.class_intro,
         payload.memo,
+        payload.credit,
         payload.maximum_number_of_tas_admitted,
         payload.ta_applications_allowed,
         payload.is_conflict_allowed,
@@ -1936,7 +2241,7 @@ async function updateCourseClass(actor, classId, payload, scheduleRows) {
         actor?.role ?? "System",
         String(classId),
         `${payload.course_name} / ${payload.class_name}`,
-        `教学班代码：${payload.class_code}\n教授：${payload.teacher_name}\n学期：${payload.semester}\nTA上限：${payload.maximum_number_of_tas_admitted}\n排课数：${scheduleRows.length}`,
+        `教学班代码：${payload.class_code}\n教授：${payload.teacher_name}\n学期：${payload.semester}\n学分：${payload.credit}\nTA上限：${payload.maximum_number_of_tas_admitted}\n排课数：${scheduleRows.length}`,
         nowMinuteStr()
       ]);
       return { ok: true };
@@ -2282,6 +2587,7 @@ module.exports = {
   appendAuditLog,
   batchApplyTaAdminDecision,
   findUserByLoginAndPassword,
+  findUserByLoginName,
   findUserById,
   getAllApplications,
   getAllApplicationAuditRows,
@@ -2294,6 +2600,7 @@ module.exports = {
   createCourseClass,
   createCourseUser,
   batchToggleCourseClassApply,
+  batchUpdateCourseClassConflict,
   batchUpdateCourseClassWindow,
   deleteCourseUser,
   deleteCourseClasses,
@@ -2312,14 +2619,22 @@ module.exports = {
   getProfessorApplicationDetail,
   getProfessorClassReviewData,
   getProfessorPendingClassRows,
+  getNotificationsByUser,
   getSchedulesForClassIds,
   getTaAdminPendingApplications,
+  getTaUsersManagementRows,
+  getTaApplications,
+  getTaApplicationDetail,
   getTaClassesSnapshot,
   findUnusedLoginToken,
+  markNotificationReadById,
   markLoginTokenUsed,
   unreadNotificationCountByUser,
   updateCourseClass,
   updateCourseUser,
+  toggleTaUserApplyQualification,
+  updateTaResume,
+  withdrawTaApplication,
   updateProfessorPublishStatus,
   markClassesPublishedToProfessor,
   upsertImportedClasses,

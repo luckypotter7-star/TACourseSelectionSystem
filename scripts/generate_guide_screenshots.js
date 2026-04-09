@@ -25,6 +25,26 @@ async function captureTaApplications(browser) {
   await context.close();
 }
 
+async function captureTaClasses(browser) {
+  const context = await browser.createBrowserContext();
+  const page = await context.newPage();
+  await page.setViewport({ width: 1440, height: 1200, deviceScaleFactor: 2 });
+  await login(page, "ta1", "123456");
+  await page.goto(`${BASE}/ta/classes`, { waitUntil: "networkidle2" });
+  await page.screenshot({ path: path.join(SCREENSHOT_DIR, "ta_classes_current.png"), fullPage: true });
+  await context.close();
+}
+
+async function captureTaProfile(browser) {
+  const context = await browser.createBrowserContext();
+  const page = await context.newPage();
+  await page.setViewport({ width: 1440, height: 1200, deviceScaleFactor: 2 });
+  await login(page, "ta1", "123456");
+  await page.goto(`${BASE}/ta/profile`, { waitUntil: "networkidle2" });
+  await page.screenshot({ path: path.join(SCREENSHOT_DIR, "ta_profile_current.png"), fullPage: true });
+  await context.close();
+}
+
 async function captureProfessorPending(browser) {
   const context = await browser.createBrowserContext();
   const page = await context.newPage();
@@ -50,6 +70,76 @@ async function captureMailPreview(browser) {
   await context.close();
 }
 
+async function captureTaAdminPending(browser) {
+  const context = await browser.createBrowserContext();
+  const page = await context.newPage();
+  await page.setViewport({ width: 1440, height: 1200, deviceScaleFactor: 2 });
+  await login(page, "taadmin1", "123456");
+  await page.goto(`${BASE}/admin/ta/pending`, { waitUntil: "networkidle2" });
+  await page.screenshot({ path: path.join(SCREENSHOT_DIR, "taadmin_pending_current.png"), fullPage: true });
+  await context.close();
+}
+
+async function captureTaAdminManage(browser) {
+  const context = await browser.createBrowserContext();
+  const page = await context.newPage();
+  await page.setViewport({ width: 1440, height: 1200, deviceScaleFactor: 2 });
+  await login(page, "taadmin1", "123456");
+  await page.goto(`${BASE}/admin/ta/manage`, { waitUntil: "networkidle2" });
+  await page.screenshot({ path: path.join(SCREENSHOT_DIR, "taadmin_manage_current.png"), fullPage: true });
+  await context.close();
+}
+
+async function captureTaAdminClasses(browser) {
+  const context = await browser.createBrowserContext();
+  const page = await context.newPage();
+  await page.setViewport({ width: 1440, height: 1300, deviceScaleFactor: 2 });
+  await login(page, "taadmin1", "123456");
+  await page.goto(`${BASE}/admin/ta/classes`, { waitUntil: "networkidle2" });
+  await page.screenshot({ path: path.join(SCREENSHOT_DIR, "taadmin_classes_current.png"), fullPage: true });
+  await context.close();
+}
+
+async function captureCourseAdminUsers(browser) {
+  const context = await browser.createBrowserContext();
+  const page = await context.newPage();
+  await page.setViewport({ width: 1440, height: 1200, deviceScaleFactor: 2 });
+  await login(page, "courseadmin1", "123456");
+  await page.goto(`${BASE}/course/users`, { waitUntil: "networkidle2" });
+  await page.screenshot({ path: path.join(SCREENSHOT_DIR, "courseadmin_users_current.png"), fullPage: true });
+  await context.close();
+}
+
+async function captureCourseAdminClasses(browser) {
+  const context = await browser.createBrowserContext();
+  const page = await context.newPage();
+  await page.setViewport({ width: 1440, height: 1300, deviceScaleFactor: 2 });
+  await login(page, "courseadmin1", "123456");
+  await page.goto(`${BASE}/course/classes`, { waitUntil: "networkidle2" });
+  await page.screenshot({ path: path.join(SCREENSHOT_DIR, "courseadmin_classes_current.png"), fullPage: true });
+  await context.close();
+}
+
+async function captureCourseAdminApplications(browser) {
+  const context = await browser.createBrowserContext();
+  const page = await context.newPage();
+  await page.setViewport({ width: 1440, height: 1200, deviceScaleFactor: 2 });
+  await login(page, "courseadmin1", "123456");
+  await page.goto(`${BASE}/course/applications`, { waitUntil: "networkidle2" });
+  await page.screenshot({ path: path.join(SCREENSHOT_DIR, "courseadmin_applications_current.png"), fullPage: true });
+  await context.close();
+}
+
+async function captureCourseAdminReports(browser) {
+  const context = await browser.createBrowserContext();
+  const page = await context.newPage();
+  await page.setViewport({ width: 1440, height: 1400, deviceScaleFactor: 2 });
+  await login(page, "courseadmin1", "123456");
+  await page.goto(`${BASE}/course/reports`, { waitUntil: "networkidle2" });
+  await page.screenshot({ path: path.join(SCREENSHOT_DIR, "courseadmin_reports_current.png"), fullPage: true });
+  await context.close();
+}
+
 (async () => {
   const browser = await puppeteer.launch({
     headless: "new",
@@ -57,9 +147,18 @@ async function captureMailPreview(browser) {
     args: ["--no-sandbox", "--disable-setuid-sandbox"]
   });
   try {
+    await captureTaClasses(browser);
     await captureTaApplications(browser);
+    await captureTaProfile(browser);
+    await captureTaAdminPending(browser);
+    await captureTaAdminManage(browser);
+    await captureTaAdminClasses(browser);
     await captureProfessorPending(browser);
     await captureMailPreview(browser);
+    await captureCourseAdminClasses(browser);
+    await captureCourseAdminUsers(browser);
+    await captureCourseAdminApplications(browser);
+    await captureCourseAdminReports(browser);
     console.log("screenshots_done");
   } finally {
     await browser.close();

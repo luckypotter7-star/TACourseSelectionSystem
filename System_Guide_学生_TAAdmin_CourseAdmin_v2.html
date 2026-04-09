@@ -1,0 +1,488 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <title>TA选课系统使用手册</title>
+  <style>
+    body {
+      font-family: "PingFang SC", "Microsoft YaHei", sans-serif;
+      color: #202124;
+      line-height: 1.7;
+      margin: 40px auto;
+      max-width: 980px;
+      padding: 0 24px 60px;
+      background: #fffdfa;
+    }
+    h1 { font-size: 30px; margin: 0 0 24px; }
+    h2 { font-size: 22px; margin: 30px 0 12px; }
+    h3 { font-size: 18px; margin: 22px 0 10px; }
+    p { margin: 0 0 10px; }
+    ul { margin: 0 0 14px 20px; padding: 0; }
+    li { margin: 0 0 6px; }
+    code {
+      background: #f3f6fb;
+      padding: 2px 6px;
+      border-radius: 6px;
+      font-family: Menlo, Monaco, monospace;
+      font-size: 0.95em;
+    }
+    img { margin: 8px 0 18px; box-shadow: 0 8px 28px rgba(0,0,0,0.06); }
+  </style>
+</head>
+<body>
+<h1>TA选课系统使用手册</h1>
+<p>适用角色：</p>
+<ul>
+<li>学生（TA）</li>
+<li>TA Admin</li>
+<li>Course Admin</li>
+</ul>
+<p>本手册基于当前系统最新实现整理，覆盖：</p>
+<ul>
+<li>本地登录与 SSO 登录</li>
+<li>学生申请主流程</li>
+<li>TA Admin 初审与发布至教授</li>
+<li>Course Admin 教学班、人员、申请、报表、审计</li>
+</ul>
+<h2>1. 系统入口</h2>
+<p>系统支持两种登录方式：</p>
+<ul>
+<li>本地账号密码登录</li>
+<li>SSO 统一身份认证登录</li>
+</ul>
+<p>常见入口示例：</p>
+<ul>
+<li>本机访问：<code>http://127.0.0.1:3000</code></li>
+<li>局域网访问：<code>http://&lt;内网IP&gt;:3000</code></li>
+<li>服务器访问：<code>http://&lt;公网IP&gt;:&lt;端口&gt;</code> 或正式 HTTPS 地址</li>
+</ul>
+<h2>2. 登录说明</h2>
+<p>登录页包含：</p>
+<ul>
+<li>SAIF 品牌页头</li>
+<li>系统简介区</li>
+<li>登录表单</li>
+<li><code>登录</code></li>
+<li><code>SSO 登录</code></li>
+</ul>
+<p>登录成功后，系统会根据账号角色自动进入对应首页。</p>
+<h2>3. 角色总览</h2>
+<h3>3.1 学生（TA）</h3>
+<p>学生可以：</p>
+<ul>
+<li>查看可申请教学班</li>
+<li>查看冲突信息</li>
+<li>提交 TA 申请</li>
+<li>查看自己的申请状态</li>
+<li>撤销尚未进入 Professor 审批阶段的申请</li>
+<li>维护个人简历</li>
+</ul>
+<h3>3.2 TA Admin</h3>
+<p>TA Admin 可以：</p>
+<ul>
+<li>查看待初审申请</li>
+<li>单条或批量审批</li>
+<li>查看全部申请</li>
+<li>查看全部教学班</li>
+<li>审核某个教学班下的申请</li>
+<li>生成并发送 Professor 邮件</li>
+<li>管理 TA 申请资格</li>
+</ul>
+<h3>3.3 Course Admin</h3>
+<p>Course Admin 可以：</p>
+<ul>
+<li>管理教学班</li>
+<li>创建、编辑、删除教学班</li>
+<li>导入教学班与排课</li>
+<li>管理人员</li>
+<li>导入人员</li>
+<li>查看全部申请与申请日志</li>
+<li>查看报表与审计日志</li>
+</ul>
+<h2>4. 学生（TA）使用说明</h2>
+<h3>4.1 可申请教学班</h3>
+<p>学生登录后进入 <code>可申请教学班</code> 页面。</p>
+<p>页面支持：</p>
+<ul>
+<li>按 <code>是否可申请</code></li>
+<li>按 <code>教授名</code></li>
+<li>按 <code>课程名称</code></li>
+<li>按 <code>教学班名称</code></li>
+<li>按 <code>授课语言</code></li>
+</ul>
+<p>教学班卡片当前会展示：</p>
+<ul>
+<li>教学班名称</li>
+<li>教授</li>
+<li>授课语言</li>
+<li>学分</li>
+<li>当前状态</li>
+<li><code>待初审申请数</code></li>
+</ul>
+<p>说明：</p>
+<ul>
+<li>页面不再展示“已通过人数”</li>
+<li>页面不再展示“学期”</li>
+<li><code>待初审申请数</code> 表示当前该教学班中，状态为 <code>待 TAAdmin 审批</code> 的申请数量</li>
+<li>如果该教学班的上一条申请已被拒绝，学生会看到 <code>被拒绝</code> 状态，并可再次申请</li>
+<li>被拒绝的历史申请不会再参与新的冲突阻断</li>
+</ul>
+<p>示意图：</p>
+<p><img src="screenshots/ta_classes_current.png" alt="学生可申请教学班页面" style="max-width: 920px; width: 100%; border: 1px solid #dfe3eb; border-radius: 12px;" /></p>
+<h3>4.2 教学班详情与提交申请</h3>
+<p>点击 <code>查看详情</code> 后，学生可以查看：</p>
+<ul>
+<li>教学班基础信息</li>
+<li>排课安排</li>
+<li>冲突信息</li>
+<li>当前简历</li>
+<li>提交申请区域</li>
+</ul>
+<p>当前规则：</p>
+<ul>
+<li><code>申请原因</code> 为非必填</li>
+<li><code>简历</code> 为必填</li>
+<li>如教学班不允许冲突申请，且存在阻断性冲突，则无法提交</li>
+<li>提交后按钮会暂时变灰，避免重复点击</li>
+</ul>
+<h3>4.3 我的申请</h3>
+<p>在 <code>我的申请</code> 页面，学生可以查看自己的全部申请。</p>
+<p>页面包含：</p>
+<ul>
+<li>申请列表</li>
+<li>教授列</li>
+<li>学分列</li>
+<li>申请时间</li>
+<li>当前状态</li>
+<li>TAAdmin 备注</li>
+<li>Professor 备注</li>
+<li>操作按钮</li>
+</ul>
+<p>顶部摘要卡会展示：</p>
+<ul>
+<li>待审批教学班数</li>
+<li>待审批申请学分</li>
+<li>已通过教学班数</li>
+<li>已通过教学学分合计</li>
+</ul>
+<p>按钮说明：</p>
+<ul>
+<li><code>详情</code></li>
+<li><code>撤销</code></li>
+</ul>
+<p>说明：</p>
+<ul>
+<li><code>撤销</code> 会先弹出确认框</li>
+<li>已撤销、被拒绝的申请可以再次申请</li>
+<li>如果申请已经进入更后阶段，是否允许撤销会按系统状态控制</li>
+</ul>
+<p>示意图：</p>
+<p><img src="screenshots/ta_my_applications.png" alt="学生我的申请页面" style="max-width: 920px; width: 100%; border: 1px solid #dfe3eb; border-radius: 12px;" /></p>
+<h3>4.4 个人资料</h3>
+<p>在 <code>个人资料</code> 页面，学生可以：</p>
+<ul>
+<li>查看姓名、账号、邮箱</li>
+<li>上传个人简历</li>
+<li>更新个人简历</li>
+</ul>
+<p>说明：</p>
+<ul>
+<li>简历支持中文文件名</li>
+<li>更新后，后续申请与已有关联申请会显示最新简历</li>
+</ul>
+<h2>5. TA Admin 使用说明</h2>
+<h3>5.1 待初审申请</h3>
+<p>在 <code>待初审申请</code> 页面，TA Admin 可以按条件筛选待审核申请，并执行单条或批量审批。</p>
+<p>筛选维度：</p>
+<ul>
+<li>教学班</li>
+<li>教授</li>
+<li>申请学生</li>
+</ul>
+<p>可执行动作：</p>
+<ul>
+<li>单独审批</li>
+<li>批量通过</li>
+<li>批量拒绝</li>
+</ul>
+<p>说明：</p>
+<ul>
+<li><code>审批备注</code> 现在为非必填</li>
+<li>TA Admin 通过后，申请状态进入 <code>待教授审批</code></li>
+<li>TA Admin 拒绝后，状态进入 <code>TAAdmin 拒绝</code></li>
+</ul>
+<p>示意图：</p>
+<p><img src="screenshots/taadmin_pending_current.png" alt="TAAdmin待初审申请页面" style="max-width: 920px; width: 100%; border: 1px solid #dfe3eb; border-radius: 12px;" /></p>
+<h3>5.2 按教学班审核申请</h3>
+<p>在 <code>全部教学班</code> 中点击 <code>审核</code>，可进入某个教学班下的申请审核页。</p>
+<p>页面可查看：</p>
+<ul>
+<li>该教学班全部申请</li>
+<li>冲突教学班摘要</li>
+<li>简历</li>
+<li>TAAdmin</li>
+<li>当前状态</li>
+</ul>
+<h3>5.3 全部申请</h3>
+<p>在 <code>全部申请</code> 页面，TA Admin 可以查看所有 TA 申请。</p>
+<p>筛选维度：</p>
+<ul>
+<li>教学班</li>
+<li>教授</li>
+<li>申请学生</li>
+<li>状态</li>
+</ul>
+<p>用途：</p>
+<ul>
+<li>追踪全量申请状态</li>
+<li>回看历史审批</li>
+<li>进入详情页查看日志和备注</li>
+</ul>
+<h3>5.4 全部教学班</h3>
+<p>在 <code>全部教学班</code> 页面，TA Admin 可以按教学班维度查看初审工作。</p>
+<p>页面包含：</p>
+<ul>
+<li>教学班筛选</li>
+<li>日历视图</li>
+<li>导出教学班 TA</li>
+<li>审核入口</li>
+<li>批量设置开放时间</li>
+<li>批量更新开放设置</li>
+<li>批量修改发布状态</li>
+</ul>
+<p>当前主要字段包括：</p>
+<ul>
+<li>教学班代码</li>
+<li>教学班名称</li>
+<li>学分</li>
+<li>教授</li>
+<li>学期</li>
+<li>开放状态</li>
+<li>TA已满</li>
+<li>排课数</li>
+<li>TA</li>
+<li>已通过/上限</li>
+<li>申请数</li>
+<li>待 TAAdmin 审批数</li>
+<li>发布至教授</li>
+</ul>
+<p>说明：</p>
+<ul>
+<li><code>课程名</code> 已隐藏</li>
+<li>点击 <code>排课数</code> 即可查看排课安排</li>
+<li><code>发布至教授 = 已发送</code> 后，教学班会自动关闭申请</li>
+<li>此时 <code>开放申请 = N</code>，学生不能再申请</li>
+</ul>
+<p>示意图：</p>
+<p><img src="screenshots/taadmin_classes_current.png" alt="TAAdmin全部教学班页面" style="max-width: 920px; width: 100%; border: 1px solid #dfe3eb; border-radius: 12px;" /></p>
+<h3>5.5 发布至教授与邮件预览</h3>
+<p>TA Admin 在 <code>全部教学班</code> 中勾选教学班后，可以：</p>
+<ul>
+<li>生成邮件预览</li>
+<li>发送邮件给 Professor</li>
+<li>抄送当前 TA Admin</li>
+</ul>
+<p>系统行为：</p>
+<ul>
+<li>按教授分别生成邮件</li>
+<li>若一个教学班有多个教授，则每位教授都能收到</li>
+<li>发送成功后，<code>发布至教授</code> 更新为 <code>已发送</code></li>
+<li>教授端会同时收到站内通知</li>
+</ul>
+<p>示意图：</p>
+<p><img src="screenshots/taadmin_email_preview.png" alt="TAAdmin邮件预览页面" style="max-width: 920px; width: 100%; border: 1px solid #dfe3eb; border-radius: 12px;" /></p>
+<h3>5.6 TA 管理</h3>
+<p>在 <code>TA 管理</code> 页面，TA Admin 可以：</p>
+<ul>
+<li>查看 TA 列表</li>
+<li>查看申请数</li>
+<li>查看已通过数</li>
+<li>切换是否允许申请</li>
+</ul>
+<p>示意图：</p>
+<p><img src="screenshots/taadmin_manage_current.png" alt="TAAdmin TA管理页面" style="max-width: 920px; width: 100%; border: 1px solid #dfe3eb; border-radius: 12px;" /></p>
+<h2>6. Course Admin 使用说明</h2>
+<h3>6.1 教学班管理</h3>
+<p><code>教学班管理</code> 是 Course Admin 最核心的页面之一。</p>
+<p>页面支持：</p>
+<ul>
+<li>教学班筛选</li>
+<li>展开批量操作</li>
+<li>展开新增教学班</li>
+<li>导入教学班与排课</li>
+<li>日历视图</li>
+<li>导出教学班 TA</li>
+</ul>
+<p>当前新增/编辑教学班支持维护：</p>
+<ul>
+<li>教学班代码</li>
+<li>教学班缩写</li>
+<li>教学班名称</li>
+<li>学分（浮点数）</li>
+<li>授课语言</li>
+<li>Professor（可多选）</li>
+<li>学期</li>
+<li>最大录取人数</li>
+<li>是否开放申请</li>
+<li>是否允许冲突</li>
+<li>开放开始时间</li>
+<li>开放结束时间</li>
+<li>课程介绍</li>
+<li>备注</li>
+<li>排课记录</li>
+</ul>
+<p>说明：</p>
+<ul>
+<li>导入功能也支持 <code>学分</code></li>
+<li>列表中隐藏了 <code>课程名</code></li>
+<li><code>排课数</code> 可直接点击查看排课</li>
+<li>操作按钮保持单行展示</li>
+</ul>
+<p>示意图：</p>
+<p><img src="screenshots/courseadmin_classes_current.png" alt="CourseAdmin教学班管理页面" style="max-width: 920px; width: 100%; border: 1px solid #dfe3eb; border-radius: 12px;" /></p>
+<h3>6.2 人员管理</h3>
+<p>在 <code>人员管理</code> 页面，Course Admin 可以：</p>
+<ul>
+<li>查看所有人员</li>
+<li>按姓名、登录名、邮箱、角色、是否允许申请筛选</li>
+<li>排序</li>
+<li>新增人员</li>
+<li>编辑人员</li>
+<li>删除人员</li>
+<li>导入人员</li>
+</ul>
+<p>角色常见包括：</p>
+<ul>
+<li><code>TA</code></li>
+<li><code>Professor</code></li>
+<li><code>TAAdmin</code></li>
+<li><code>CourseAdmin</code></li>
+</ul>
+<p>示意图：</p>
+<p><img src="screenshots/courseadmin_users_current.png" alt="CourseAdmin人员管理页面" style="max-width: 920px; width: 100%; border: 1px solid #dfe3eb; border-radius: 12px;" /></p>
+<h3>6.3 全部申请</h3>
+<p>在 <code>全部申请</code> 页面，Course Admin 可以：</p>
+<ul>
+<li>按教学班、教授、学生、状态查看申请</li>
+<li>打开单条申请详情</li>
+<li>查看审批记录</li>
+<li>查看申请业务日志</li>
+<li>手工修改申请状态</li>
+</ul>
+<p>管理员改状态后：</p>
+<ul>
+<li>会保留审批日志</li>
+<li>会新增业务日志/审计日志</li>
+</ul>
+<p>示意图：</p>
+<p><img src="screenshots/courseadmin_applications_current.png" alt="CourseAdmin全部申请页面" style="max-width: 920px; width: 100%; border: 1px solid #dfe3eb; border-radius: 12px;" /></p>
+<h3>6.4 申请日志</h3>
+<p>在 <code>申请日志</code> 页面，Course Admin 可以按更管理化的视角排查申请轨迹。</p>
+<p>筛选维度：</p>
+<ul>
+<li>申请学生</li>
+<li>教学班</li>
+<li>教授</li>
+<li>状态</li>
+<li>申请时间起止</li>
+</ul>
+<p>每一行会展示：</p>
+<ul>
+<li>当前状态</li>
+<li>最新动作</li>
+<li>最近几条业务日志摘要</li>
+</ul>
+<h3>6.5 报表视图</h3>
+<p>在 <code>报表视图</code> 页面，Course Admin 可以查看：</p>
+<ul>
+<li>申请总数</li>
+<li>待 TAAdmin 审批</li>
+<li>待 Professor 审批</li>
+<li>已通过</li>
+<li>已拒绝</li>
+<li>已撤销</li>
+<li>开放中教学班</li>
+<li>TA 已满教学班</li>
+<li>申请 TA 人数</li>
+<li>通过率</li>
+</ul>
+<p>页面还提供：</p>
+<ul>
+<li>热门教学班</li>
+<li>教授维度申请分布</li>
+<li>申请状态概览</li>
+<li>名额使用率 Top N 教学班</li>
+<li>最近 7 日申请趋势</li>
+<li>导出 Excel</li>
+</ul>
+<p>示意图：</p>
+<p><img src="screenshots/courseadmin_reports_current.png" alt="CourseAdmin报表视图页面" style="max-width: 920px; width: 100%; border: 1px solid #dfe3eb; border-radius: 12px;" /></p>
+<h3>6.6 审计日志</h3>
+<p>在 <code>审计日志</code> 页面，Course Admin 可以查看系统级操作痕迹。</p>
+<p>可筛选：</p>
+<ul>
+<li>操作人</li>
+<li>动作类型</li>
+<li>对象类型</li>
+<li>关键字</li>
+</ul>
+<p>系统当前已经覆盖的审计范围包括：</p>
+<ul>
+<li>学生提交申请</li>
+<li>学生撤销申请</li>
+<li>TAAdmin 审批</li>
+<li>Professor 审批</li>
+<li>管理员改状态</li>
+<li>教学班创建/编辑/删除</li>
+<li>人员创建/编辑/删除</li>
+<li>教学班导入</li>
+<li>人员导入</li>
+<li>邮件发送及失败场景</li>
+</ul>
+<h2>7. 状态说明</h2>
+<p>常见申请状态：</p>
+<ul>
+<li><code>待 TAAdmin 审批</code></li>
+<li><code>TAAdmin 拒绝</code></li>
+<li><code>待教授审批</code></li>
+<li><code>Professor 拒绝</code></li>
+<li><code>已通过</code></li>
+<li><code>已撤销</code></li>
+</ul>
+<p>补充说明：</p>
+<ul>
+<li>被拒绝的教学班可以重新申请</li>
+<li>被拒绝的历史申请不会继续参与阻断性冲突判断</li>
+</ul>
+<h2>8. 通知与邮件</h2>
+<p>当前系统同时支持：</p>
+<ul>
+<li>站内通知</li>
+<li>邮件通知</li>
+</ul>
+<p>通知触发示例：</p>
+<ul>
+<li>学生提交申请 -&gt; 通知 TAAdmin</li>
+<li>TAAdmin 审批 -&gt; 通知学生</li>
+<li>Professor 审批 -&gt; 通知学生</li>
+<li>发布至教授 -&gt; 邮件 + 站内通知给 Professor</li>
+</ul>
+<h2>9. 使用建议</h2>
+<p>推荐的日常使用顺序：</p>
+<h3>学生（TA）</h3>
+<p>1. 先上传个人简历</p>
+<p>2. 浏览可申请教学班</p>
+<p>3. 查看冲突并提交申请</p>
+<p>4. 在我的申请中跟踪状态</p>
+<h3>TA Admin</h3>
+<p>1. 在待初审申请中完成初审</p>
+<p>2. 在全部教学班中按班级维度复核</p>
+<p>3. 生成并发送 Professor 邮件</p>
+<p>4. 跟踪后续申请状态</p>
+<h3>Course Admin</h3>
+<p>1. 维护教学班和人员</p>
+<p>2. 管理开放时间和开放规则</p>
+<p>3. 通过全部申请和申请日志跟踪流程</p>
+<p>4. 用报表视图与审计日志做管理复盘</p>
+</body>
+</html>

@@ -29,6 +29,7 @@ CREATE TABLE IF NOT EXISTS classes (
   teacher_name VARCHAR(255) NOT NULL,
   class_intro TEXT NULL,
   memo TEXT NULL,
+  credit DECIMAL(6,2) NULL,
   maximum_number_of_tas_admitted INT NOT NULL DEFAULT 1,
   ta_applications_allowed CHAR(1) NOT NULL DEFAULT 'Y',
   is_conflict_allowed CHAR(1) NOT NULL DEFAULT 'N',

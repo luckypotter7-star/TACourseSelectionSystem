@@ -1,4 +1,4 @@
-class_code,class_abbr,course_name,class_name,teaching_language,teacher_login_name,semester,maximum_number,ta_allowed,is_conflict_allowed,apply_start_at,apply_end_at,lesson_date,start_time,end_time,section,is_exam,class_intro,memo
-FIN201-A,FIN201,公司金融,公司金融A班,中文,prof1,2026Fall,2,Y,N,2026-03-09 09:00,2026-12-31 23:59,2026-09-15,18:30,20:30,晚上,,公司金融教学班,工作日晚课
-FIN201-A,FIN201,公司金融,公司金融A班,中文,prof1,2026Fall,2,Y,N,2026-03-09 09:00,2026-12-31 23:59,2026-09-22,18:30,20:30,晚上,,公司金融教学班,工作日晚课
-FIN201-A,FIN201,公司金融,公司金融A班,中文,prof1,2026Fall,2,Y,N,2026-03-09 09:00,2026-12-31 23:59,2026-12-20,18:30,20:30,晚上,期末考试,公司金融教学班,工作日晚课
+class_code,class_abbr,course_name,class_name,teaching_language,teacher_login_name,semester,credit,maximum_number,ta_allowed,is_conflict_allowed,apply_start_at,apply_end_at,lesson_date,start_time,end_time,section,is_exam,class_intro,memo
+FIN201-A,FIN201,公司金融,公司金融A班,中文,prof1,2026Fall,3.0,2,Y,N,2026-03-09 09:00,2026-12-31 23:59,2026-09-15,18:30,20:30,晚上,,公司金融教学班,工作日晚课
+FIN201-A,FIN201,公司金融,公司金融A班,中文,prof1,2026Fall,3.0,2,Y,N,2026-03-09 09:00,2026-12-31 23:59,2026-09-22,18:30,20:30,晚上,,公司金融教学班,工作日晚课
+FIN201-A,FIN201,公司金融,公司金融A班,中文,prof1,2026Fall,3.0,2,Y,N,2026-03-09 09:00,2026-12-31 23:59,2026-12-20,18:30,20:30,晚上,期末考试,公司金融教学班,工作日晚课

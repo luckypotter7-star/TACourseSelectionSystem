@@ -19,6 +19,258 @@ try {
 const SAIF_LOGO_HORIZONTAL = `/assets/${encodeURIComponent("学院logo金色版2-英文横版.png")}`;
 const SAIF_LOGO_VERTICAL = `/assets/${encodeURIComponent("学院logo金色版7-原竖版.png")}`;
 const sessions = new Map();
+const ssoStates = new Map();
+
+function isSsoConfigured() {
+  return Boolean(String(process.env.SSO_AUTH_URL || "").trim() && String(process.env.SSO_CLIENT_ID || "").trim());
+}
+
+function getSsoScope() {
+  return String(process.env.SSO_SCOPE || "openid profile").trim() || "openid profile";
+}
+
+function getSsoLoginNameField() {
+  return String(process.env.SSO_LOGIN_NAME_FIELD || "account").trim() || "account";
+}
+
+function getSsoRedirectUri(req) {
+  const configured = String(process.env.SSO_REDIRECT_URI || "").trim();
+  if (configured) return configured;
+  return `${getExternalBaseUrl(req)}/login/sso/callback`;
+}
+
+function cleanupSsoStates() {
+  const now = Date.now();
+  for (const [state, meta] of ssoStates.entries()) {
+    if (!meta || meta.expiresAt <= now) {
+      ssoStates.delete(state);
+    }
+  }
+}
+
+function createSsoState(targetPath) {
+  cleanupSsoStates();
+  const state = crypto.randomBytes(16).toString("hex");
+  ssoStates.set(state, {
+    targetPath: targetPath || "/",
+    expiresAt: Date.now() + 10 * 60 * 1000
+  });
+  return state;
+}
+
+function consumeSsoState(state) {
+  cleanupSsoStates();
+  const meta = ssoStates.get(state);
+  if (!meta) return null;
+  ssoStates.delete(state);
+  if (meta.expiresAt <= Date.now()) return null;
+  return meta;
+}
+
+function parseJwtPayload(token) {
+  try {
+    const parts = String(token || "").split(".");
+    if (parts.length < 2) return null;
+    const payload = parts[1].replace(/-/g, "+").replace(/_/g, "/");
+    const normalized = payload + "=".repeat((4 - (payload.length % 4 || 4)) % 4);
+    return JSON.parse(Buffer.from(normalized, "base64").toString("utf8"));
+  } catch (_) {
+    return null;
+  }
+}
+
+async function fetchJson(url, options = {}) {
+  const response = await fetch(url, options);
+  const text = await response.text();
+  let data = null;
+  try {
+    data = text ? JSON.parse(text) : null;
+  } catch (_) {
+    data = text;
+  }
+  if (!response.ok) {
+    throw new Error(`HTTP ${response.status}: ${typeof data === "string" ? data : JSON.stringify(data)}`);
+  }
+  return data;
+}
+
+function buildSsoAuthorizeUrl(req, state) {
+  const authUrl = String(process.env.SSO_AUTH_URL || "").trim();
+  const clientId = String(process.env.SSO_CLIENT_ID || "").trim();
+  const redirectUri = getSsoRedirectUri(req);
+  const scope = getSsoScope();
+  const encodedScope = encodeURIComponent(scope).replace(/%20/g, "+");
+  const encodedClientId = encodeURIComponent(clientId);
+  const encodedState = encodeURIComponent(state);
+  const authorizationUrl = `${authUrl}?client_id=${encodedClientId}&response_type=code&redirect_uri=${redirectUri}&scope=${encodedScope}&state=${encodedState}`;
+
+  const loginUrl = String(process.env.SSO_LOGIN_URL || "").trim();
+  if (!loginUrl) {
+    return authorizationUrl;
+  }
+  const wrapper = new URL(loginUrl);
+  if (String(process.env.SSO_LOGIN_X_STARTED || "").trim().toUpperCase() === "Y") {
+    wrapper.searchParams.set("x_started", "true");
+  }
+  wrapper.searchParams.set("redirect_uri", authorizationUrl);
+  return wrapper.toString();
+}
+
+async function exchangeSsoCodeForToken(req, code) {
+  const tokenUrl = String(process.env.SSO_TOKEN_URL || "").trim();
+  const clientId = String(process.env.SSO_CLIENT_ID || "").trim();
+  const clientSecret = String(process.env.SSO_CLIENT_SECRET || "").trim();
+  const redirectUri = getSsoRedirectUri(req);
+  const body = new URLSearchParams({
+    grant_type: "authorization_code",
+    code: String(code || ""),
+    redirect_uri: redirectUri,
+    client_id: clientId,
+    client_secret: clientSecret
+  });
+  return fetchJson(tokenUrl, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/x-www-form-urlencoded",
+      Accept: "application/json"
+    },
+    body: body.toString()
+  });
+}
+
+async function fetchSsoProfile(accessToken) {
+  const profileUrl = String(process.env.SSO_USERINFO_URL || "").trim();
+  if (!profileUrl) return null;
+  return fetchJson(profileUrl, {
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      Accept: "application/json"
+    }
+  });
+}
+
+function extractSsoLoginName(profile, accessToken) {
+  const field = getSsoLoginNameField();
+  const candidateKeys = Array.from(new Set([
+    field,
+    "account",
+    "login_name",
+    "loginName",
+    "username",
+    "userName",
+    "uid",
+    "sub"
+  ]));
+  const containers = [];
+  if (profile && typeof profile === "object") {
+    containers.push(profile);
+    for (const key of ["data", "result", "profile", "user", "me"]) {
+      if (profile[key] && typeof profile[key] === "object") {
+        containers.push(profile[key]);
+      }
+    }
+    if (Array.isArray(profile.entities)) {
+      for (const entity of profile.entities) {
+        if (entity && typeof entity === "object") {
+          containers.push(entity);
+        }
+      }
+    }
+  }
+  for (const container of containers) {
+    for (const key of candidateKeys) {
+      if (container[key]) {
+        return String(container[key]).trim();
+      }
+    }
+  }
+  const payload = parseJwtPayload(accessToken);
+  if (payload && typeof payload === "object") {
+    const payloadContainers = [payload];
+    for (const key of ["data", "result", "profile", "user", "me"]) {
+      if (payload[key] && typeof payload[key] === "object") {
+        payloadContainers.push(payload[key]);
+      }
+    }
+    if (Array.isArray(payload.entities)) {
+      for (const entity of payload.entities) {
+        if (entity && typeof entity === "object") {
+          payloadContainers.push(entity);
+        }
+      }
+    }
+    for (const container of payloadContainers) {
+      for (const key of candidateKeys) {
+        if (container[key]) {
+          return String(container[key]).trim();
+        }
+      }
+    }
+  }
+  return "";
+}
+
+async function startSsoLogin(req, res) {
+  if (!isSsoConfigured()) {
+    return redirect(res, "/?notice=SSO 尚未配置完成");
+  }
+  const targetPath = "/";
+  const state = createSsoState(targetPath);
+  return redirect(res, buildSsoAuthorizeUrl(req, state));
+}
+
+async function handleSsoCallback(req, res, url) {
+  if (!isSsoConfigured()) {
+    return redirect(res, "/?notice=SSO 尚未配置完成");
+  }
+  const code = String(url.searchParams.get("code") || "").trim();
+  const state = String(url.searchParams.get("state") || "").trim();
+  if (!code || !state) {
+    return redirect(res, "/?notice=SSO 回调缺少必要参数");
+  }
+  const stateMeta = consumeSsoState(state);
+  if (!stateMeta) {
+    return redirect(res, "/?notice=SSO 登录状态已失效，请重新登录");
+  }
+  try {
+    const tokenData = await exchangeSsoCodeForToken(req, code);
+    const accessToken = String(tokenData.access_token || "").trim();
+    if (!accessToken) {
+      return redirect(res, "/?notice=SSO 未返回 access token");
+    }
+    let profile = null;
+    try {
+      profile = await fetchSsoProfile(accessToken);
+    } catch (_) {
+      profile = null;
+    }
+    const loginName = extractSsoLoginName(profile, accessToken);
+    if (!loginName) {
+      const payload = parseJwtPayload(accessToken);
+      console.warn("[sso] 可识别账号字段缺失", {
+        profileKeys: profile && typeof profile === "object" ? Object.keys(profile) : [],
+        profileDataKeys: profile && profile.data && typeof profile.data === "object" ? Object.keys(profile.data) : [],
+        profileResultKeys: profile && profile.result && typeof profile.result === "object" ? Object.keys(profile.result) : [],
+        profileEntityKeys: profile && Array.isArray(profile.entities) && profile.entities[0] && typeof profile.entities[0] === "object" ? Object.keys(profile.entities[0]) : [],
+        payloadKeys: payload && typeof payload === "object" ? Object.keys(payload) : [],
+        payloadDataKeys: payload && payload.data && typeof payload.data === "object" ? Object.keys(payload.data) : [],
+        loginField: getSsoLoginNameField()
+      });
+      return redirect(res, "/?notice=SSO 未返回可识别的账号字段");
+    }
+    const user = await dbGateway.findUserByLoginName(loginName);
+    if (!user) {
+      return redirect(res, "/?notice=SSO 用户未在本系统开通");
+    }
+    const sid = crypto.randomBytes(16).toString("hex");
+    sessions.set(sid, user.user_id);
+    return redirect(res, `${stateMeta.targetPath || "/"}?notice=${user.user_name} 已通过 SSO 登录`, {
+      "Set-Cookie": `sid=${sid}; Path=/; HttpOnly`
+    });
+  } catch (error) {
+    return redirect(res, `/?notice=SSO 登录失败：${error.message}`);
+  }
+}
 const importReports = new Map();
 const MAX_UPLOAD_SIZE = 5 * 1024 * 1024;
 const ALLOWED_EXTENSIONS = new Set([".pdf", ".doc", ".docx"]);
@@ -133,6 +385,7 @@ function initDb() {
       teacher_name text not null,
       class_intro text,
       memo text,
+      credit real,
       maximum_number_of_tas_admitted integer not null default 1,
       ta_applications_allowed text not null default 'Y',
       is_conflict_allowed text not null default 'N',
@@ -233,6 +486,9 @@ function initDb() {
   const classColumns = db.prepare("pragma table_info(classes)").all();
   if (!classColumns.some((column) => column.name === "class_abbr")) {
     db.exec("alter table classes add column class_abbr text");
+  }
+  if (!classColumns.some((column) => column.name === "credit")) {
+    db.exec("alter table classes add column credit real");
   }
   if (!classColumns.some((column) => column.name === "apply_start_at")) {
     db.exec("alter table classes add column apply_start_at text");
@@ -399,7 +655,19 @@ function readRawBody(req) {
 
 function sanitizeFilename(filename) {
   const base = path.basename(String(filename || "").trim());
-  return base.replace(/[^A-Za-z0-9._-]/g, "_");
+  return base.replace(/[\\/:*?"<>|\u0000-\u001F]/g, "_");
+}
+
+function decodeMultipartFilename(filename) {
+  const raw = String(filename || "");
+  if (!raw) return "";
+  try {
+    const decoded = Buffer.from(raw, "latin1").toString("utf8");
+    if (decoded && !decoded.includes("\uFFFD")) {
+      return decoded;
+    }
+  } catch {}
+  return raw;
 }
 
 function parseMultipart(buffer, contentType) {
@@ -427,8 +695,9 @@ function parseMultipart(buffer, contentType) {
     const fileMatch = /filename="([^"]*)"/i.exec(disposition);
     const contentTypeHeader = headers.find((line) => /^content-type:/i.test(line));
     if (fileMatch) {
+      const decodedFilename = decodeMultipartFilename(fileMatch[1]);
       files[fieldName] = {
-        filename: fileMatch[1],
+        filename: decodedFilename,
         contentType: contentTypeHeader ? contentTypeHeader.split(":")[1].trim() : "application/octet-stream",
         buffer: Buffer.from(bodyBinary, "binary")
       };
@@ -440,7 +709,8 @@ function parseMultipart(buffer, contentType) {
 }
 
 function saveUploadedFile(file) {
-  const safeName = sanitizeFilename(file.filename);
+  const originalName = path.basename(String(file.filename || "").trim());
+  const safeName = sanitizeFilename(originalName);
   if (!safeName) {
     throw new Error("附件文件名无效");
   }
@@ -461,7 +731,7 @@ function saveUploadedFile(file) {
   const targetPath = path.join(UPLOAD_DIR, storedName);
   fs.writeFileSync(targetPath, file.buffer);
   return {
-    originalName: safeName,
+    originalName: originalName,
     storedName,
     relativePath: `/uploads/${storedName}`
   };
@@ -485,7 +755,8 @@ function normalizeDateTimeInput(value) {
 }
 
 function datetimeValueForInput(value) {
-  return value ? String(value).replace(" ", "T").slice(0, 16) : "";
+  const normalized = comparableDateTimeValue(value);
+  return normalized ? normalized.replace(" ", "T").slice(0, 16) : "";
 }
 
 function validateApplyWindow(startAt, endAt) {
@@ -508,15 +779,15 @@ function applyWindowText(classRow) {
   if (!classRow.apply_start_at || !classRow.apply_end_at) {
     return "未设置";
   }
-  return `${escapeHtml(classRow.apply_start_at)} 至 ${escapeHtml(classRow.apply_end_at)}`;
+  return `${escapeHtml(normalizeDisplayDateTime(classRow.apply_start_at))} 至 ${escapeHtml(normalizeDisplayDateTime(classRow.apply_end_at))}`;
 }
 
 function compactApplyWindowText(classRow) {
   if (!classRow.apply_start_at || !classRow.apply_end_at) {
     return "未设置";
   }
-  const start = String(classRow.apply_start_at);
-  const end = String(classRow.apply_end_at);
+  const start = normalizeDisplayDateTime(classRow.apply_start_at);
+  const end = normalizeDisplayDateTime(classRow.apply_end_at);
   if (start.slice(0, 10) === end.slice(0, 10)) {
     return `${start.slice(0, 10)} ${start.slice(11, 16)}-${end.slice(11, 16)}`;
   }
@@ -751,6 +1022,160 @@ function formatDateTime(date) {
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
 }
 
+function normalizeDisplayDateTime(value) {
+  if (!value) return "";
+  if (value instanceof Date) {
+    return formatDateTime(value).slice(0, 16);
+  }
+  const text = String(value).trim();
+  if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}/.test(text)) {
+    return text.slice(0, 16);
+  }
+  const parsed = new Date(text);
+  if (!Number.isNaN(parsed.getTime())) {
+    return formatDateTime(parsed).slice(0, 16);
+  }
+  return text;
+}
+
+function normalizeDisplayDate(value) {
+  const text = normalizeDisplayDateTime(value);
+  return text ? text.slice(0, 10) : "";
+}
+
+function normalizeMonthValue(value) {
+  const text = String(value || "").trim();
+  if (/^\d{4}-\d{2}$/.test(text)) {
+    return text;
+  }
+  const now = new Date();
+  const pad = (v) => String(v).padStart(2, "0");
+  return `${now.getFullYear()}-${pad(now.getMonth() + 1)}`;
+}
+
+function shiftMonthValue(monthValue, offset) {
+  const [yearText, monthText] = normalizeMonthValue(monthValue).split("-");
+  const year = Number(yearText);
+  const monthIndex = Number(monthText) - 1;
+  const date = new Date(year, monthIndex + Number(offset || 0), 1);
+  const pad = (v) => String(v).padStart(2, "0");
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}`;
+}
+
+function monthLabel(monthValue) {
+  const [yearText, monthText] = normalizeMonthValue(monthValue).split("-");
+  return `${yearText}年${Number(monthText)}月`;
+}
+
+function timeToMinutes(value) {
+  const text = String(value || "").trim();
+  const matched = text.match(/^(\d{1,2}):(\d{2})$/);
+  if (!matched) return null;
+  return Number(matched[1]) * 60 + Number(matched[2]);
+}
+
+function schedulesOverlap(a, b) {
+  const aStart = timeToMinutes(a.start_time);
+  const aEnd = timeToMinutes(a.end_time);
+  const bStart = timeToMinutes(b.start_time);
+  const bEnd = timeToMinutes(b.end_time);
+  if ([aStart, aEnd, bStart, bEnd].some((item) => item === null)) return false;
+  return aStart < bEnd && bStart < aEnd;
+}
+
+function buildClassCalendarData(rows, schedulesByClass, monthValue) {
+  const normalizedMonth = normalizeMonthValue(monthValue);
+  const [yearText, monthText] = normalizedMonth.split("-");
+  const year = Number(yearText);
+  const monthIndex = Number(monthText) - 1;
+  const firstDay = new Date(year, monthIndex, 1);
+  const daysInMonth = new Date(year, monthIndex + 1, 0).getDate();
+  const monthStartWeekday = (firstDay.getDay() + 6) % 7;
+  const gridStart = new Date(year, monthIndex, 1 - monthStartWeekday);
+  const rowById = new Map(rows.map((row) => [Number(row.class_id), row]));
+  const entriesByDate = new Map();
+
+  for (const [classIdRaw, scheduleRows] of schedulesByClass.entries()) {
+    const classId = Number(classIdRaw);
+    const row = rowById.get(classId);
+    if (!row) continue;
+    for (const schedule of scheduleRows || []) {
+      const lessonDate = normalizeDisplayDate(schedule.lesson_date);
+      if (!lessonDate.startsWith(`${normalizedMonth}-`)) continue;
+      if (!entriesByDate.has(lessonDate)) {
+        entriesByDate.set(lessonDate, []);
+      }
+      entriesByDate.get(lessonDate).push({
+        class_id: classId,
+        class_code: row.class_code,
+        class_name: row.class_name,
+        course_name: row.course_name,
+        teacher_name: row.teacher_name,
+        start_time: String(schedule.start_time || ""),
+        end_time: String(schedule.end_time || ""),
+        section: String(schedule.section || ""),
+        is_exam: String(schedule.is_exam || ""),
+        ta_count: Number(row.approved_count || 0),
+        ta_limit: Number(row.maximum_number_of_tas_admitted || 0)
+      });
+    }
+  }
+
+  let conflictDayCount = 0;
+  let conflictItemCount = 0;
+  for (const entries of entriesByDate.values()) {
+    entries.sort((a, b) => {
+      const aStart = timeToMinutes(a.start_time) ?? 0;
+      const bStart = timeToMinutes(b.start_time) ?? 0;
+      return aStart - bStart || String(a.class_name).localeCompare(String(b.class_name), "zh-Hans-CN");
+    });
+    let hasConflict = false;
+    for (let i = 0; i < entries.length; i += 1) {
+      for (let j = i + 1; j < entries.length; j += 1) {
+        if (schedulesOverlap(entries[i], entries[j])) {
+          entries[i].is_conflict = true;
+          entries[j].is_conflict = true;
+          hasConflict = true;
+        }
+      }
+    }
+    if (hasConflict) {
+      conflictDayCount += 1;
+      conflictItemCount += entries.filter((item) => item.is_conflict).length;
+    }
+  }
+
+  const weeks = [];
+  for (let weekIndex = 0; weekIndex < 6; weekIndex += 1) {
+    const days = [];
+    for (let dayIndex = 0; dayIndex < 7; dayIndex += 1) {
+      const date = new Date(gridStart);
+      date.setDate(gridStart.getDate() + weekIndex * 7 + dayIndex);
+      const pad = (v) => String(v).padStart(2, "0");
+      const dateKey = `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
+      const isCurrentMonth = date.getMonth() === monthIndex;
+      days.push({
+        dateKey,
+        dateNumber: date.getDate(),
+        isCurrentMonth,
+        entries: entriesByDate.get(dateKey) || []
+      });
+    }
+    weeks.push(days);
+  }
+
+  return {
+    monthValue: normalizedMonth,
+    monthLabel: monthLabel(normalizedMonth),
+    daysInMonth,
+    totalClasses: rows.length,
+    totalSchedules: Array.from(entriesByDate.values()).reduce((sum, items) => sum + items.length, 0),
+    conflictDayCount,
+    conflictItemCount,
+    weeks
+  };
+}
+
 function createLoginToken(db, userId, targetPath) {
   const token = crypto.randomBytes(24).toString("hex");
   const expiresAt = formatDateTime(addHours(new Date(), 72));
@@ -795,7 +1220,8 @@ function getExternalBaseUrl(req) {
 function buildProfessorEmailDraft(professor, selectedClasses, accessLink) {
   const greeting = `${professor.user_name}教授您好`;
   const classLines = selectedClasses.map((row) => `- ${row.course_name} / ${row.class_name}（${row.class_code}）`).join("\n");
-  const body = `${greeting}，\n\n你任教的以下教学班已完成TA申请的前置审核，请点击以下链接进入系统进行最终审核：\n${accessLink}\n\n${classLines}\n\n请勿将本邮件及其中链接转发给其他人员，以免造成学生申请信息、审核信息等敏感数据泄露。如邮件误收或不再负责相关审核工作，请及时删除并通知系统管理员。\n`;
+  const contactNote = "如有任何疑问或需要获取更多信息，请联系此次负责 TA 招募的同事：course.coordination@saif.sjtu.edu.cn。";
+  const body = `${greeting}，\n\n你任教的以下教学班已完成TA申请的前置审核，请点击以下链接进入系统进行最终审核：\n${accessLink}\n\n${classLines}\n\n${contactNote}\n\n请勿将本邮件及其中链接转发给其他人员，以免造成学生申请信息、审核信息等敏感数据泄露。如邮件误收或不再负责相关审核工作，请及时删除并通知系统管理员。\n`;
   return {
     to: professor.email,
     subject: "TA申请前置审核已完成",
@@ -810,7 +1236,7 @@ function buildProfessorEmailDraft(professor, selectedClasses, accessLink) {
       ],
       listTitle: "待审核教学班",
       listItems: selectedClasses.map((row) => `${row.course_name} / ${row.class_name}（${row.class_code}）`),
-      footer: "请勿将本邮件及其中链接转发给其他人员，以免造成学生申请信息、审核信息等敏感数据泄露。如邮件误收或不再负责相关审核工作，请及时删除并通知系统管理员。"
+      footer: `${contactNote}\n\n请勿将本邮件及其中链接转发给其他人员，以免造成学生申请信息、审核信息等敏感数据泄露。如邮件误收或不再负责相关审核工作，请及时删除并通知系统管理员。`
     })
   };
 }
@@ -846,6 +1272,12 @@ function createMailer() {
 }
 
 function buildBrandedEmailHtml({ eyebrow, title, greeting, intro, facts = [], listTitle = "", listItems = [], footer = "" }) {
+  const footerHtml = String(footer || "")
+    .split(/\n{2,}/)
+    .map((paragraph) => paragraph.trim())
+    .filter(Boolean)
+    .map((paragraph) => `<p style="margin:0 0 12px 0;">${escapeHtml(paragraph)}</p>`)
+    .join("");
   const factsHtml = facts.length
     ? `<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="border-collapse:collapse;mso-table-lspace:0pt;mso-table-rspace:0pt;margin-top:18px;">
       ${facts.map((item) => `<tr>
@@ -907,7 +1339,7 @@ function buildBrandedEmailHtml({ eyebrow, title, greeting, intro, facts = [], li
                       <td style="padding-top:22px;">
                         <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" bgcolor="#F6F1E7" style="border-collapse:collapse;background-color:#F6F1E7;">
                           <tr>
-                            <td style="padding:14px 16px;color:#6D6257;font-size:13px;line-height:22px;">${escapeHtml(footer)}</td>
+                            <td style="padding:14px 16px;color:#6D6257;font-size:13px;line-height:22px;">${footerHtml}</td>
                           </tr>
                         </table>
                       </td>
@@ -1107,7 +1539,7 @@ async function sendProfessorNotificationEmails(db, classes, taAdmin, baseUrl) {
 async function pageLayout(title, body, user, notice) {
   let nav = "";
   if (user) {
-    const links = ['<a href="/">首页</a>', '<a href="/logout">退出</a>'];
+    const links = ['<a href="/">首页</a>', '<a href="/logout" onclick="return confirm(\'确认退出当前账号吗？\')">退出</a>'];
     const unreadCount = await unreadNotificationCount(user.user_id);
     links.splice(1, 0, `<a href="/notifications">通知${unreadCount ? `(${unreadCount})` : ""}</a>`);
     if (user.role === "TA") {
@@ -1122,6 +1554,8 @@ async function pageLayout(title, body, user, notice) {
     nav = `<nav class="nav-links">${links.join("")}</nav>`;
   }
   const noticeBlock = notice ? `<div class="notice">${escapeHtml(notice)}</div>` : "";
+  const backButton = `<button class="back-button" type="button" onclick="if (window.history.length > 1) { window.history.back(); } else { window.location.href = '/'; }" aria-label="返回上一页">返回</button>`;
+  const pageClass = title === "登录" ? "page-login" : "";
   return `<!DOCTYPE html>
   <html lang="zh-CN">
   <head>
@@ -1171,37 +1605,82 @@ async function pageLayout(title, body, user, notice) {
       .topbar {
         max-width: 1360px;
         margin: 0 auto;
-        padding: 18px 32px 14px;
+        padding: 14px 28px 10px;
         display: flex;
         justify-content: space-between;
         align-items: center;
-        gap: 20px;
+        gap: 16px;
+      }
+      .topbar-left {
+        display: flex;
+        align-items: center;
+        gap: 14px;
+        min-width: 0;
+        flex: 1 1 auto;
+      }
+      .back-button {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        flex: 0 0 auto;
+        min-width: 72px;
+        height: 38px;
+        padding: 0 14px;
+        border-radius: 999px;
+        border: 1px solid rgba(26, 34, 135, 0.16);
+        background: linear-gradient(180deg, rgba(255,255,255,0.96), rgba(243,239,233,0.96));
+        color: var(--accent);
+        font-size: 13px;
+        font-weight: 600;
+        cursor: pointer;
+        box-shadow: 0 6px 14px rgba(68, 52, 36, 0.08);
+      }
+      .back-button:hover {
+        background: var(--accent-soft);
+      }
+      .back-button.is-hidden {
+        display: none !important;
       }
       .brand {
         display: flex;
         align-items: center;
         gap: 16px;
-        min-width: 0;
+        min-width: 420px;
+        flex: 0 0 auto;
       }
       .brand-logo {
         display: block;
-        width: 340px;
-        max-width: min(44vw, 340px);
+        flex-shrink: 0;
+        width: 300px;
+        max-width: min(40vw, 300px);
+        aspect-ratio: 4339 / 832;
         height: auto;
+        object-fit: contain;
+        object-position: left center;
       }
       .brand-text {
         min-width: 0;
       }
       .brand-text h1 {
         margin: 0;
-        font-size: 24px;
+        font-size: 22px;
         font-weight: 700;
         letter-spacing: -0.02em;
+        white-space: nowrap;
       }
       .brand-text p {
         margin: 6px 0 0;
         color: var(--muted);
         font-size: 13px;
+      }
+      .brand-text .role-line {
+        margin-top: 4px;
+        color: var(--muted);
+        font-size: 12px;
+        line-height: 1.4;
+      }
+      .brand-text .role-line div {
+        white-space: nowrap;
       }
       .nav-links {
         display: flex;
@@ -1209,14 +1688,17 @@ async function pageLayout(title, body, user, notice) {
         justify-content: flex-end;
         gap: 10px;
         min-width: 0;
+        flex: 1 1 auto;
       }
       .nav-links a {
-        padding: 10px 14px;
+        padding: 8px 12px;
         border-radius: 999px;
         color: var(--accent);
         background: transparent;
         font-weight: 500;
+        font-size: 14px;
         white-space: nowrap;
+        flex: 0 0 auto;
       }
       .nav-links a:hover {
         background: var(--accent-soft);
@@ -1299,7 +1781,17 @@ async function pageLayout(title, body, user, notice) {
       .table-wrap {
         overflow-x: auto;
         -webkit-overflow-scrolling: touch;
-        scrollbar-gutter: stable both-edges;
+      }
+      .table-wrap table th,
+      .detail-table-wrap table th {
+        font-size: 11px;
+        padding: 10px 8px;
+      }
+      .table-wrap table td,
+      .detail-table-wrap table td {
+        font-size: 13px;
+        padding: 10px 8px;
+        line-height: 1.45;
       }
       .table-wrap.list-scroll {
         max-height: min(62vh, 760px);
@@ -1307,6 +1799,7 @@ async function pageLayout(title, body, user, notice) {
         border: 1px solid var(--line);
         border-radius: 18px;
         background: var(--panel);
+        scrollbar-gutter: stable;
       }
       .table-wrap.list-scroll table {
         margin: 0;
@@ -1318,14 +1811,39 @@ async function pageLayout(title, body, user, notice) {
         background: linear-gradient(180deg, #f8efe4, #f6f0e8);
         box-shadow: inset 0 -1px 0 #d8c9b1;
       }
+      .detail-table-wrap {
+        overflow-x: auto;
+        overflow-y: visible;
+        -webkit-overflow-scrolling: touch;
+        border: 1px solid var(--line);
+        border-radius: 18px;
+        background: var(--panel);
+        padding: 0;
+      }
+      .detail-table-wrap table {
+        min-width: 760px;
+        margin: 0;
+      }
+      .detail-table-wrap th,
+      .detail-table-wrap td {
+        white-space: nowrap;
+      }
+      .detail-table-wrap .audit-log-table td:last-child,
+      .detail-table-wrap .audit-log-table th:last-child {
+        white-space: normal;
+      }
       table.wide { min-width: 1320px; }
       table.compact-table th {
         font-size: 11px;
         padding: 10px 8px;
+        vertical-align: middle;
+        line-height: 1.2;
+        white-space: nowrap;
       }
       table.compact-table td {
         font-size: 13px;
         padding: 10px 8px;
+        vertical-align: middle;
       }
       table.fixed-layout th,
       table.fixed-layout td {
@@ -1374,6 +1892,199 @@ async function pageLayout(title, body, user, notice) {
         font-size: 11px;
         line-height: 1.2;
       }
+      .ta-summary-grid {
+        display: grid;
+        gap: 14px;
+        grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+        margin-bottom: 18px;
+      }
+      .ta-summary-card {
+        border: 1px solid var(--line);
+        border-radius: 18px;
+        background: linear-gradient(180deg, #fffdf9, #faf4eb);
+        padding: 14px 16px;
+        box-shadow: 0 1px 2px rgba(60, 64, 67, 0.06);
+      }
+      .ta-summary-card .summary-label {
+        font-size: 12px;
+        color: var(--muted);
+        margin-bottom: 6px;
+      }
+      .ta-summary-card .summary-value {
+        font-size: 28px;
+        font-weight: 800;
+        color: var(--text);
+        line-height: 1.1;
+      }
+      .ta-summary-card .summary-footnote {
+        margin-top: 6px;
+        font-size: 12px;
+        color: var(--muted);
+      }
+      .calendar-toolbar {
+        display: flex;
+        flex-wrap: wrap;
+        justify-content: space-between;
+        align-items: center;
+        gap: 12px;
+        margin-bottom: 16px;
+      }
+      .calendar-toolbar h2 {
+        margin: 0;
+      }
+      .calendar-actions {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 10px;
+        align-items: center;
+      }
+      .calendar-meta-grid {
+        display: grid;
+        gap: 12px;
+        grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+        margin-bottom: 18px;
+      }
+      .calendar-meta-card {
+        padding: 14px 16px;
+        border-radius: 18px;
+        background: linear-gradient(180deg, #fffefb, #f8f3ec);
+        border: 1px solid #e6d7bf;
+      }
+      .calendar-meta-label {
+        color: var(--muted);
+        font-size: 12px;
+        margin-bottom: 6px;
+      }
+      .calendar-meta-value {
+        font-size: 28px;
+        font-weight: 700;
+        letter-spacing: -0.03em;
+      }
+      .calendar-legend {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 10px;
+        margin-bottom: 16px;
+      }
+      .calendar-legend-item {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        color: var(--muted);
+        font-size: 13px;
+      }
+      .calendar-legend-swatch {
+        width: 14px;
+        height: 14px;
+        border-radius: 6px;
+        border: 1px solid var(--line);
+      }
+      .calendar-wrap {
+        overflow: auto;
+        border: 1px solid var(--line);
+        border-radius: 22px;
+        background: var(--panel);
+      }
+      .calendar-table {
+        width: 100%;
+        min-width: 1120px;
+        border-collapse: separate;
+        border-spacing: 0;
+      }
+      .calendar-table th,
+      .calendar-table td {
+        border-right: 1px solid var(--line);
+        border-bottom: 1px solid var(--line);
+        padding: 0;
+        vertical-align: top;
+        text-align: left;
+        overflow: visible;
+        text-overflow: clip;
+      }
+      .calendar-table th:last-child,
+      .calendar-table td:last-child {
+        border-right: 0;
+      }
+      .calendar-table tr:last-child td {
+        border-bottom: 0;
+      }
+      .calendar-table th {
+        position: sticky;
+        top: 0;
+        z-index: 2;
+        background: linear-gradient(180deg, #f8efe4, #f6f0e8);
+        padding: 12px 14px;
+        font-size: 12px;
+        color: var(--muted);
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+      }
+      .calendar-day {
+        min-height: 180px;
+        padding: 12px;
+        background: #fff;
+      }
+      .calendar-day.is-outside {
+        background: #faf8f3;
+      }
+      .calendar-day.is-outside .calendar-day-number {
+        color: #b8ad9e;
+      }
+      .calendar-day-header {
+        display: flex;
+        justify-content: space-between;
+        align-items: baseline;
+        gap: 8px;
+        margin-bottom: 10px;
+      }
+      .calendar-day-number {
+        font-size: 18px;
+        font-weight: 700;
+      }
+      .calendar-day-count {
+        color: var(--muted);
+        font-size: 11px;
+      }
+      .calendar-day-list {
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+      }
+      .calendar-entry {
+        border-radius: 14px;
+        border: 1px solid #d8dff8;
+        background: #edf2ff;
+        padding: 9px 10px;
+        box-shadow: 0 1px 0 rgba(26, 34, 135, 0.04);
+      }
+      .calendar-entry.is-conflict {
+        border-color: #d9b98a;
+        background: #fbedd9;
+      }
+      .calendar-entry-time {
+        font-size: 12px;
+        font-weight: 700;
+        color: var(--accent);
+      }
+      .calendar-entry.is-conflict .calendar-entry-time {
+        color: #8a5f22;
+      }
+      .calendar-entry-name {
+        margin-top: 4px;
+        font-size: 13px;
+        font-weight: 600;
+        line-height: 1.35;
+      }
+      .calendar-entry-meta {
+        margin-top: 4px;
+        color: var(--muted);
+        font-size: 11px;
+        line-height: 1.4;
+      }
+      .calendar-empty {
+        color: #b3aa9f;
+        font-size: 12px;
+      }
       .filters-grid {
         display: grid;
         gap: 12px 14px;
@@ -1390,15 +2101,43 @@ async function pageLayout(title, body, user, notice) {
         justify-content: flex-start;
         align-items: center;
       }
+      .filters-actions-row {
+        display: flex;
+        flex-wrap: nowrap;
+        gap: 8px;
+        align-items: center;
+      }
+      .filters-actions-row .action-button {
+        min-width: 110px;
+        justify-content: center;
+        text-align: center;
+      }
+      .filters-grid.pending-filters {
+        grid-template-columns: repeat(3, minmax(0, 1fr)) auto;
+      }
+      .filters-grid.pending-filters .actions {
+        white-space: nowrap;
+      }
       @media (max-width: 1100px) {
         .filters-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+        .filters-grid.pending-filters { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       }
       @media (max-width: 720px) {
         .filters-grid { grid-template-columns: 1fr; }
+        .filters-grid.pending-filters { grid-template-columns: 1fr; }
         .class-card-grid { grid-template-columns: 1fr; }
         .report-grid { grid-template-columns: 1fr; }
         .report-row { grid-template-columns: 1fr; }
         .report-row-side { text-align: left; }
+        .calendar-toolbar {
+          align-items: flex-start;
+        }
+        .calendar-actions {
+          width: 100%;
+        }
+        .calendar-meta-grid {
+          grid-template-columns: repeat(2, minmax(0, 1fr));
+        }
       }
       .notice {
         max-width: 1360px;
@@ -1666,6 +2405,11 @@ async function pageLayout(title, body, user, notice) {
         min-width: 200px;
         max-width: 260px;
       }
+      .schedule-summary.schedule-summary-compact {
+        min-width: 0;
+        max-width: none;
+        align-items: center;
+      }
       .schedule-preview {
         display: flex;
         flex-direction: column;
@@ -1686,6 +2430,26 @@ async function pageLayout(title, body, user, notice) {
       .schedule-meta {
         font-size: 12px;
         color: var(--muted);
+      }
+      .schedule-trigger {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        min-width: 34px;
+        height: 30px;
+        padding: 0 10px;
+        border-radius: 10px;
+        border: 1px solid #e4d5bd;
+        background: #f7ecda;
+        color: #6d4b17;
+        font-size: 13px;
+        font-weight: 700;
+        line-height: 1;
+        cursor: pointer;
+        white-space: nowrap;
+      }
+      .schedule-trigger:hover {
+        background: #f3e3c8;
       }
       .schedule-dialog {
         border: 0;
@@ -1751,6 +2515,47 @@ async function pageLayout(title, body, user, notice) {
         appearance: none;
         background: #faf7f2;
       }
+      select[multiple] {
+        appearance: auto;
+        min-height: 172px;
+        padding: 6px 8px;
+        background: #fff;
+        overflow-y: auto;
+      }
+      select[multiple] option {
+        padding: 6px 8px;
+        color: var(--ink);
+      }
+      .multi-select-list {
+        appearance: auto !important;
+        -webkit-appearance: listbox !important;
+        width: 100%;
+        height: 244px;
+        min-height: 244px;
+        padding: 8px 10px;
+        border: 1px solid #cbbfad;
+        border-radius: 14px;
+        background: #fff;
+        color: var(--ink);
+        line-height: 1.45;
+        font-size: 14px;
+        box-sizing: border-box;
+        overflow-x: hidden;
+        overflow-y: auto;
+      }
+      .multi-select-list option {
+        display: block;
+        min-height: 28px;
+        padding: 6px 10px;
+        line-height: 1.4;
+        white-space: normal;
+        color: var(--ink);
+      }
+      .multi-select-list:focus {
+        outline: none;
+        border-color: var(--accent);
+        box-shadow: 0 0 0 4px rgba(26, 115, 232, 0.12);
+      }
       input[type="checkbox"] {
         width: 18px;
         height: 18px;
@@ -1810,7 +2615,14 @@ async function pageLayout(title, body, user, notice) {
       .table-actions-compact {
         display: flex;
         gap: 6px;
-        flex-wrap: wrap;
+        flex-wrap: nowrap;
+      }
+      .cell-compact {
+        font-size: 13px;
+        line-height: 1.35;
+      }
+      .cell-compact .name-pill-wrap {
+        gap: 4px;
       }
       .table-actions-compact .action-button {
         min-width: 64px;
@@ -1837,7 +2649,126 @@ async function pageLayout(title, body, user, notice) {
         flex-wrap: wrap;
         min-height: 100%;
       }
+      .table-action-inner.notifications-actions {
+        display: inline-grid;
+        grid-template-columns: repeat(2, minmax(84px, max-content));
+        gap: 8px;
+        align-items: center;
+        justify-content: center;
+      }
+      .table-action-inner.application-actions {
+        display: inline-grid;
+        grid-template-columns: repeat(2, minmax(84px, max-content));
+        gap: 8px;
+        align-items: center;
+        justify-content: center;
+      }
+      .table-action-inner.notifications-actions .action-placeholder {
+        display: inline-block;
+        min-width: 84px;
+        height: 36px;
+      }
+      .table-action-inner.application-actions .action-placeholder {
+        display: inline-block;
+        min-width: 84px;
+        height: 36px;
+      }
+      .compact-note.reapply-note {
+        color: #8a4b0f;
+      }
       .mobile-only { display: none; }
+      .mobile-fab {
+        position: fixed;
+        right: 16px;
+        bottom: 18px;
+        z-index: 28;
+        display: none;
+        align-items: center;
+        justify-content: center;
+        min-width: 0;
+        padding: 12px 16px;
+        border-radius: 999px;
+        border: 1px solid rgba(26, 34, 135, 0.18);
+        background: linear-gradient(180deg, #1a2287, #2b36a3);
+        color: #fff;
+        box-shadow: 0 14px 28px rgba(26, 34, 135, 0.22);
+        font-size: 13px;
+        font-weight: 700;
+      }
+      .mobile-fab:hover {
+        color: #fff;
+        text-decoration: none;
+        transform: translateY(-1px);
+      }
+      .filter-dialog {
+        width: min(480px, calc(100vw - 16px));
+        border: none;
+        border-radius: 20px;
+        padding: 0;
+        box-shadow: 0 24px 48px rgba(0, 0, 0, 0.2);
+      }
+      .filter-dialog::backdrop {
+        background: rgba(34, 37, 66, 0.3);
+        backdrop-filter: blur(3px);
+      }
+      .filter-dialog-body {
+        padding: 18px;
+      }
+      .filter-dialog-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 10px;
+        margin-bottom: 12px;
+      }
+      .filter-dialog-header h3 {
+        margin: 0;
+      }
+      .notification-card-list {
+        display: grid;
+        gap: 12px;
+      }
+      .notification-card {
+        border: 1px solid var(--line);
+        border-radius: 16px;
+        background: #fff;
+        padding: 14px;
+      }
+      .notification-card-header {
+        display: flex;
+        align-items: flex-start;
+        justify-content: space-between;
+        gap: 12px;
+        margin-bottom: 8px;
+      }
+      .notification-card h3 {
+        margin: 0;
+        font-size: 15px;
+        line-height: 1.35;
+      }
+      .notification-card p {
+        margin: 0 0 8px;
+        font-size: 13px;
+        line-height: 1.55;
+        color: var(--text);
+      }
+      .notification-card-meta {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        margin-bottom: 10px;
+        color: var(--muted);
+        font-size: 12px;
+      }
+      .notification-card-actions {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 8px;
+      }
+      .notification-card-actions .action-placeholder {
+        display: block;
+        min-height: 36px;
+      }
       .desktop-only { display: block; }
       .mobile-card-list {
         display: flex;
@@ -1894,8 +2825,8 @@ async function pageLayout(title, body, user, notice) {
       .split { display: grid; grid-template-columns: 2fr 1fr; gap: 18px; }
       .hero {
         display: grid;
-        grid-template-columns: minmax(280px, 1.1fr) minmax(320px, 420px);
-        gap: 24px;
+        grid-template-columns: minmax(280px, 0.92fr) minmax(320px, 430px);
+        gap: 20px;
         align-items: stretch;
       }
       .feature-card {
@@ -1910,18 +2841,70 @@ async function pageLayout(title, body, user, notice) {
         background: linear-gradient(180deg, var(--brand-red), var(--brand-gold));
       }
       .feature-card h3 {
-        margin-bottom: 10px;
+        margin-bottom: 8px;
       }
       .feature-card p {
         color: var(--muted);
-        margin: 0 0 16px;
-        line-height: 1.65;
+        margin: 0 0 14px;
+        line-height: 1.6;
+        font-size: 14px;
       }
       .feature-card .actions {
         margin-top: auto;
       }
+      .home-summary {
+        display: grid;
+        grid-template-columns: minmax(0, 1.2fr) auto;
+        gap: 18px;
+        align-items: center;
+      }
+      .home-summary-main {
+        min-width: 0;
+      }
+      .home-summary-title {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        margin-bottom: 8px;
+      }
+      .home-summary-title h2 {
+        margin: 0;
+      }
+      .home-summary-subtitle {
+        margin: 0;
+        color: var(--muted);
+        line-height: 1.6;
+      }
+      .home-role-chip {
+        display: inline-flex;
+        align-items: center;
+        padding: 6px 10px;
+        border-radius: 999px;
+        background: var(--brand-gold-soft);
+        color: #7d5726;
+        font-size: 12px;
+        font-weight: 700;
+      }
+      .home-user-name {
+        font-size: 18px;
+        font-weight: 700;
+        color: var(--ink);
+      }
+      .dashboard-grid {
+        display: grid;
+        gap: 14px;
+        grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      }
+      .dashboard-grid .feature-card {
+        min-height: 186px;
+        padding: 20px;
+      }
+      .dashboard-grid .button-link {
+        min-width: 72px;
+        padding: 9px 14px;
+      }
       .hero-panel {
-        min-height: 420px;
+        min-height: 360px;
         display: flex;
         flex-direction: column;
         justify-content: center;
@@ -1929,6 +2912,7 @@ async function pageLayout(title, body, user, notice) {
           linear-gradient(135deg, rgba(26, 34, 135, 0.95), rgba(26, 34, 135, 0.82) 48%, rgba(200, 22, 30, 0.78)),
           linear-gradient(160deg, var(--brand-gold-soft), #fff);
         color: #fff;
+        padding: 28px 34px;
       }
       .hero-panel::before {
         content: "";
@@ -1945,10 +2929,13 @@ async function pageLayout(title, body, user, notice) {
         z-index: 1;
       }
       .hero-logo {
-        width: min(320px, 62%);
+        width: min(250px, 48%);
         max-width: 100%;
+        aspect-ratio: 1457 / 2279;
         height: auto;
-        margin: 0 0 20px;
+        margin: 0 0 16px;
+        object-fit: contain;
+        object-position: left top;
         filter: drop-shadow(0 10px 24px rgba(0, 0, 0, 0.18));
       }
       .hero-panel .hero-pills {
@@ -1960,36 +2947,147 @@ async function pageLayout(title, body, user, notice) {
       .hero-panel .hero-pills span {
         display: inline-flex;
         align-items: center;
-        padding: 6px 10px;
+        padding: 5px 10px;
         border-radius: 999px;
         background: rgba(255, 255, 255, 0.16);
         color: #fff;
-        font-size: 12px;
+        font-size: 11px;
         font-weight: 600;
         border: 1px solid rgba(255,255,255,0.18);
       }
       .hero-panel h2 {
-        font-size: 34px;
+        font-size: 28px;
         line-height: 1.15;
-        margin-bottom: 16px;
+        margin-bottom: 12px;
       }
       .hero-panel p {
-        margin: 0 0 12px;
+        margin: 0 0 10px;
         color: rgba(255, 255, 255, 0.9);
-        line-height: 1.7;
+        line-height: 1.6;
+        font-size: 14px;
       }
       .login-card {
         display: flex;
         flex-direction: column;
         justify-content: center;
-        min-height: 420px;
+        min-height: 360px;
         background: linear-gradient(180deg, #ffffff, #fbf8f3);
+        padding: 28px 32px;
+      }
+      .page-login main {
+        max-width: 1280px;
+      }
+      .page-login .hero {
+        position: relative;
+        display: block;
+      }
+      .page-login .hero-panel {
+        min-height: 560px;
+        padding: 34px 470px 32px 36px;
+        border-radius: 32px;
+      }
+      .page-login .login-card {
+        position: absolute;
+        top: 50%;
+        right: 32px;
+        z-index: 2;
+        transform: translateY(-50%);
+        width: min(440px, calc(100% - 64px));
+        margin-left: 0;
+        min-height: auto;
+        padding: 34px 30px;
+        border-radius: 28px;
+        background: linear-gradient(180deg, rgba(255,255,255,0.80), rgba(255,255,255,0.68));
+        border: 1px solid rgba(255,255,255,0.62);
+        backdrop-filter: blur(18px) saturate(1.08);
+        -webkit-backdrop-filter: blur(18px) saturate(1.08);
+        box-shadow: 0 18px 36px rgba(32, 30, 60, 0.16);
+      }
+      .page-login .login-shell {
+        width: 100%;
+      }
+      .page-login .login-card .actions {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 10px;
+      }
+      .page-login .login-card .actions .button-link,
+      .page-login .login-card .actions button {
+        width: 100%;
+        justify-content: center;
+      }
+      .login-card .muted {
+        margin-bottom: 18px;
+      }
+      .page-login .login-card h2 {
+        font-size: 20px;
+      }
+      .page-login .login-card .muted {
+        font-size: 14px;
+        line-height: 1.55;
+      }
+      .page-login .login-card form p {
+        margin-bottom: 16px;
+      }
+      .page-login .login-card input {
+        min-height: 44px;
+      }
+      .page-login .login-card .actions {
+        margin-top: 10px;
+      }
+      .page-login .mobile-login-copy {
+        display: none;
+      }
+      .login-card form p {
+        margin: 0 0 14px;
+      }
+      .login-card input {
+        margin-top: 6px;
+      }
+      .login-card .actions {
+        margin-top: 6px;
+      }
+      .login-shell {
+        width: min(100%, 360px);
+      }
+      .login-shell h2 {
+        margin-bottom: 10px;
+      }
+      .login-shell .button-link,
+      .login-shell button {
+        min-width: 104px;
       }
       @media (max-width: 900px) {
         .topbar { padding-left: 18px; padding-right: 18px; align-items: flex-start; flex-direction: column; }
         main { padding-left: 18px; padding-right: 18px; }
         .split, .hero { grid-template-columns: 1fr; }
-        .hero-panel, .login-card { min-height: auto; }
+        .hero-panel, .login-card { min-height: auto; padding: 22px 22px; }
+        .login-shell { width: 100%; }
+        .page-login .hero {
+          display: grid;
+          grid-template-columns: 1fr;
+          gap: 12px;
+        }
+        .page-login .hero-panel {
+          min-height: auto;
+          padding: 22px 20px 20px;
+          border-radius: 24px;
+        }
+        .page-login .login-card {
+          position: relative;
+          top: auto;
+          right: auto;
+          transform: none;
+          width: 100%;
+          margin-left: 0;
+          padding: 20px 18px;
+          border-radius: 24px;
+          background: linear-gradient(180deg, rgba(255,255,255,0.96), rgba(251,248,243,0.94));
+          border-color: rgba(221,213,202,0.92);
+          backdrop-filter: blur(10px);
+          -webkit-backdrop-filter: blur(10px);
+          box-shadow: var(--shadow);
+        }
         .nav-links {
           width: 100%;
           flex-wrap: nowrap;
@@ -2032,42 +3130,100 @@ async function pageLayout(title, body, user, notice) {
         body {
           font-size: 14px;
         }
+        .site-header {
+          position: sticky;
+          top: 0;
+          z-index: 30;
+          backdrop-filter: blur(10px);
+        }
         .topbar {
-          padding: 14px 14px 12px;
-          gap: 12px;
+          padding: 12px 14px 10px;
+          gap: 10px;
+        }
+        .topbar-left {
+          width: 100%;
+          align-items: flex-start;
+          gap: 10px;
+        }
+        .back-button {
+          min-width: 62px;
+          height: 34px;
+          padding: 0 12px;
+          font-size: 12px;
         }
         .brand {
           width: 100%;
           align-items: flex-start;
+          min-width: 0;
+          flex: 1 1 auto;
+          gap: 10px;
         }
         .brand-logo {
-          width: 240px;
-          max-width: 56vw;
+          width: 208px;
+          max-width: 52vw;
         }
-        .brand h1 {
-          font-size: 20px;
+        .brand h1,
+        .brand-text h1 {
+          font-size: 18px;
+          white-space: normal;
+          line-height: 1.15;
         }
-        .brand p {
+        .brand p,
+        .brand-text p {
+          font-size: 11px;
+        }
+        .brand-text .role-line div {
+          white-space: normal;
+        }
+        .nav-links {
+          gap: 6px;
+          padding-bottom: 2px;
+          align-items: center;
+        }
+        .nav-links a {
           font-size: 12px;
+          padding: 8px 10px;
+          border-radius: 999px;
+          flex: 0 0 auto;
         }
         main {
-          padding: 16px 14px 32px;
+          padding: 14px 12px 28px;
         }
         .notice {
-          margin-top: 12px;
+          margin-top: 10px;
           border-radius: 14px;
-          padding: 12px 14px;
+          padding: 10px 12px;
+          font-size: 13px;
         }
         .card {
-          padding: 16px;
-          border-radius: 18px;
-          margin-bottom: 14px;
+          padding: 14px;
+          border-radius: 16px;
+          margin-bottom: 12px;
+        }
+        .home-summary {
+          grid-template-columns: 1fr;
+          gap: 10px;
+        }
+        .dashboard-grid {
+          grid-template-columns: 1fr;
+        }
+        .dashboard-grid .feature-card {
+          min-height: auto;
+        }
+        .hero-logo {
+          width: min(180px, 54%);
+        }
+        .hero-panel h2 {
+          font-size: 21px;
+        }
+        .hero-panel p {
+          font-size: 12px;
         }
         h2 {
-          font-size: 20px;
+          font-size: 19px;
         }
         h3 {
-          font-size: 17px;
+          font-size: 16px;
         }
         .grid {
           grid-template-columns: 1fr;
@@ -2077,15 +3233,15 @@ async function pageLayout(title, body, user, notice) {
           gap: 12px;
         }
         .hero-logo {
-          width: min(220px, 76%);
-          margin-bottom: 16px;
+          width: min(190px, 72%);
+          margin-bottom: 14px;
         }
         .hero-panel .hero-pills span {
           font-size: 11px;
           padding: 5px 8px;
         }
         .class-card {
-          padding: 14px 14px 12px;
+          padding: 13px 13px 11px;
         }
         .feature-card::before {
           width: 3px;
@@ -2109,13 +3265,135 @@ async function pageLayout(title, body, user, notice) {
           font-size: 13px;
         }
         input, select, textarea {
-          padding: 11px 12px;
+          padding: 10px 11px;
           border-radius: 12px;
         }
         .login-card input,
         .login-card select,
         .login-card textarea {
           font-size: 16px;
+        }
+        .hero-panel,
+        .login-card {
+          padding: 18px 16px;
+        }
+        .page-login .topbar {
+          padding-top: 10px;
+          padding-bottom: 8px;
+        }
+        .page-login .topbar-left {
+          gap: 8px;
+        }
+        .page-login .brand {
+          gap: 10px;
+          min-width: 0;
+        }
+        .page-login .brand-logo {
+          width: 180px;
+          max-width: 44vw;
+        }
+        .page-login .brand-text h1 {
+          font-size: 17px;
+        }
+        .page-login .brand-text p {
+          font-size: 10px;
+          line-height: 1.35;
+        }
+        .page-login .hero-panel {
+          min-height: auto;
+          padding: 16px 14px 14px;
+        }
+        .page-login .login-card {
+          min-height: auto;
+          padding: 14px 14px 16px;
+        }
+        .page-login .hero {
+          display: block;
+          overflow: visible;
+          border-radius: 0;
+          background: transparent;
+          box-shadow: none;
+        }
+        .page-login .hero-panel,
+        .page-login .login-card {
+          margin: 0;
+          box-shadow: var(--shadow);
+        }
+        .page-login .hero {
+          display: block;
+          overflow: visible;
+          border-radius: 0;
+          background: transparent;
+          box-shadow: none;
+          padding-top: 0;
+          margin: 0;
+        }
+        .page-login .hero-panel {
+          position: relative;
+          min-height: 620px;
+          padding: 18px 16px 160px;
+          border-radius: 22px;
+          box-shadow: var(--shadow);
+          overflow: hidden;
+        }
+        .page-login .login-card {
+          position: absolute;
+          left: 16px;
+          right: 16px;
+          top: 210px;
+          margin: 0 auto;
+          width: auto;
+          border-top: 0;
+          border-radius: 22px;
+          background: linear-gradient(180deg, rgba(255,255,255,0.82), rgba(251,248,243,0.76));
+          border: 1px solid rgba(255,255,255,0.6);
+          backdrop-filter: blur(18px) saturate(1.06);
+          -webkit-backdrop-filter: blur(18px) saturate(1.06);
+          box-shadow: 0 16px 28px rgba(32, 30, 60, 0.14);
+          z-index: 2;
+        }
+        .page-login .hero-panel h2,
+        .page-login .hero-panel p,
+        .page-login .hero-panel .hero-pills {
+          display: none;
+        }
+        .page-login .hero-logo {
+          display: block;
+          width: min(164px, 48%);
+          margin-bottom: 0;
+        }
+        .page-login .login-shell h2 {
+          margin-bottom: 10px;
+        }
+        .page-login .login-card .muted {
+          margin-bottom: 12px;
+          font-size: 12px;
+        }
+        .login-shell {
+          max-width: 100%;
+        }
+        .login-shell .actions {
+          display: grid;
+          grid-template-columns: repeat(2, minmax(0, 1fr));
+          gap: 8px;
+        }
+        .filters-shell,
+        .filters-card {
+          padding: 14px;
+        }
+        .filters-actions-row,
+        .filters-actions {
+          width: 100%;
+          justify-content: stretch;
+          gap: 8px;
+          flex-wrap: wrap;
+        }
+        .filters-actions-row button,
+        .filters-actions-row a,
+        .filters-actions button,
+        .filters-actions a {
+          flex: 1 1 calc(50% - 4px);
+          min-width: 0;
         }
         .actions {
           width: 100%;
@@ -2156,17 +3434,234 @@ async function pageLayout(title, body, user, notice) {
         .mobile-data-value {
           font-size: 12px;
         }
+        .mobile-fab {
+          display: inline-flex;
+        }
+        .ta-summary-grid,
+        .stats-grid,
+        .calendar-meta-grid {
+          grid-template-columns: repeat(2, minmax(0, 1fr));
+          gap: 10px;
+        }
+        .summary-card,
+        .stat-card,
+        .calendar-meta-card {
+          padding: 12px;
+          min-height: auto;
+        }
+        .summary-value,
+        .stat-value,
+        .calendar-meta-value {
+          font-size: 24px;
+        }
+        .report-grid {
+          grid-template-columns: 1fr;
+          gap: 12px;
+        }
+        .report-card {
+          padding: 14px;
+        }
+        .calendar-shell {
+          padding: 14px;
+        }
+        .calendar-grid {
+          gap: 8px;
+        }
+        .calendar-day {
+          min-height: 120px;
+          padding: 10px;
+        }
+        .calendar-event {
+          font-size: 11px;
+          padding: 6px 7px;
+        }
+        .notification-card {
+          padding: 12px;
+        }
+        .notification-card-actions {
+          grid-template-columns: 1fr;
+        }
+        .page-login .mobile-login-copy {
+          display: block;
+          position: absolute;
+          left: 16px;
+          right: 16px;
+          bottom: 16px;
+          margin: 0;
+          padding: 0;
+          border-radius: 0;
+          background: transparent;
+          color: #fff;
+          box-shadow: none;
+          z-index: 1;
+        }
+        .page-login .mobile-login-copy h3 {
+          margin: 0 0 8px;
+          font-size: 15px;
+          line-height: 1.2;
+        }
+        .page-login .mobile-login-copy p {
+          margin: 0 0 10px;
+          font-size: 11px;
+          line-height: 1.5;
+          color: rgba(255,255,255,0.88);
+        }
+        .page-login .mobile-login-copy .hero-pills {
+          display: flex;
+          flex-wrap: wrap;
+          gap: 6px;
+        }
+        .page-login .mobile-login-copy .hero-pills span {
+          display: inline-flex;
+          align-items: center;
+          padding: 4px 8px;
+          border-radius: 999px;
+          background: rgba(255,255,255,0.16);
+          color: #fff;
+          font-size: 10px;
+          font-weight: 600;
+          border: 1px solid rgba(255,255,255,0.18);
+        }
+      }
+      @media (max-width: 520px) {
+        .topbar {
+          padding: 10px 10px 8px;
+        }
+        .topbar-left {
+          gap: 8px;
+        }
+        .back-button {
+          min-width: 56px;
+          height: 32px;
+          padding: 0 10px;
+          font-size: 11px;
+        }
+        .brand-logo {
+          width: 168px;
+          max-width: 46vw;
+        }
+        .brand h1,
+        .brand-text h1 {
+          font-size: 16px;
+        }
+        .nav-links a {
+          font-size: 11px;
+          padding: 7px 9px;
+        }
+        main {
+          padding: 12px 10px 24px;
+        }
+        .card,
+        .filters-shell,
+        .filters-card,
+        .report-card,
+        .calendar-shell {
+          padding: 12px;
+        }
+        .login-shell .actions,
+        .filters-actions-row button,
+        .filters-actions-row a,
+        .filters-actions button,
+        .filters-actions a {
+          flex-basis: 100%;
+        }
+        .ta-summary-grid,
+        .stats-grid,
+        .calendar-meta-grid {
+          grid-template-columns: 1fr;
+        }
+        .summary-value,
+        .stat-value,
+        .calendar-meta-value {
+          font-size: 22px;
+        }
+        .calendar-day {
+          min-height: 102px;
+          padding: 8px;
+        }
+        .mobile-data-row {
+          grid-template-columns: 64px minmax(0, 1fr);
+        }
+        .mobile-fab {
+          right: 12px;
+          bottom: 14px;
+          padding: 11px 14px;
+          font-size: 12px;
+        }
+        .notification-card h3 {
+          font-size: 14px;
+        }
+        .notification-card p {
+          font-size: 12px;
+        }
+        .page-login .brand-logo {
+          width: 150px;
+          max-width: 40vw;
+        }
+        .page-login .brand-text h1 {
+          font-size: 15px;
+        }
+        .page-login .brand-text p {
+          font-size: 9px;
+        }
+        .page-login .hero-panel,
+        .page-login .login-card,
+        .page-login .card {
+          padding: 12px;
+        }
+        .page-login .hero {
+          border-radius: 0;
+          padding-top: 0;
+        }
+        .page-login .hero-panel {
+          border-radius: 18px;
+          min-height: 600px;
+          padding: 14px 14px 120px;
+        }
+        .page-login .login-card {
+          position: absolute;
+          left: 12px;
+          right: 12px;
+          top: 96px;
+          margin: 0 auto;
+          padding-top: 12px;
+          border-radius: 18px;
+        }
+        .page-login .login-shell .actions {
+          grid-template-columns: 1fr;
+        }
+        .page-login .mobile-login-copy {
+          left: 12px;
+          right: 12px;
+          bottom: 14px;
+          padding: 0;
+          border-radius: 0;
+        }
+        .page-login .hero-logo {
+          width: min(150px, 46%);
+        }
+        .page-login .mobile-login-copy h3 {
+          font-size: 14px;
+        }
+        .page-login .mobile-login-copy p {
+          font-size: 10px;
+        }
       }
     </style>
   </head>
-  <body>
+  <body class="${pageClass}">
     <header>
       <div class="topbar">
-        <div class="brand">
-          <img class="brand-logo" src="${SAIF_LOGO_HORIZONTAL}" alt="SAIF Logo">
-          <div class="brand-text">
-            <h1>TA 选课系统</h1>
-            <p>${user ? `当前角色：${escapeHtml(user.role)} · ${escapeHtml(user.user_name)}` : "上海高级金融学院 Teaching Assistant Course Assignment Platform"}</p>
+        <div class="topbar-left">
+          ${backButton}
+          <div class="brand">
+            <img class="brand-logo" src="${SAIF_LOGO_HORIZONTAL}" alt="SAIF Logo">
+            <div class="brand-text">
+              <h1>TA 选课系统</h1>
+              ${user
+                ? `<div class="role-line"><div>当前角色：${escapeHtml(user.role)}</div><div>· ${escapeHtml(user.user_name)}</div></div>`
+                : `<p>上海高级金融学院 Teaching Assistant Course Assignment Platform</p>`}
+            </div>
           </div>
         </div>
         ${nav}
@@ -2175,6 +3670,10 @@ async function pageLayout(title, body, user, notice) {
     ${noticeBlock}
     <main>${body}</main>
     <script>
+      const backButton = document.querySelector('.back-button');
+      if (backButton && (window.location.pathname === '/' || window.location.pathname === '/login')) {
+        backButton.classList.add('is-hidden');
+      }
       document.addEventListener('click', (event) => {
         const openButton = event.target.closest('[data-open-schedule]');
         if (openButton) {
@@ -2212,6 +3711,7 @@ async function pageLayout(title, body, user, notice) {
 }
 
 function loginPage(res, notice) {
+  const ssoEnabled = isSsoConfigured();
   const body = `
     <div class="hero">
       <section class="card hero-panel">
@@ -2227,15 +3727,28 @@ function loginPage(res, notice) {
         </div>
       </section>
       <section class="card login-card">
-        <h2>登录</h2>
-        <p class="muted">请输入账号和密码进入系统。</p>
-        <form method="post" action="/login">
-          <p><label>账号<input name="login_name" autocomplete="username" required /></label></p>
-          <p><label>密码<input name="password" type="password" autocomplete="current-password" required /></label></p>
-          <div class="actions">
-            <button type="submit">登录</button>
-          </div>
-        </form>
+        <div class="login-shell">
+          <h2>登录</h2>
+          <p class="muted">你可以选择本地账号密码登录，或通过 SSO 统一身份认证登录。</p>
+          <form method="post" action="/login">
+            <p><label>账号<input name="login_name" autocomplete="username" required /></label></p>
+            <p><label>密码<input name="password" type="password" autocomplete="current-password" required /></label></p>
+            <div class="actions">
+              <button type="submit">登录</button>
+              ${ssoEnabled ? `<a class="button-link secondary action-button" href="/login/sso">SSO 登录</a>` : ""}
+            </div>
+          </form>
+          ${!ssoEnabled ? `<p class="muted" style="margin-top:12px;">当前未配置 SSO，暂仅支持本地登录。</p>` : ""}
+        </div>
+      </section>
+      <section class="mobile-login-copy">
+        <h3>TA选课申请系统</h3>
+        <p>系统覆盖 TA 申请、TAAdmin 初审、Professor 终审、教学班开放时间控制，以及课程与人员管理。</p>
+        <div class="hero-pills">
+          <span>TA 申请</span>
+          <span>TAAdmin 审核</span>
+          <span>Professor 终审</span>
+        </div>
       </section>
     </div>`;
   sendHtml(res, pageLayout("登录", body, null, notice));
@@ -2249,7 +3762,7 @@ function schedulesTable(schedules) {
   if (!schedules.length) {
     return "<p class='muted'>暂无排课。</p>";
   }
-  const rows = schedules.map((row) => `<tr><td>${escapeHtml(row.lesson_date)}</td><td>${escapeHtml(row.start_time)}</td><td>${escapeHtml(row.end_time)}</td><td>${escapeHtml(row.section)}</td><td>${escapeHtml(row.is_exam || "")}</td></tr>`).join("");
+  const rows = schedules.map((row) => `<tr><td>${escapeHtml(normalizeDisplayDate(row.lesson_date))}</td><td>${escapeHtml(row.start_time)}</td><td>${escapeHtml(row.end_time)}</td><td>${escapeHtml(row.section)}</td><td>${escapeHtml(row.is_exam || "")}</td></tr>`).join("");
   return `<table><tr><th>日期</th><th>开始</th><th>结束</th><th>节次</th><th>考试</th></tr>${rows}</table>`;
 }
 
@@ -2272,8 +3785,8 @@ function getAppliedConflicts(db, taUserId, classId) {
     const matches = [];
     for (const t of target) {
       for (const e of existing) {
-        if (t.lesson_date === e.lesson_date && hasTimeConflict(t.start_time, t.end_time, e.start_time, e.end_time)) {
-          matches.push(`${t.lesson_date} ${t.start_time}-${t.end_time} vs ${e.start_time}-${e.end_time}`);
+        if (normalizeDisplayDate(t.lesson_date) === normalizeDisplayDate(e.lesson_date) && hasTimeConflict(t.start_time, t.end_time, e.start_time, e.end_time)) {
+          matches.push(`${normalizeDisplayDate(t.lesson_date)} ${t.start_time}-${t.end_time} vs ${e.start_time}-${e.end_time}`);
         }
       }
     }
@@ -2301,8 +3814,8 @@ function getOpenClassConflicts(db, taUserId, classId) {
     const matches = [];
     for (const t of target) {
       for (const e of existing) {
-        if (t.lesson_date === e.lesson_date && hasTimeConflict(t.start_time, t.end_time, e.start_time, e.end_time)) {
-          matches.push(`${t.lesson_date} ${t.start_time}-${t.end_time} vs ${e.start_time}-${e.end_time}`);
+        if (normalizeDisplayDate(t.lesson_date) === normalizeDisplayDate(e.lesson_date) && hasTimeConflict(t.start_time, t.end_time, e.start_time, e.end_time)) {
+          matches.push(`${normalizeDisplayDate(t.lesson_date)} ${t.start_time}-${t.end_time} vs ${e.start_time}-${e.end_time}`);
         }
       }
     }
@@ -2378,8 +3891,8 @@ function getAppliedConflictsFromData(applications, classMap, scheduleMap, classI
     const matches = [];
     for (const t of target) {
       for (const e of existing) {
-        if (t.lesson_date === e.lesson_date && hasTimeConflict(t.start_time, t.end_time, e.start_time, e.end_time)) {
-          matches.push(`${t.lesson_date} ${t.start_time}-${t.end_time} vs ${e.start_time}-${e.end_time}`);
+        if (normalizeDisplayDate(t.lesson_date) === normalizeDisplayDate(e.lesson_date) && hasTimeConflict(t.start_time, t.end_time, e.start_time, e.end_time)) {
+          matches.push(`${normalizeDisplayDate(t.lesson_date)} ${t.start_time}-${t.end_time} vs ${e.start_time}-${e.end_time}`);
         }
       }
     }
@@ -2400,8 +3913,8 @@ function getOpenClassConflictsFromData(openClasses, applications, scheduleMap, c
     const matches = [];
     for (const t of target) {
       for (const e of existing) {
-        if (t.lesson_date === e.lesson_date && hasTimeConflict(t.start_time, t.end_time, e.start_time, e.end_time)) {
-          matches.push(`${t.lesson_date} ${t.start_time}-${t.end_time} vs ${e.start_time}-${e.end_time}`);
+        if (normalizeDisplayDate(t.lesson_date) === normalizeDisplayDate(e.lesson_date) && hasTimeConflict(t.start_time, t.end_time, e.start_time, e.end_time)) {
+          matches.push(`${normalizeDisplayDate(t.lesson_date)} ${t.start_time}-${t.end_time} vs ${e.start_time}-${e.end_time}`);
         }
       }
     }
@@ -2421,7 +3934,7 @@ function compactScheduleList(schedules) {
   }
   return `<div class="compact-stack">${schedules.map((row) => `
     <div class="schedule-item">
-      <div>${escapeHtml(row.lesson_date)} ${escapeHtml(row.start_time)}-${escapeHtml(row.end_time)}</div>
+      <div>${escapeHtml(normalizeDisplayDate(row.lesson_date))} ${escapeHtml(row.start_time)}-${escapeHtml(row.end_time)}</div>
       <div class="schedule-meta">${escapeHtml(row.section)}${row.is_exam ? ` · ${escapeHtml(row.is_exam)}` : ""}</div>
     </div>
   `).join("")}</div>`;
@@ -2459,28 +3972,35 @@ function homePage(res, user, notice) {
   }
   let body = `
     <section class="card card-brand">
-      <h2>当前用户</h2>
-      <p><span class="pill gold">${escapeHtml(user.role)}</span> ${escapeHtml(user.user_name)}</p>
-      <p class="muted">当前系统已接入 TA 申请、TAAdmin 审核、Professor 终审、教学班与人员管理，并支持邮件通知、导入和手机端访问。</p>
+      <div class="home-summary">
+        <div class="home-summary-main">
+          <div class="home-summary-title">
+            <h2>当前用户</h2>
+            <span class="home-role-chip">${escapeHtml(user.role)}</span>
+          </div>
+          <div class="home-user-name">${escapeHtml(user.user_name)}</div>
+          <p class="home-summary-subtitle">当前系统已接入 TA 申请、TAAdmin 审核、Professor 终审、教学班与人员管理，并支持邮件通知、导入和手机端访问。</p>
+        </div>
+      </div>
     </section>
   `;
   if (user.role === "TA") {
-    body += `<section class="grid">
+    body += `<section class="dashboard-grid">
       <article class="card card-brand feature-card"><h3>可申请教学班</h3><p>浏览开放教学班、查看冲突情况并提交申请。</p><div class="actions"><a class="button-link" href="/ta/classes">进入</a></div></article>
       <article class="card card-brand feature-card"><h3>我的申请</h3><p>查看申请状态，并在 TAAdmin 审批前撤销申请。</p><div class="actions"><a class="button-link" href="/ta/applications">进入</a></div></article>
       <article class="card card-brand feature-card"><h3>个人资料</h3><p>维护个人简历，申请时自动带出最新简历。</p><div class="actions"><a class="button-link" href="/ta/profile">进入</a></div></article>
     </section>`;
   } else if (user.role === "TAAdmin") {
-    body += `<section class="grid">
+    body += `<section class="dashboard-grid">
       <article class="card card-brand feature-card"><h3>待初审申请</h3><p>集中处理当前待 TAAdmin 审批的学生申请。</p><div class="actions"><a class="button-link" href="/admin/ta/pending">进入</a></div></article>
       <article class="card card-brand feature-card"><h3>全部申请</h3><p>查看所有 TA 申请状态并追踪历史审批情况。</p><div class="actions"><a class="button-link" href="/admin/ta/applications">进入</a></div></article>
       <article class="card card-brand feature-card"><h3>全部教学班</h3><p>按教学班查看申请、发布至教授并发送邮件。</p><div class="actions"><a class="button-link" href="/admin/ta/classes">进入</a></div></article>
       <article class="card card-brand feature-card"><h3>TA 管理</h3><p>查看 TA 名单并维护 TA 申请资格。</p><div class="actions"><a class="button-link" href="/admin/ta/users">进入</a></div></article>
     </section>`;
   } else if (user.role === "Professor") {
-    body += `<section class="grid"><article class="card card-brand feature-card"><h3>待教授审批</h3><p>按教学班查看待终审申请，并在达到名额上限时自动完成其余申请处理。</p><div class="actions"><a class="button-link" href="/professor/pending">进入</a></div></article></section>`;
+    body += `<section class="dashboard-grid"><article class="card card-brand feature-card"><h3>待教授审批</h3><p>按教学班查看待终审申请，并在达到名额上限时自动完成其余申请处理。</p><div class="actions"><a class="button-link" href="/professor/pending">进入</a></div></article></section>`;
   } else if (user.role === "CourseAdmin") {
-    body += `<section class="grid">
+    body += `<section class="dashboard-grid">
       <article class="card card-brand feature-card"><h3>报表视图</h3><p>集中查看申请、审批、教学班开放与名额使用情况。</p><div class="actions"><a class="button-link" href="/course/reports">进入</a></div></article>
       <article class="card card-brand feature-card"><h3>全部申请</h3><p>查看全量申请并在必要时进行管理性状态调整。</p><div class="actions"><a class="button-link" href="/course/applications">进入</a></div></article>
       <article class="card card-brand feature-card"><h3>教学班管理</h3><p>维护教学班、排课、导入和批量操作。</p><div class="actions"><a class="button-link" href="/course/classes">进入</a></div></article>
@@ -2785,6 +4305,7 @@ function parseImportedClassesRows(rows) {
     "teaching_language",
     "teacher_login_name",
     "semester",
+    "credit",
     "maximum_number",
     "ta_allowed",
     "is_conflict_allowed",
@@ -2834,6 +4355,11 @@ function parseImportedClassesRows(rows) {
       errors.push(`第 ${rowNo} 行失败：maximum_number 必须是大于 0 的整数`);
       hasRowError = true;
     }
+    const credit = Number(get("credit"));
+    if (!Number.isFinite(credit) || credit < 0) {
+      errors.push(`第 ${rowNo} 行失败：credit 必须是大于等于 0 的数字`);
+      hasRowError = true;
+    }
     const taAllowed = get("ta_allowed") || "Y";
     if (!["Y", "N"].includes(taAllowed)) {
       errors.push(`第 ${rowNo} 行失败：ta_allowed 仅支持 Y 或 N`);
@@ -2863,6 +4389,7 @@ function parseImportedClassesRows(rows) {
       teachingLanguage: get("teaching_language") || "中文",
       teacherLoginNames: parseDelimitedValues(get("teacher_login_name")),
       semester: get("semester"),
+      credit,
       maximumNumber,
       taAllowed,
       isConflictAllowed,
@@ -2882,7 +4409,7 @@ function parseImportedClassesRows(rows) {
       grouped.set(classCode, { ...base, schedules: [] });
     } else {
       const current = grouped.get(classCode);
-      const comparableKeys = ["classAbbr", "courseName", "className", "teachingLanguage", "semester", "maximumNumber", "taAllowed", "isConflictAllowed", "applyStartAt", "applyEndAt", "classIntro", "memo"];
+      const comparableKeys = ["classAbbr", "courseName", "className", "teachingLanguage", "semester", "credit", "maximumNumber", "taAllowed", "isConflictAllowed", "applyStartAt", "applyEndAt", "classIntro", "memo"];
       for (const key of comparableKeys) {
         if (String(current[key] ?? "") !== String(base[key] ?? "")) {
           errors.push(`第 ${rowNo} 行失败：class_code ${classCode} 的基础信息不一致`);
@@ -3053,14 +4580,14 @@ function upsertImportedClasses(db, importedClasses) {
   const insertClass = db.prepare(`
     insert into classes (
       class_code, class_abbr, class_name, course_name, teaching_language, teacher_user_id,
-      teacher_name, class_intro, memo, maximum_number_of_tas_admitted,
+      teacher_name, class_intro, memo, credit, maximum_number_of_tas_admitted,
       ta_applications_allowed, is_conflict_allowed, apply_start_at, apply_end_at, semester
-    ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
   const updateClass = db.prepare(`
     update classes
     set class_abbr = ?, class_name = ?, course_name = ?, teaching_language = ?, teacher_user_id = ?,
-        teacher_name = ?, class_intro = ?, memo = ?, maximum_number_of_tas_admitted = ?,
+        teacher_name = ?, class_intro = ?, memo = ?, credit = ?, maximum_number_of_tas_admitted = ?,
         ta_applications_allowed = ?, is_conflict_allowed = ?, apply_start_at = ?, apply_end_at = ?, semester = ?
     where class_id = ?
   `);
@@ -3106,6 +4633,7 @@ function upsertImportedClasses(db, importedClasses) {
         teacherNames,
         item.classIntro,
         item.memo,
+        item.credit,
         item.maximumNumber,
         item.taAllowed,
         item.isConflictAllowed,
@@ -3135,6 +4663,7 @@ function upsertImportedClasses(db, importedClasses) {
         teacherNames,
         item.classIntro,
         item.memo,
+        item.credit,
         item.maximumNumber,
         item.taAllowed,
         item.isConflictAllowed,
@@ -3166,18 +4695,20 @@ function scheduleSummary(rows, key, options = {}) {
     return "<span class='muted'>暂无排课</span>";
   }
   const showPreview = options.showPreview !== false;
+  const triggerLabel = options.triggerLabel || "查看排课";
+  const compact = !showPreview;
   const renderItem = (row) => `
     <div class="schedule-item">
-      <div>${escapeHtml(row.lesson_date)} ${escapeHtml(row.start_time)}-${escapeHtml(row.end_time)}</div>
+      <div>${escapeHtml(normalizeDisplayDate(row.lesson_date))} ${escapeHtml(row.start_time)}-${escapeHtml(row.end_time)}</div>
       <div class="schedule-meta">${escapeHtml(row.section)}${row.is_exam ? ` · ${escapeHtml(row.is_exam)}` : ""}</div>
     </div>
   `;
-  const previewText = escapeHtml(`${rows[0].lesson_date} ${rows[0].start_time}-${rows[0].end_time}`);
+  const previewText = escapeHtml(`${normalizeDisplayDate(rows[0].lesson_date)} ${rows[0].start_time}-${rows[0].end_time}`);
   const extraCount = rows.length - 1;
   const fullItems = rows.map(renderItem).join("");
   const dialogId = `schedule-dialog-${escapeHtml(String(key || crypto.randomBytes(4).toString("hex")))}`;
   return `
-    <div class="schedule-summary">
+    <div class="schedule-summary${compact ? " schedule-summary-compact" : ""}">
       ${showPreview ? `
       <div class="schedule-preview">
         <div class="schedule-item">
@@ -3186,7 +4717,7 @@ function scheduleSummary(rows, key, options = {}) {
         </div>
       </div>` : ""}
       <div class="actions">
-        <button class="secondary rect" type="button" data-open-schedule="${dialogId}">查看排课</button>
+        <button class="${compact ? "schedule-trigger" : "secondary rect"}" type="button" data-open-schedule="${dialogId}">${escapeHtml(triggerLabel)}</button>
       </div>
       <dialog class="schedule-dialog" id="${dialogId}">
         <div class="schedule-dialog-body">
@@ -3203,8 +4734,258 @@ function scheduleSummary(rows, key, options = {}) {
 
 function scheduleLinesValue(rows) {
   return rows
-    .map((row) => [row.lesson_date, row.start_time, row.end_time, row.section, row.is_exam || ""].filter((value, index) => index < 4 || value).join(","))
+    .map((row) => [normalizeDisplayDate(row.lesson_date), row.start_time, row.end_time, row.section, row.is_exam || ""].filter((value, index) => index < 4 || value).join(","))
     .join("\n");
+}
+
+function renderClassCalendarGrid(calendar) {
+  const weekdayHeaders = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"];
+  const rowsMarkup = calendar.weeks.map((week) => `
+    <tr>
+      ${week.map((day) => {
+        const entriesMarkup = day.entries.length
+          ? `<div class="calendar-day-list">${day.entries.map((entry) => `
+              <div class="calendar-entry${entry.is_conflict ? " is-conflict" : ""}">
+                <div class="calendar-entry-time">${escapeHtml(entry.start_time)}-${escapeHtml(entry.end_time)}${entry.section ? ` · ${escapeHtml(entry.section)}` : ""}</div>
+                <div class="calendar-entry-name">${escapeHtml(entry.course_name)} / ${escapeHtml(entry.class_name)}</div>
+                <div class="calendar-entry-meta">${escapeHtml(entry.class_code)} · ${escapeHtml(entry.teacher_name)} · TA ${entry.ta_count}/${entry.ta_limit}${entry.is_exam ? ` · ${escapeHtml(entry.is_exam)}` : ""}</div>
+              </div>
+            `).join("")}</div>`
+          : `<div class="calendar-empty">暂无排课</div>`;
+        return `
+          <td>
+            <div class="calendar-day${day.isCurrentMonth ? "" : " is-outside"}">
+              <div class="calendar-day-header">
+                <div class="calendar-day-number">${day.dateNumber}</div>
+                <div class="calendar-day-count">${day.entries.length ? `${day.entries.length} 条排课` : ""}</div>
+              </div>
+              ${entriesMarkup}
+            </div>
+          </td>
+        `;
+      }).join("")}
+    </tr>
+  `).join("");
+  return `
+    <div class="calendar-wrap">
+      <table class="calendar-table">
+        <thead><tr>${weekdayHeaders.map((label) => `<th>${label}</th>`).join("")}</tr></thead>
+        <tbody>${rowsMarkup}</tbody>
+      </table>
+    </div>
+  `;
+}
+
+function renderClassCalendarPageContent(options) {
+  const {
+    title,
+    basePath,
+    listPath,
+    filters,
+    calendar,
+    rows,
+    filterFields,
+    legendNote
+  } = options;
+  const queryBase = { ...filterFields, month: calendar.monthValue };
+  const prevMonth = shiftMonthValue(calendar.monthValue, -1);
+  const nextMonth = shiftMonthValue(calendar.monthValue, 1);
+  return `
+    <section class="card card-brand">
+      <div class="calendar-toolbar">
+        <div>
+          <h2>${escapeHtml(title)}</h2>
+          <p class="muted" style="margin:8px 0 0;">以月视图展示当前筛选范围内的全部排课。橙色条目代表同一天内存在时间重叠，方便快速识别教学班冲突。</p>
+        </div>
+        <div class="calendar-actions">
+          <a class="button-link secondary action-button" href="${basePath}${buildQueryString({ ...filterFields, month: prevMonth })}">上个月</a>
+          <form method="get" action="${basePath}" style="display:flex; gap:10px; align-items:center;">
+            ${Object.entries(filterFields).map(([key, value]) => {
+              if (value === undefined || value === null || value === "") return "";
+              return `<input type="hidden" name="${escapeHtml(key)}" value="${escapeHtml(value)}" />`;
+            }).join("")}
+            <input name="month" type="month" value="${escapeHtml(calendar.monthValue)}" />
+            <button class="secondary action-button" type="submit">查看月份</button>
+          </form>
+          <a class="button-link secondary action-button" href="${basePath}${buildQueryString({ ...filterFields, month: nextMonth })}">下个月</a>
+          <a class="button-link secondary action-button" href="${listPath}${buildQueryString(filterFields)}">返回列表</a>
+        </div>
+      </div>
+      <div class="calendar-meta-grid">
+        <div class="calendar-meta-card">
+          <div class="calendar-meta-label">当前月份</div>
+          <div class="calendar-meta-value">${escapeHtml(calendar.monthLabel)}</div>
+        </div>
+        <div class="calendar-meta-card">
+          <div class="calendar-meta-label">教学班数</div>
+          <div class="calendar-meta-value">${calendar.totalClasses}</div>
+        </div>
+        <div class="calendar-meta-card">
+          <div class="calendar-meta-label">本月排课数</div>
+          <div class="calendar-meta-value">${calendar.totalSchedules}</div>
+        </div>
+        <div class="calendar-meta-card">
+          <div class="calendar-meta-label">冲突日期数</div>
+          <div class="calendar-meta-value">${calendar.conflictDayCount}</div>
+        </div>
+      </div>
+      <div class="calendar-legend">
+        <span class="calendar-legend-item"><span class="calendar-legend-swatch" style="background:#edf2ff; border-color:#d8dff8;"></span>正常排课</span>
+        <span class="calendar-legend-item"><span class="calendar-legend-swatch" style="background:#fbedd9; border-color:#d9b98a;"></span>存在时间冲突</span>
+        <span class="calendar-legend-item"><span class="calendar-legend-swatch" style="background:#faf8f3; border-color:#ddd5ca;"></span>非本月日期</span>
+      </div>
+      <p class="muted" style="margin:0 0 16px;">${escapeHtml(legendNote)} 当前筛选共 ${rows.length} 个教学班，本月检测到 ${calendar.conflictItemCount} 条冲突排课。</p>
+      ${renderClassCalendarGrid(calendar)}
+    </section>
+  `;
+}
+
+async function courseClassesCalendarPage(res, user, notice, filters = {}) {
+  const rows = DB_CLIENT === "mysql"
+    ? await dbGateway.getCourseAdminClassRows(filters)
+    : (() => {
+        const db = getDb();
+        try {
+          return loadCourseAdminClassRows(db, filters);
+        } finally {
+          db.close();
+        }
+      })();
+  const classIds = rows.map((row) => Number(row.class_id)).filter(Boolean);
+  const allSchedules = DB_CLIENT === "mysql"
+    ? await dbGateway.getSchedulesForClassIds(classIds)
+    : (() => {
+        const db = getDb();
+        try {
+          const stmt = db.prepare(`
+            select class_id, lesson_date, start_time, end_time, section, is_exam
+            from class_schedules
+            where class_id = ?
+            order by lesson_date, start_time
+          `);
+          return classIds.flatMap((classId) => stmt.all(classId));
+        } finally {
+          db.close();
+        }
+      })();
+  const schedulesByClass = new Map();
+  for (const schedule of allSchedules) {
+    const classId = Number(schedule.class_id);
+    if (!schedulesByClass.has(classId)) {
+      schedulesByClass.set(classId, []);
+    }
+    schedulesByClass.get(classId).push(schedule);
+  }
+  const calendar = buildClassCalendarData(rows, schedulesByClass, filters.month);
+  sendHtml(res, pageLayout("教学班日历视图", renderClassCalendarPageContent({
+    title: "教学班日历视图",
+    basePath: "/course/classes/calendar",
+    listPath: "/course/classes",
+    filters,
+    calendar,
+    rows,
+    filterFields: {
+      class_code: filters.class_code || "",
+      class_name: filters.class_name || "",
+      teacher_name: filters.teacher_name || "",
+      ta_full: filters.ta_full || "",
+      status_filter: filters.status_filter || "",
+      sort_by: filters.sort_by || "",
+      sort_order: filters.sort_order || ""
+    },
+    legendNote: "本页不改变任何排课或申请逻辑，只提供教学班排课的月历总览。"
+  }), user, notice));
+}
+
+async function taAdminClassesCalendarPage(res, user, notice, filters = {}) {
+  const rows = DB_CLIENT === "mysql"
+    ? await dbGateway.getTaAdminClassRows(filters)
+    : (() => {
+        const db = getDb();
+        try {
+          return loadTaAdminClassRows(db, filters);
+        } finally {
+          db.close();
+        }
+      })();
+  const classIds = rows.map((row) => Number(row.class_id)).filter(Boolean);
+  const allSchedules = DB_CLIENT === "mysql"
+    ? await dbGateway.getSchedulesForClassIds(classIds)
+    : (() => {
+        const db = getDb();
+        try {
+          const stmt = db.prepare(`
+            select class_id, lesson_date, start_time, end_time, section, is_exam
+            from class_schedules
+            where class_id = ?
+            order by lesson_date, start_time
+          `);
+          return classIds.flatMap((classId) => stmt.all(classId));
+        } finally {
+          db.close();
+        }
+      })();
+  const schedulesByClass = new Map();
+  for (const schedule of allSchedules) {
+    const classId = Number(schedule.class_id);
+    if (!schedulesByClass.has(classId)) {
+      schedulesByClass.set(classId, []);
+    }
+    schedulesByClass.get(classId).push(schedule);
+  }
+  const calendar = buildClassCalendarData(rows, schedulesByClass, filters.month);
+  sendHtml(res, pageLayout("全部教学班日历视图", renderClassCalendarPageContent({
+    title: "全部教学班日历视图",
+    basePath: "/admin/ta/classes/calendar",
+    listPath: "/admin/ta/classes",
+    filters,
+    calendar,
+    rows,
+    filterFields: {
+      professor_name: filters.professor_name || "",
+      class_name: filters.class_name || "",
+      ta_full: filters.ta_full || "",
+      has_pending: filters.has_pending || ""
+    },
+    legendNote: "本页用于直观看教学班排课冲突和当前待审教学班的时间分布，不影响现有审批逻辑。"
+  }), user, notice));
+}
+
+function renderTaClassesFilterForm(filters, options = {}) {
+  const isDialog = options.dialog === true;
+  return `
+    <form method="get" action="/ta/classes">
+      ${isDialog ? `
+        <div class="filter-dialog-header">
+          <h3>搜索教学班</h3>
+          <button class="secondary rect" type="button" onclick="this.closest('dialog').close()">关闭</button>
+        </div>
+      ` : ""}
+      <div class="filters-shell">
+        <div class="filters-grid pending-filters">
+          <p><label>是否可申请<select name="apply_status">
+            <option value="" ${!filters.apply_status ? "selected" : ""}>全部</option>
+            <option value="可申请" ${filters.apply_status === "可申请" ? "selected" : ""}>可申请</option>
+            <option value="有冲突" ${filters.apply_status === "有冲突" ? "selected" : ""}>有冲突</option>
+            <option value="已申请" ${filters.apply_status === "已申请" ? "selected" : ""}>已申请</option>
+            <option value="被拒绝" ${filters.apply_status === "被拒绝" ? "selected" : ""}>被拒绝</option>
+          </select></label></p>
+          <p><label>教授名<input name="professor_name" value="${escapeHtml(filters.professor_name || "")}" /></label></p>
+          <p><label>课程名称<input name="course_name" value="${escapeHtml(filters.course_name || "")}" /></label></p>
+          <p><label>教学班名称<input name="class_name" value="${escapeHtml(filters.class_name || "")}" /></label></p>
+          <p><label>授课语言<select name="teaching_language">
+            <option value="" ${!filters.teaching_language ? "selected" : ""}>全部</option>
+            ${["中文", "英文", "双语"].map((item) => `<option value="${item}" ${filters.teaching_language === item ? "selected" : ""}>${item}</option>`).join("")}
+          </select></label></p>
+          <div class="actions">
+            <button class="secondary action-button" type="submit">筛选</button>
+            <a class="button-link secondary action-button" href="/ta/classes">重置</a>
+            ${isDialog ? `<button class="secondary action-button" type="button" onclick="this.closest('dialog').close()">取消</button>` : ""}
+          </div>
+        </div>
+      </div>
+    </form>
+  `;
 }
 
 async function taClassesPage(res, user, notice, filters = {}) {
@@ -3228,7 +5009,9 @@ async function taClassesPage(res, user, notice, filters = {}) {
         const activeApplication = latestApplication && isActiveApplicationStatus(latestApplication.status) ? latestApplication : null;
         const cardStatus = activeApplication
           ? "已申请"
-          : (blockingConflicts.length && row.is_conflict_allowed !== "Y" ? "有冲突" : "可申请");
+          : (latestApplication && ["RejectedByTAAdmin", "RejectedByProfessor"].includes(latestApplication.status)
+            ? "被拒绝"
+            : (blockingConflicts.length && row.is_conflict_allowed !== "Y" ? "有冲突" : "可申请"));
         return {
           ...row,
           schedules,
@@ -3244,21 +5027,28 @@ async function taClassesPage(res, user, notice, filters = {}) {
       .filter((row) => !classNameFilter || String(row.class_name || "").toLowerCase().includes(classNameFilter))
       .filter((row) => !languageFilter || String(row.teaching_language || "") === languageFilter);
     const body = visibleClasses.map((row) => {
-      const labelClass = row.cardStatus === "有冲突" ? "pill bad" : row.cardStatus === "已申请" ? "pill" : "pill ok";
+      const labelClass = row.cardStatus === "有冲突"
+        ? "pill bad"
+        : row.cardStatus === "已申请"
+          ? "pill"
+          : row.cardStatus === "被拒绝"
+            ? "pill gold"
+            : "pill ok";
       const cardClass = row.cardStatus === "有冲突" ? "card-soft-red" : row.cardStatus === "已申请" ? "card-soft-purple" : "";
       const dialogId = `ta-conflicts-${row.class_id}`;
       const actionHint = row.activeApplication
         ? `<p class="compact-note">已提交申请，请到“我的申请”查看；若仍处于 TAAdmin 审批前，可在“我的申请”中撤销。</p>`
-        : "";
+        : (row.cardStatus === "被拒绝" ? `<p class="compact-note reapply-note">该教学班上一条申请已被拒绝，你可以重新申请。</p>` : "")
+      ;
       return `<article class="card class-card ${cardClass}">
         <h3>${escapeHtml(row.course_name)} / ${escapeHtml(row.class_name)}</h3>
         <p><span class="${labelClass}">${escapeHtml(row.cardStatus)}</span></p>
         <div class="class-card-meta">
           <span>${escapeHtml(row.teacher_name)}</span>
           <span>${escapeHtml(row.teaching_language)}</span>
-          <span>${escapeHtml(row.semester)}</span>
+          <span>${escapeHtml(Number(row.credit || 0) > 0 ? `${Number(row.credit)} 学分` : "未设置学分")}</span>
         </div>
-        <p>已通过：${row.approved_count} / ${row.maximum_number_of_tas_admitted}</p>
+        <p>待初审申请数：${row.pending_taadmin_count || 0}</p>
         <p class="muted">开放申请：${escapeHtml(compactApplyWindowText(row))}</p>
         ${actionHint}
         <div class="actions">
@@ -3284,37 +5074,21 @@ async function taClassesPage(res, user, notice, filters = {}) {
       </article>`;
     }).join("");
     return sendHtml(res, pageLayout("可申请教学班", `
-      <section class="card">
+      <section class="card" id="ta-class-filters">
         <h2>筛选教学班</h2>
-        <form method="get" action="/ta/classes">
-          <div class="filters-shell">
-          <div class="filters-grid">
-            <p><label>是否可申请<select name="apply_status">
-              <option value="" ${!filters.apply_status ? "selected" : ""}>全部</option>
-              <option value="可申请" ${filters.apply_status === "可申请" ? "selected" : ""}>可申请</option>
-              <option value="有冲突" ${filters.apply_status === "有冲突" ? "selected" : ""}>有冲突</option>
-              <option value="已申请" ${filters.apply_status === "已申请" ? "selected" : ""}>已申请</option>
-            </select></label></p>
-            <p><label>教授名<input name="professor_name" value="${escapeHtml(filters.professor_name || "")}" /></label></p>
-            <p><label>课程名称<input name="course_name" value="${escapeHtml(filters.course_name || "")}" /></label></p>
-            <p><label>教学班名称<input name="class_name" value="${escapeHtml(filters.class_name || "")}" /></label></p>
-            <p><label>授课语言<select name="teaching_language">
-              <option value="" ${!filters.teaching_language ? "selected" : ""}>全部</option>
-              ${["中文", "英文", "双语"].map((item) => `<option value="${item}" ${filters.teaching_language === item ? "selected" : ""}>${item}</option>`).join("")}
-            </select></label></p>
-            <div class="actions">
-              <button class="secondary action-button" type="submit">筛选</button>
-              <a class="button-link secondary action-button" href="/ta/classes">重置</a>
-            </div>
-          </div>
-          </div>
-        </form>
+        ${renderTaClassesFilterForm(filters)}
       </section>
       <section class="card">
         <h2>开放教学班</h2>
         <p class="muted">当前共匹配 <strong>${visibleClasses.length}</strong> 个教学班。浅紫色表示已申请，浅红色表示存在阻断性时间冲突。</p>
         ${body ? `<div class="class-card-grid">${body}</div>` : `<p class="muted">当前没有符合条件的开放教学班。</p>`}
       </section>
+      <a class="mobile-fab" href="#ta-class-filters" onclick="event.preventDefault();document.getElementById('ta-class-filter-dialog')?.showModal();">搜索筛选</a>
+      <dialog class="filter-dialog" id="ta-class-filter-dialog">
+        <div class="filter-dialog-body">
+          ${renderTaClassesFilterForm(filters, { dialog: true })}
+        </div>
+      </dialog>
     `, user, notice));
   }
   const db = getDb();
@@ -3333,15 +5107,17 @@ async function taClassesPage(res, user, notice, filters = {}) {
   const languageFilter = String(filters.teaching_language || "").trim();
   const visibleClasses = classes
     .filter((row) => isClassOpenForApply(row))
-    .map((row) => {
-      const schedules = fetchSchedules(db, row.class_id);
-      const conflicts = getOpenClassConflicts(db, user.user_id, row.class_id);
-      const blockingConflicts = getAppliedConflicts(db, user.user_id, row.class_id);
-      const latestApplication = latestApplicationMap.get(row.class_id) || null;
-      const activeApplication = latestApplication && isActiveApplicationStatus(latestApplication.status) ? latestApplication : null;
+      .map((row) => {
+        const schedules = fetchSchedules(db, row.class_id);
+        const conflicts = getOpenClassConflicts(db, user.user_id, row.class_id);
+        const blockingConflicts = getAppliedConflicts(db, user.user_id, row.class_id);
+        const latestApplication = latestApplicationMap.get(row.class_id) || null;
+        const activeApplication = latestApplication && isActiveApplicationStatus(latestApplication.status) ? latestApplication : null;
       const cardStatus = activeApplication
         ? "已申请"
-        : (blockingConflicts.length && row.is_conflict_allowed !== "Y" ? "有冲突" : "可申请");
+        : (latestApplication && ["RejectedByTAAdmin", "RejectedByProfessor"].includes(latestApplication.status)
+          ? "被拒绝"
+          : (blockingConflicts.length && row.is_conflict_allowed !== "Y" ? "有冲突" : "可申请"));
       return {
         ...row,
         schedules,
@@ -3357,21 +5133,27 @@ async function taClassesPage(res, user, notice, filters = {}) {
     .filter((row) => !classNameFilter || String(row.class_name || "").toLowerCase().includes(classNameFilter))
     .filter((row) => !languageFilter || String(row.teaching_language || "") === languageFilter);
   const body = visibleClasses.map((row) => {
-    const labelClass = row.cardStatus === "有冲突" ? "pill bad" : row.cardStatus === "已申请" ? "pill" : "pill ok";
+    const labelClass = row.cardStatus === "有冲突"
+      ? "pill bad"
+      : row.cardStatus === "已申请"
+        ? "pill"
+        : row.cardStatus === "被拒绝"
+          ? "pill gold"
+          : "pill ok";
     const cardClass = row.cardStatus === "有冲突" ? "card-soft-red" : row.cardStatus === "已申请" ? "card-soft-purple" : "";
     const dialogId = `ta-conflicts-${row.class_id}`;
     const actionHint = row.activeApplication
       ? `<p class="compact-note">已提交申请，请到“我的申请”查看；若仍处于 TAAdmin 审批前，可在“我的申请”中撤销。</p>`
-      : "";
+      : (row.cardStatus === "被拒绝" ? `<p class="compact-note reapply-note">该教学班上一条申请已被拒绝，你可以重新申请。</p>` : "");
     return `<article class="card class-card ${cardClass}">
       <h3>${escapeHtml(row.course_name)} / ${escapeHtml(row.class_name)}</h3>
       <p><span class="${labelClass}">${escapeHtml(row.cardStatus)}</span></p>
       <div class="class-card-meta">
         <span>${escapeHtml(row.teacher_name)}</span>
         <span>${escapeHtml(row.teaching_language)}</span>
-        <span>${escapeHtml(row.semester)}</span>
+        <span>${escapeHtml(Number(row.credit || 0) > 0 ? `${Number(row.credit)} 学分` : "未设置学分")}</span>
       </div>
-      <p>已通过：${row.approved_count} / ${row.maximum_number_of_tas_admitted}</p>
+      <p>待初审申请数：${row.pending_taadmin_count || 0}</p>
       <p class="muted">开放申请：${escapeHtml(compactApplyWindowText(row))}</p>
       ${actionHint}
       <div class="actions">
@@ -3398,37 +5180,21 @@ async function taClassesPage(res, user, notice, filters = {}) {
   }).join("");
   db.close();
   sendHtml(res, pageLayout("可申请教学班", `
-    <section class="card">
+    <section class="card" id="ta-class-filters">
       <h2>筛选教学班</h2>
-      <form method="get" action="/ta/classes">
-        <div class="filters-shell">
-        <div class="filters-grid">
-          <p><label>是否可申请<select name="apply_status">
-            <option value="" ${!filters.apply_status ? "selected" : ""}>全部</option>
-            <option value="可申请" ${filters.apply_status === "可申请" ? "selected" : ""}>可申请</option>
-            <option value="有冲突" ${filters.apply_status === "有冲突" ? "selected" : ""}>有冲突</option>
-            <option value="已申请" ${filters.apply_status === "已申请" ? "selected" : ""}>已申请</option>
-          </select></label></p>
-          <p><label>教授名<input name="professor_name" value="${escapeHtml(filters.professor_name || "")}" /></label></p>
-          <p><label>课程名称<input name="course_name" value="${escapeHtml(filters.course_name || "")}" /></label></p>
-          <p><label>教学班名称<input name="class_name" value="${escapeHtml(filters.class_name || "")}" /></label></p>
-          <p><label>授课语言<select name="teaching_language">
-            <option value="" ${!filters.teaching_language ? "selected" : ""}>全部</option>
-            ${["中文", "英文", "双语"].map((item) => `<option value="${item}" ${filters.teaching_language === item ? "selected" : ""}>${item}</option>`).join("")}
-          </select></label></p>
-          <div class="actions">
-            <button class="secondary action-button" type="submit">筛选</button>
-            <a class="button-link secondary action-button" href="/ta/classes">重置</a>
-          </div>
-        </div>
-        </div>
-      </form>
+      ${renderTaClassesFilterForm(filters)}
     </section>
     <section class="card">
       <h2>开放教学班</h2>
       <p class="muted">当前共匹配 <strong>${visibleClasses.length}</strong> 个教学班。浅紫色表示已申请，浅红色表示存在阻断性时间冲突。</p>
       ${body ? `<div class="class-card-grid">${body}</div>` : `<p class="muted">当前没有符合条件的开放教学班。</p>`}
     </section>
+    <a class="mobile-fab" href="#ta-class-filters" onclick="event.preventDefault();document.getElementById('ta-class-filter-dialog')?.showModal();">搜索筛选</a>
+    <dialog class="filter-dialog" id="ta-class-filter-dialog">
+      <div class="filter-dialog-body">
+        ${renderTaClassesFilterForm(filters, { dialog: true })}
+      </div>
+    </dialog>
   `, user, notice));
 }
 
@@ -3497,7 +5263,7 @@ async function taClassDetailPage(res, user, classId, notice) {
         ${submitGuardSection}
         <form method="post" action="/ta/applications" data-disable-on-submit="1" data-submit-hint-target="ta-submit-hint">
           <input type="hidden" name="class_id" value="${row.class_id}" />
-          <p><label>申请原因<textarea name="application_reason" required></textarea></label></p>
+          <p><label>申请原因<textarea name="application_reason"></textarea></label></p>
           <button type="submit" ${canSubmit ? "" : "disabled"}>提交申请</button>
         </form>
         <div class="submit-hint" id="ta-submit-hint">申请正在提交。提交后按钮会暂时停用，避免重复提交。在 TAAdmin 审批前，你可以进入“我的申请”模块撤销申请。</div>
@@ -3573,7 +5339,7 @@ async function taClassDetailPage(res, user, classId, notice) {
       ${submitGuardSection}
       <form method="post" action="/ta/applications" data-disable-on-submit="1" data-submit-hint-target="ta-submit-hint">
         <input type="hidden" name="class_id" value="${row.class_id}" />
-        <p><label>申请原因<textarea name="application_reason" required></textarea></label></p>
+        <p><label>申请原因<textarea name="application_reason"></textarea></label></p>
         <button type="submit" ${canSubmit ? "" : "disabled"}>提交申请</button>
       </form>
       <div class="submit-hint" id="ta-submit-hint">申请正在提交。提交后按钮会暂时停用，避免重复提交。在 TAAdmin 审批前，你可以进入“我的申请”模块撤销申请。</div>
@@ -3585,9 +5351,6 @@ async function createApplication(req, res, user) {
   const fields = await readBody(req);
   const classId = Number(fields.class_id || 0);
   const reason = String(fields.application_reason || "").trim();
-  if (!reason) {
-    return redirect(res, `/ta/classes/${classId}?notice=申请原因必填`);
-  }
 
   if (DB_CLIENT === "mysql") {
     const result = await dbGateway.createTaApplication(user, classId, reason, nowStr());
@@ -3664,7 +5427,7 @@ async function createApplication(req, res, user) {
     targetType: "Application",
     targetId: applicationId,
     targetName: `${classRow.course_name} / ${classRow.class_name}`,
-    details: `申请人：${user.user_name}\n教学班：${classRow.class_name}\n教授：${classRow.teacher_name}\n申请原因：${reason}`
+    details: `申请人：${user.user_name}\n教学班：${classRow.class_name}\n教授：${classRow.teacher_name}${reason ? `\n申请原因：${reason}` : ""}`
   });
   const emailJobs = taAdmins.map((admin) => buildTaAdminNewApplicationEmail(admin, user, classRow));
   db.close();
@@ -3715,13 +5478,9 @@ async function updateTaResume(req, res, user) {
   } catch (error) {
     return redirect(res, `/ta/profile?notice=${error.message}`);
   }
-  const db = getDb();
-  const current = db.prepare("select resume_path from users where user_id = ?").get(user.user_id);
-  db.prepare("update users set resume_name = ?, resume_path = ? where user_id = ?").run(storedFile.originalName, storedFile.relativePath, user.user_id);
-  db.prepare("update applications set resume_name = ?, resume_path = ? where applier_user_id = ?").run(storedFile.originalName, storedFile.relativePath, user.user_id);
-  db.close();
-  if (current && current.resume_path) {
-    const oldFilePath = path.join(UPLOAD_DIR, path.basename(current.resume_path));
+  const result = await dbGateway.updateTaResume(user.user_id, storedFile.originalName, storedFile.relativePath);
+  if (result?.previousResumePath) {
+    const oldFilePath = path.join(UPLOAD_DIR, path.basename(result.previousResumePath));
     if (fs.existsSync(oldFilePath)) {
       fs.unlinkSync(oldFilePath);
     }
@@ -3729,19 +5488,47 @@ async function updateTaResume(req, res, user) {
   redirect(res, "/ta/profile?notice=个人简历已更新");
 }
 
-function taApplicationsPage(res, user, notice) {
-  const db = getDb();
-  const apps = db.prepare("select * from applications where applier_user_id = ? order by submitted_at desc").all(user.user_id);
-  db.close();
+async function taApplicationsPage(res, user, notice) {
+  const apps = await dbGateway.getTaApplications(user.user_id);
+  const pendingApps = apps.filter((app) => ["PendingTAAdmin", "PendingProfessor"].includes(app.status));
+  const approvedApps = apps.filter((app) => app.status === "Approved");
+  const pendingCredit = pendingApps.reduce((sum, app) => sum + Number(app.class_credit || 0), 0);
+  const approvedCredit = approvedApps.reduce((sum, app) => sum + Number(app.class_credit || 0), 0);
+  const summaryCards = `
+    <div class="ta-summary-grid">
+      <article class="ta-summary-card">
+        <div class="summary-label">待审批教学班数</div>
+        <div class="summary-value">${pendingApps.length}</div>
+        <div class="summary-footnote">包含待 TAAdmin 与待 Professor 审批</div>
+      </article>
+      <article class="ta-summary-card">
+        <div class="summary-label">待审批申请学分</div>
+        <div class="summary-value">${pendingCredit.toFixed(1)}</div>
+        <div class="summary-footnote">当前所有待处理申请对应学分合计</div>
+      </article>
+      <article class="ta-summary-card">
+        <div class="summary-label">已通过教学班数</div>
+        <div class="summary-value">${approvedApps.length}</div>
+        <div class="summary-footnote">最终通过的教学班数量</div>
+      </article>
+      <article class="ta-summary-card">
+        <div class="summary-label">已通过教学学分合计</div>
+        <div class="summary-value">${approvedCredit.toFixed(1)}</div>
+        <div class="summary-footnote">当前已通过申请的学分合计</div>
+      </article>
+    </div>
+  `;
   const rows = apps.map((app) => `<tr>
     <td>${escapeHtml(app.class_name)}</td>
-    <td>${escapeHtml(app.submitted_at)}</td>
+    <td>${escapeHtml(app.teacher_name || "-")}</td>
+    <td>${escapeHtml(Number(app.class_credit || 0) > 0 ? Number(app.class_credit).toFixed(1) : "-")}</td>
+    <td>${escapeHtml(normalizeDisplayDateTime(app.submitted_at))}</td>
     <td>${escapeHtml(statusLabels[app.status])}</td>
     <td>${escapeHtml(app.ta_comment || "")}</td>
     <td>${escapeHtml(app.prof_comment || "")}</td>
-    <td class="table-action-cell"><div class="table-action-inner">
+    <td class="table-action-cell"><div class="table-action-inner application-actions">
       <a class="button-link secondary action-button" href="/ta/applications/${app.application_id}">详情</a>
-      ${app.status === "PendingTAAdmin" ? `<form class="inline" method="post" action="/ta/applications/${app.application_id}/withdraw" onsubmit="return confirm('确认撤销这条申请吗？撤销后需要重新提交申请。');"><button class="danger action-button" type="submit">撤销</button></form>` : ""}
+      ${app.status === "PendingTAAdmin" ? `<form class="inline" method="post" action="/ta/applications/${app.application_id}/withdraw" onsubmit="return confirm('确认撤销这条申请吗？撤销后需要重新提交申请。');"><button class="danger action-button" type="submit">撤销</button></form>` : `<span class="action-placeholder" aria-hidden="true"></span>`}
     </div></td>
   </tr>`).join("");
   const cards = apps.map((app) => `
@@ -3749,9 +5536,17 @@ function taApplicationsPage(res, user, notice) {
       <h3>${escapeHtml(app.class_name)}</h3>
       <div class="mobile-meta">
         <span>${escapeHtml(statusLabels[app.status])}</span>
-        <span>${escapeHtml(app.submitted_at)}</span>
+        <span>${escapeHtml(normalizeDisplayDateTime(app.submitted_at))}</span>
       </div>
       <div class="mobile-data-list">
+        <div class="mobile-data-row">
+          <div class="mobile-data-label">教授</div>
+          <div class="mobile-data-value">${escapeHtml(app.teacher_name || "-")}</div>
+        </div>
+        <div class="mobile-data-row">
+          <div class="mobile-data-label">学分</div>
+          <div class="mobile-data-value">${escapeHtml(Number(app.class_credit || 0) > 0 ? Number(app.class_credit).toFixed(1) : "-")}</div>
+        </div>
         <div class="mobile-data-row">
           <div class="mobile-data-label">TA备注</div>
           <div class="mobile-data-value">${escapeHtml(app.ta_comment || "-")}</div>
@@ -3770,10 +5565,11 @@ function taApplicationsPage(res, user, notice) {
   sendHtml(res, pageLayout("我的申请", `
     <section class="card">
       <h2>我的申请</h2>
+      ${summaryCards}
       <div class="desktop-only">
         <div class="table-wrap">
           <table>
-            <tr><th>教学班</th><th>申请时间</th><th>状态</th><th>TAAdmin 备注</th><th>Professor 备注</th><th>操作</th></tr>${rows}
+            <tr><th>教学班</th><th>教授</th><th>学分</th><th>申请时间</th><th>状态</th><th>TAAdmin 备注</th><th>Professor 备注</th><th>操作</th></tr>${rows}
           </table>
         </div>
       </div>
@@ -3784,23 +5580,17 @@ function taApplicationsPage(res, user, notice) {
   `, user, notice));
 }
 
-function taApplicationDetailPage(res, user, applicationId, notice) {
-  const db = getDb();
-  const app = db.prepare("select * from applications where application_id = ? and applier_user_id = ?").get(applicationId, user.user_id);
+async function taApplicationDetailPage(res, user, applicationId, notice) {
+  const { app, logs, auditRows } = await dbGateway.getTaApplicationDetail(applicationId, user.user_id);
   if (!app) {
-    db.close();
     return sendHtml(res, pageLayout("未找到", '<section class="card">申请不存在。</section>', user, notice), {}, 404);
-    return;
   }
-  const logs = db.prepare("select * from approval_logs where application_id = ? order by acted_at").all(applicationId);
-  const auditRows = applicationAuditRows(db, applicationId);
-  db.close();
-  const logRows = logs.map((log) => `<tr><td>${escapeHtml(log.approval_stage)}</td><td>${escapeHtml(log.approver_name)}</td><td>${escapeHtml(log.result)}</td><td>${escapeHtml(log.comments || "")}</td><td>${escapeHtml(log.acted_at)}</td></tr>`).join("");
+  const logRows = logs.map((log) => `<tr><td>${escapeHtml(log.approval_stage)}</td><td>${escapeHtml(log.approver_name)}</td><td>${escapeHtml(log.result)}</td><td>${escapeHtml(log.comments || "")}</td><td>${escapeHtml(normalizeDisplayDateTime(log.acted_at))}</td></tr>`).join("");
   sendHtml(res, pageLayout("申请详情", `
     <section class="card">
       <h2>${escapeHtml(app.class_name)}</h2>
       <p>当前状态：<span class="pill">${escapeHtml(statusLabels[app.status])}</span></p>
-      <p>申请原因：${escapeHtml(app.application_reason)}</p>
+      <p>申请原因：${escapeHtml(app.application_reason || "-")}</p>
       <p>简历：${attachmentLink(app)}</p>
       <p>TAAdmin 备注：${escapeHtml(app.ta_comment || "")}</p>
       <p>Professor 备注：${escapeHtml(app.prof_comment || "")}</p>
@@ -3808,33 +5598,17 @@ function taApplicationDetailPage(res, user, applicationId, notice) {
     </section>
     <section class="card">
       <h3>审批日志</h3>
-      <table><tr><th>阶段</th><th>审批人</th><th>结果</th><th>备注</th><th>时间</th></tr>${logRows}</table>
+      <div class="detail-table-wrap"><table><tr><th>阶段</th><th>审批人</th><th>结果</th><th>备注</th><th>时间</th></tr>${logRows}</table></div>
     </section>
     ${renderApplicationAuditSection(auditRows)}
   `, user, notice));
 }
 
-function withdrawApplication(res, user, applicationId) {
-  const db = getDb();
-  const app = db.prepare("select * from applications where application_id = ? and applier_user_id = ?").get(applicationId, user.user_id);
-  if (!app) {
-    db.close();
-    return redirect(res, "/ta/applications?notice=申请不存在");
+async function withdrawApplication(res, user, applicationId) {
+  const result = await dbGateway.withdrawTaApplication(user, applicationId);
+  if (!result.ok) {
+    return redirect(res, `/ta/applications?notice=${result.notice}`);
   }
-  if (app.status !== "PendingTAAdmin") {
-    db.close();
-    return redirect(res, "/ta/applications?notice=当前状态不可撤销");
-  }
-  db.prepare("update applications set status = 'Withdrawn' where application_id = ?").run(applicationId);
-  createAuditLog(db, {
-    actor: user,
-    actionType: "TA_WITHDRAW",
-    targetType: "Application",
-    targetId: applicationId,
-    targetName: app.class_name,
-    details: `申请人：${app.applier_name}\n原状态：${statusLabels[app.status] || app.status}\n操作结果：已撤销`
-  });
-  db.close();
   redirect(res, "/ta/applications?notice=申请已撤销");
 }
 
@@ -3846,7 +5620,7 @@ async function taAdminPendingPage(res, user, notice, filters = {}) {
       <td>${escapeHtml(app.applier_name)}</td>
       <td>${escapeHtml(app.class_name)}</td>
       <td>${escapeHtml(app.teacher_name)}</td>
-      <td>${escapeHtml(app.submitted_at)}</td>
+      <td>${escapeHtml(normalizeDisplayDateTime(app.submitted_at))}</td>
       <td>${escapeHtml(app.application_reason)}</td>
       <td class="table-action-cell"><div class="table-action-inner"><a class="button-link secondary action-button" href="/admin/ta/pending/${app.application_id}">详情</a></div></td>
     </tr>`).join("");
@@ -3941,7 +5715,7 @@ async function taAdminPendingPage(res, user, notice, filters = {}) {
     <td>${escapeHtml(app.applier_name)}</td>
     <td>${escapeHtml(app.class_name)}</td>
     <td>${escapeHtml(app.teacher_name)}</td>
-    <td>${escapeHtml(app.submitted_at)}</td>
+    <td>${escapeHtml(normalizeDisplayDateTime(app.submitted_at))}</td>
     <td>${escapeHtml(app.application_reason)}</td>
     <td class="table-action-cell"><div class="table-action-inner"><a class="button-link secondary action-button" href="/admin/ta/pending/${app.application_id}">详情</a></div></td>
   </tr>`).join("");
@@ -4043,7 +5817,7 @@ async function taAdminDetailPage(res, user, applicationId, notice) {
       <section class="card">
         <h2>${escapeHtml(app.applier_name)} - ${escapeHtml(app.class_name)}</h2>
         <p>状态：${escapeHtml(statusLabels[app.status])}</p>
-        <p>申请原因：${escapeHtml(app.application_reason)}</p>
+        <p>申请原因：${escapeHtml(app.application_reason || "-")}</p>
         <p>简历：${attachmentLink(app)}</p>
         ${app.status === "PendingTAAdmin" ? `
           <form method="post" action="/admin/ta/pending/${applicationId}/approve">
@@ -4085,7 +5859,7 @@ async function taAdminDetailPage(res, user, applicationId, notice) {
     <section class="card">
       <h2>${escapeHtml(app.applier_name)} - ${escapeHtml(app.class_name)}</h2>
       <p>状态：${escapeHtml(statusLabels[app.status])}</p>
-      <p>申请原因：${escapeHtml(app.application_reason)}</p>
+      <p>申请原因：${escapeHtml(app.application_reason || "-")}</p>
       <p>简历：${attachmentLink(app)}</p>
       ${app.status === "PendingTAAdmin" ? `
         <form method="post" action="/admin/ta/pending/${applicationId}/approve">
@@ -4359,17 +6133,8 @@ function remindProfessor(res, user, applicationId) {
   redirect(res, `/admin/ta/pending/${applicationId}?notice=已提醒 Professor 审批`);
 }
 
-function taUsersPage(res, user, notice) {
-  const db = getDb();
-  const rows = db.prepare(`
-    select u.*,
-      (select count(*) from applications a where a.applier_user_id = u.user_id) as application_count,
-      (select count(*) from applications a where a.applier_user_id = u.user_id and a.status = 'Approved') as approved_count
-    from users u
-    where u.role = 'TA'
-    order by u.user_name
-  `).all();
-  db.close();
+async function taUsersPage(res, user, notice) {
+  const rows = await dbGateway.getTaUsersManagementRows();
   const htmlRows = rows.map((row) => `<tr>
     <td>${escapeHtml(row.user_name)}</td>
     <td>${escapeHtml(row.login_name)}</td>
@@ -4382,22 +6147,38 @@ function taUsersPage(res, user, notice) {
   sendHtml(res, pageLayout("TA 管理", `<section class="card"><h2>TA 管理</h2><div class="table-wrap list-scroll"><table><tr><th>姓名</th><th>账号</th><th>邮箱</th><th>允许申请</th><th>申请数</th><th>已通过</th><th>操作</th></tr>${htmlRows}</table></div></section>`, user, notice));
 }
 
-function notificationsPage(res, user, notice) {
-  const db = getDb();
-  const rows = db.prepare("select * from notifications where user_id = ? order by created_at desc, notification_id desc").all(user.user_id);
-  db.close();
+async function notificationsPage(res, user, notice) {
+  const rows = await dbGateway.getNotificationsByUser(user.user_id);
   const tableRows = rows.map((row) => `<tr>
     <td>${row.notification_id}</td>
     <td>${escapeHtml(row.title)}</td>
     <td>${escapeHtml(row.content)}</td>
-    <td>${escapeHtml(row.created_at)}</td>
+    <td>${escapeHtml(normalizeDisplayDateTime(row.created_at))}</td>
     <td>${row.is_read === "Y" ? "已读" : "未读"}</td>
-    <td class="table-action-cell"><div class="table-action-inner">${row.target_path ? `<a class="button-link secondary action-button" href="${escapeHtml(row.target_path)}">查看</a>` : ""}${row.is_read === "N" ? `<form class="inline" method="post" action="/notifications/${row.notification_id}/read"><button class="secondary action-button" type="submit">标为已读</button></form>` : ""}</div></td>
+    <td class="table-action-cell"><div class="table-action-inner notifications-actions">${row.target_path ? `<a class="button-link secondary action-button" href="${escapeHtml(row.target_path)}">查看</a>` : `<span class="action-placeholder" aria-hidden="true"></span>`}${row.is_read === "N" ? `<form class="inline" method="post" action="/notifications/${row.notification_id}/read"><button class="secondary action-button" type="submit">标为已读</button></form>` : `<span class="action-placeholder" aria-hidden="true"></span>`}</div></td>
   </tr>`).join("");
+  const mobileCards = rows.map((row) => `
+    <article class="notification-card">
+      <div class="notification-card-header">
+        <h3>${escapeHtml(row.title)}</h3>
+        ${row.is_read === "Y" ? `<span class="pill">已读</span>` : `<span class="pill ok">未读</span>`}
+      </div>
+      <p>${escapeHtml(row.content)}</p>
+      <div class="notification-card-meta">
+        <span>ID ${row.notification_id}</span>
+        <span>${escapeHtml(normalizeDisplayDateTime(row.created_at))}</span>
+      </div>
+      <div class="notification-card-actions">
+        ${row.target_path ? `<a class="button-link secondary action-button" href="${escapeHtml(row.target_path)}">查看</a>` : `<span class="action-placeholder" aria-hidden="true"></span>`}
+        ${row.is_read === "N" ? `<form class="inline" method="post" action="/notifications/${row.notification_id}/read"><button class="secondary action-button" type="submit">标为已读</button></form>` : `<span class="action-placeholder" aria-hidden="true"></span>`}
+      </div>
+    </article>
+  `).join("");
   sendHtml(res, pageLayout("通知中心", `
     <section class="card">
       <h2>通知中心</h2>
-      <div class="table-wrap list-scroll"><table><tr><th>ID</th><th>标题</th><th>内容</th><th>时间</th><th>状态</th><th>操作</th></tr>${tableRows}</table></div>
+      <div class="table-wrap list-scroll desktop-only"><table><tr><th>ID</th><th>标题</th><th>内容</th><th>时间</th><th>状态</th><th>操作</th></tr>${tableRows}</table></div>
+      <div class="mobile-only notification-card-list">${mobileCards || `<p class="muted">当前没有通知。</p>`}</div>
     </section>
   `, user, notice));
 }
@@ -4411,7 +6192,7 @@ async function courseAuditLogsPage(res, user, notice, filters = {}) {
     .map(([value, label]) => `<option value="${value}" ${actionType === value ? "selected" : ""}>${escapeHtml(label)}</option>`)
     .join("");
   const rowsHtml = rows.map((row) => `<tr class="audit-row-${auditActionTone(row.action_type)}">
-    <td>${escapeHtml(row.created_at)}</td>
+    <td>${escapeHtml(normalizeDisplayDateTime(row.created_at))}</td>
     <td>${escapeHtml(row.actor_name || "系统")}</td>
     <td>${escapeHtml(row.actor_role || "System")}</td>
     <td>${renderAuditActionBadge(row.action_type)}</td>
@@ -4466,7 +6247,7 @@ function applicationAuditRows(db, applicationId) {
 
 function renderApplicationAuditSection(rows) {
   const rowHtml = rows.map((row) => `<tr class="audit-row-${auditActionTone(row.action_type)}">
-    <td>${escapeHtml(row.created_at)}</td>
+    <td>${escapeHtml(normalizeDisplayDateTime(row.created_at))}</td>
     <td>${escapeHtml(row.actor_name || "系统")}</td>
     <td>${escapeHtml(row.actor_role || "System")}</td>
     <td>${renderAuditActionBadge(row.action_type)}</td>
@@ -4475,7 +6256,7 @@ function renderApplicationAuditSection(rows) {
   return `
     <section class="card">
       <h3>申请业务日志</h3>
-      <div class="table-wrap list-scroll"><table class="audit-log-table">
+      <div class="detail-table-wrap"><table class="audit-log-table">
         <tr><th>时间</th><th>操作人</th><th>角色</th><th>动作</th><th>详情</th></tr>
         ${rowHtml || '<tr><td colspan="5" class="muted">暂无业务日志。</td></tr>'}
       </table></div>
@@ -4507,7 +6288,7 @@ function renderApplicationAuditTimeline(rows) {
     <div class="audit-timeline-item audit-row-${auditActionTone(row.action_type)}">
       <div class="audit-timeline-meta">
         ${renderAuditActionBadge(row.action_type)}
-        <span class="audit-timeline-time">${escapeHtml(row.created_at)}</span>
+        <span class="audit-timeline-time">${escapeHtml(normalizeDisplayDateTime(row.created_at))}</span>
       </div>
       <div class="audit-timeline-actor">${escapeHtml(row.actor_name || "系统")} · ${escapeHtml(row.actor_role || "System")}</div>
     </div>
@@ -4550,8 +6331,8 @@ async function applicationLogListPage(res, user, notice, filters = {}, options) 
       .filter((app) => !classFilter || String(app.class_name || "").toLowerCase().includes(classFilter))
       .filter((app) => !teacherFilter || String(app.teacher_name || "").toLowerCase().includes(teacherFilter))
       .filter((app) => !statusFilter || String(app.status || "") === statusFilter)
-      .filter((app) => !submittedFrom || String(app.submitted_at || "").slice(0, 10) >= submittedFrom)
-      .filter((app) => !submittedTo || String(app.submitted_at || "").slice(0, 10) <= submittedTo)
+      .filter((app) => !submittedFrom || normalizeDisplayDate(app.submitted_at) >= submittedFrom)
+      .filter((app) => !submittedTo || normalizeDisplayDate(app.submitted_at) <= submittedTo)
       .map((app) => ({ ...app, auditRows: auditMap.get(String(app.application_id)) || [] }));
     const tableRows = rows.map((app) => {
       const latest = app.auditRows[0];
@@ -4561,7 +6342,7 @@ async function applicationLogListPage(res, user, notice, filters = {}, options) 
         <td>${escapeHtml(app.class_name)}</td>
         <td>${escapeHtml(app.teacher_name)}</td>
         <td><span class="${applicationStatusPillClass(app.status)}">${escapeHtml(statusLabels[app.status] || app.status)}</span></td>
-        <td>${latest ? `${renderAuditActionBadge(latest.action_type)}<div class="audit-summary-count">${escapeHtml(latest.created_at)}</div>` : '<span class="muted">暂无</span>'}</td>
+        <td>${latest ? `${renderAuditActionBadge(latest.action_type)}<div class="audit-summary-count">${escapeHtml(normalizeDisplayDateTime(latest.created_at))}</div>` : '<span class="muted">暂无</span>'}</td>
         <td>${renderApplicationAuditTimeline(app.auditRows)}</td>
         <td class="table-action-cell"><div class="table-action-inner"><a class="button-link secondary action-button" href="${options.detailBasePath}/${app.application_id}">查看详情</a></div></td>
       </tr>`;
@@ -4613,8 +6394,8 @@ async function applicationLogListPage(res, user, notice, filters = {}, options) 
     .filter((app) => !classFilter || String(app.class_name || "").toLowerCase().includes(classFilter))
     .filter((app) => !teacherFilter || String(app.teacher_name || "").toLowerCase().includes(teacherFilter))
     .filter((app) => !statusFilter || String(app.status || "") === statusFilter)
-    .filter((app) => !submittedFrom || String(app.submitted_at || "").slice(0, 10) >= submittedFrom)
-    .filter((app) => !submittedTo || String(app.submitted_at || "").slice(0, 10) <= submittedTo)
+    .filter((app) => !submittedFrom || normalizeDisplayDate(app.submitted_at) >= submittedFrom)
+    .filter((app) => !submittedTo || normalizeDisplayDate(app.submitted_at) <= submittedTo)
     .map((app) => ({ ...app, auditRows: auditMap.get(String(app.application_id)) || [] }));
   db.close();
   const tableRows = rows.map((app) => {
@@ -4625,7 +6406,7 @@ async function applicationLogListPage(res, user, notice, filters = {}, options) 
       <td>${escapeHtml(app.class_name)}</td>
       <td>${escapeHtml(app.teacher_name)}</td>
       <td><span class="${applicationStatusPillClass(app.status)}">${escapeHtml(statusLabels[app.status] || app.status)}</span></td>
-      <td>${latest ? `${renderAuditActionBadge(latest.action_type)}<div class="audit-summary-count">${escapeHtml(latest.created_at)}</div>` : '<span class="muted">暂无</span>'}</td>
+      <td>${latest ? `${renderAuditActionBadge(latest.action_type)}<div class="audit-summary-count">${escapeHtml(normalizeDisplayDateTime(latest.created_at))}</div>` : '<span class="muted">暂无</span>'}</td>
       <td>${renderApplicationAuditTimeline(app.auditRows)}</td>
       <td class="table-action-cell"><div class="table-action-inner"><a class="button-link secondary action-button" href="${options.detailBasePath}/${app.application_id}">查看详情</a></div></td>
     </tr>`;
@@ -4665,32 +6446,14 @@ async function applicationLogListPage(res, user, notice, filters = {}, options) 
   `, user, notice));
 }
 
-function markNotificationRead(res, user, notificationId) {
-  const db = getDb();
-  db.prepare("update notifications set is_read = 'Y' where notification_id = ? and user_id = ?").run(notificationId, user.user_id);
-  db.close();
+async function markNotificationRead(res, user, notificationId) {
+  await dbGateway.markNotificationReadById(notificationId, user.user_id);
   redirect(res, "/notifications?notice=通知已标记为已读");
 }
 
-function toggleTaUser(res, actor, userId) {
-  const db = getDb();
-  const row = db.prepare("select * from users where user_id = ? and role = 'TA'").get(userId);
-  if (!row) {
-    db.close();
-    return redirect(res, "/admin/ta/users?notice=TA 不存在");
-  }
-  const nextValue = row.is_allowed_to_apply === "Y" ? "N" : "Y";
-  db.prepare("update users set is_allowed_to_apply = ? where user_id = ?").run(nextValue, userId);
-  createAuditLog(db, {
-    actor,
-    actionType: "TA_TOGGLE_APPLY_QUALIFICATION",
-    targetType: "User",
-    targetId: userId,
-    targetName: row.user_name,
-    details: `登录名：${row.login_name}\n新允许申请状态：${nextValue}`
-  });
-  db.close();
-  redirect(res, "/admin/ta/users?notice=TA 资格已更新");
+async function toggleTaUser(res, actor, userId) {
+  const result = await dbGateway.toggleTaUserApplyQualification(actor, userId);
+  redirect(res, `/admin/ta/users?notice=${result.notice}`);
 }
 
 async function professorPendingPage(res, user, notice) {
@@ -4790,7 +6553,7 @@ async function professorClassReviewPage(res, user, classId, notice) {
     const remaining = Math.max(0, Number(classRow.maximum_number_of_tas_admitted) - Number(approvedCount));
     const rows = apps.map((app) => `<tr>
       <td>${escapeHtml(app.applier_name)}</td>
-      <td>${escapeHtml(app.submitted_at)}</td>
+      <td>${escapeHtml(normalizeDisplayDateTime(app.submitted_at))}</td>
       <td>${escapeHtml(statusLabels[app.status] || app.status)}</td>
       <td>${escapeHtml(app.ta_comment || "")}</td>
       <td class="table-action-cell"><div class="table-action-inner"><a class="button-link secondary action-button" href="/professor/pending/${app.application_id}">查看申请</a></div></td>
@@ -4800,7 +6563,7 @@ async function professorClassReviewPage(res, user, classId, notice) {
         <h3>${escapeHtml(app.applier_name)}</h3>
         <div class="mobile-meta">
           <span>${escapeHtml(statusLabels[app.status] || app.status)}</span>
-          <span>${escapeHtml(app.submitted_at)}</span>
+          <span>${escapeHtml(normalizeDisplayDateTime(app.submitted_at))}</span>
         </div>
         <div class="mobile-data-list">
           <div class="mobile-data-row">
@@ -4867,7 +6630,7 @@ async function professorClassReviewPage(res, user, classId, notice) {
   const remaining = Math.max(0, Number(classRow.maximum_number_of_tas_admitted) - Number(approvedCount));
   const rows = apps.map((app) => `<tr>
     <td>${escapeHtml(app.applier_name)}</td>
-    <td>${escapeHtml(app.submitted_at)}</td>
+    <td>${escapeHtml(normalizeDisplayDateTime(app.submitted_at))}</td>
     <td>${escapeHtml(statusLabels[app.status] || app.status)}</td>
     <td>${escapeHtml(app.ta_comment || "")}</td>
     <td class="table-action-cell"><div class="table-action-inner"><a class="button-link secondary action-button" href="/professor/pending/${app.application_id}">查看申请</a></div></td>
@@ -4877,7 +6640,7 @@ async function professorClassReviewPage(res, user, classId, notice) {
       <h3>${escapeHtml(app.applier_name)}</h3>
       <div class="mobile-meta">
         <span>${escapeHtml(statusLabels[app.status] || app.status)}</span>
-        <span>${escapeHtml(app.submitted_at)}</span>
+        <span>${escapeHtml(normalizeDisplayDateTime(app.submitted_at))}</span>
       </div>
       <div class="mobile-data-list">
         <div class="mobile-data-row">
@@ -4980,7 +6743,7 @@ async function professorDetailPage(res, user, applicationId, notice) {
   sendHtml(res, pageLayout("教授审批", `
     <section class="card">
       <h2>${escapeHtml(app.applier_name)} - ${escapeHtml(app.class_name)}</h2>
-      <p>申请原因：${escapeHtml(app.application_reason)}</p>
+      <p>申请原因：${escapeHtml(app.application_reason || "-")}</p>
       <p>简历：${attachmentLink(app)}</p>
       <p>TAAdmin 备注：${escapeHtml(app.ta_comment || "")}</p>
       <p>当前录取人数：${approvedCount} / ${classRow.maximum_number_of_tas_admitted}</p>
@@ -5146,6 +6909,11 @@ function professorMultiOptions(selectedUserIds) {
   return rows.map((row) => `<option value="${row.user_id}" ${selected.has(row.user_id) ? "selected" : ""}>${escapeHtml(row.user_name)}</option>`).join("");
 }
 
+function professorMultiOptionsFromRows(rows, selectedUserIds) {
+  const selected = new Set(normalizeTeacherUserIds(selectedUserIds));
+  return rows.map((row) => `<option value="${row.user_id}" ${selected.has(Number(row.user_id)) ? "selected" : ""}>${escapeHtml(row.user_name)}</option>`).join("");
+}
+
 function resolveProfessorSelection(db, rawValue) {
   const ids = normalizeTeacherUserIds(rawValue);
   if (!ids.length) {
@@ -5168,6 +6936,8 @@ async function courseClassesPage(res, user, notice, filters = {}) {
   const sortBy = String(filters.sort_by || "class_code");
   const sortOrder = String(filters.sort_order || "asc").toLowerCase() === "desc" ? "desc" : "asc";
   const schedulesByClass = new Map();
+  const professorRows = await dbGateway.getProfessorUsers();
+  const professorOptionsMarkup = professorMultiOptionsFromRows(professorRows, []);
 
   let rows;
   if (DB_CLIENT === "mysql") {
@@ -5212,19 +6982,19 @@ async function courseClassesPage(res, user, notice, filters = {}) {
   const tableRows = rows.map((row) => {
     const scheduleRows = schedulesByClass.get(row.class_id) || [];
     const isFull = Number(row.approved_count || 0) >= Number(row.maximum_number_of_tas_admitted || 0);
+    const creditText = row.credit === null || row.credit === undefined || row.credit === "" ? "-" : escapeHtml(String(Number(row.credit)));
     return `<tr class="${isFull ? "row-soft-purple" : ""}">
     <td><input type="checkbox" class="class-select" value="${row.class_id}" /></td>
     <td>${escapeHtml(row.class_code)}</td>
     <td>${escapeHtml(row.class_abbr || "")}</td>
-    <td>${escapeHtml(row.course_name)}</td>
     <td>${escapeHtml(row.class_name)}</td>
-    <td>${escapeHtml(row.teacher_name)}</td>
+    <td>${creditText}</td>
+    <td class="cell-compact">${escapeHtml(row.teacher_name)}</td>
     <td>${escapeHtml(row.semester)}</td>
     <td>${classOpenStatusPill(row)}</td>
     <td>${classCapacityPill(isFull)}</td>
-    <td>${scheduleRows.length}</td>
-    <td>${namePills(row.approved_ta_names || "-")}</td>
-    <td>${scheduleSummary(scheduleRows, `course-${row.class_id}`, { showPreview: false })}</td>
+    <td>${scheduleSummary(scheduleRows, `course-${row.class_id}`, { showPreview: false, triggerLabel: String(scheduleRows.length) })}</td>
+    <td class="cell-compact">${namePills(row.approved_ta_names || "-")}</td>
     <td>${metricPill(`${row.approved_count} / ${row.maximum_number_of_tas_admitted}`, isFull ? "gold" : "ok")}</td>
     <td>${metricPill(row.application_count, "muted")}</td>
     <td>${ynPill(row.ta_applications_allowed, "Y", "N")}</td>
@@ -5247,7 +7017,7 @@ async function courseClassesPage(res, user, notice, filters = {}) {
           <label><input type="checkbox" class="class-select" value="${row.class_id}" /> 选择</label>
           ${isFull ? classCapacityPill(true) : classOpenStatusPill(row)}
         </div>
-        <h3>${escapeHtml(row.course_name)} / ${escapeHtml(row.class_name)}</h3>
+        <h3>${escapeHtml(row.class_name)}</h3>
         <div class="mobile-meta">
           <span>${escapeHtml(row.class_code)}</span>
           ${row.class_abbr ? `<span>${escapeHtml(row.class_abbr)}</span>` : ""}
@@ -5257,6 +7027,10 @@ async function courseClassesPage(res, user, notice, filters = {}) {
           <div class="mobile-data-row">
             <div class="mobile-data-label">教授</div>
             <div class="mobile-data-value">${escapeHtml(row.teacher_name)}</div>
+          </div>
+          <div class="mobile-data-row">
+            <div class="mobile-data-label">学分</div>
+            <div class="mobile-data-value">${row.credit === null || row.credit === undefined || row.credit === "" ? "-" : escapeHtml(String(Number(row.credit)))}</div>
           </div>
           <div class="mobile-data-row">
             <div class="mobile-data-label">已通过</div>
@@ -5275,12 +7049,11 @@ async function courseClassesPage(res, user, notice, filters = {}) {
             <div class="mobile-data-value">${ynPill(row.ta_applications_allowed, "开放", "关闭")} / 允许冲突 ${ynPill(row.is_conflict_allowed || "N", "Y", "N")}</div>
           </div>
           <div class="mobile-data-row">
-            <div class="mobile-data-label">排课安排</div>
-            <div class="mobile-data-value">${scheduleRows.length} 条</div>
+            <div class="mobile-data-label">排课数</div>
+            <div class="mobile-data-value">${scheduleSummary(scheduleRows, `course-mobile-count-${row.class_id}`, { showPreview: false, triggerLabel: `${scheduleRows.length} 条` })}</div>
           </div>
         </div>
         <div class="actions" style="margin-top:12px;">
-          ${scheduleSummary(scheduleRows, `course-mobile-${row.class_id}`, { showPreview: false })}
           <a class="button-link secondary action-button" href="/course/classes/${row.class_id}">修改</a>
           <a class="button-link secondary action-button" href="/course/classes/${row.class_id}/applications">查看</a>
           <a class="button-link danger action-button" href="/course/classes/${row.class_id}/delete">删除</a>
@@ -5305,7 +7078,7 @@ async function courseClassesPage(res, user, notice, filters = {}) {
             <p class="muted">当前导入格式为 Excel。同一个 class_code 可出现多行，每行代表一条排课。导入时按 class_code 覆盖教学班基础信息并重建该教学班的全部排课。</p>
             <div class="field-order">
               字段顺序：<br>
-              class_code, class_abbr, course_name, class_name, teaching_language, teacher_login_name, semester, maximum_number, ta_allowed, is_conflict_allowed<br>
+              class_code, class_abbr, course_name, class_name, teaching_language, teacher_login_name, semester, credit, maximum_number, ta_allowed, is_conflict_allowed<br>
               apply_start_at, apply_end_at, lesson_date, start_time, end_time, section, is_exam, class_intro, memo
             </div>
           </section>
@@ -5333,8 +7106,9 @@ async function courseClassesPage(res, user, notice, filters = {}) {
             <option value="closed" ${statusFilter === "closed" ? "selected" : ""}>已关闭</option>
             <option value="unset" ${statusFilter === "unset" ? "selected" : ""}>未设置</option>
           </select></label></p>
-          <div class="actions">
+          <div class="actions filters-actions-row">
             <button class="secondary action-button" type="submit">筛选</button>
+            <a class="button-link secondary action-button" href="/course/classes/calendar${buildQueryString({ class_code: filters.class_code || "", class_name: filters.class_name || "", teacher_name: filters.teacher_name || "", ta_full: filters.ta_full || "", status_filter: filters.status_filter || "", sort_by: sortBy, sort_order: sortOrder })}">日历视图</a>
             <a class="button-link secondary action-button" href="/course/classes/ta-export${buildQueryString({ class_code: filters.class_code || "", class_name: filters.class_name || "", teacher_name: filters.teacher_name || "", ta_full: filters.ta_full || "", status_filter: filters.status_filter || "", sort_by: sortBy, sort_order: sortOrder })}">导出教学班TA</a>
             <a class="button-link secondary action-button" href="/course/classes">重置</a>
           </div>
@@ -5393,8 +7167,9 @@ async function courseClassesPage(res, user, notice, filters = {}) {
                 <p><label>课程名<input name="course_name" required /></label></p>
                 <p><label>教学班名称<input name="class_name" required /></label></p>
                 <p><label>授课语言<select name="teaching_language"><option value="中文">中文</option><option value="英文">英文</option></select></label></p>
-                <p><label>Professor（可多选）<select name="teacher_user_id" multiple size="4">${professorMultiOptions([])}</select></label></p>
+                <p><label>Professor（可多选）<select class="multi-select-list" name="teacher_user_id" multiple size="10">${professorOptionsMarkup}</select></label></p>
                 <p><label>学期<input name="semester" value="2026Fall" required /></label></p>
+                <p><label>学分<input name="credit" type="number" step="0.1" min="0" value="0" required /></label></p>
                 <p><label>最大录取人数<input name="maximum_number" type="number" value="1" min="1" required /></label></p>
                 <p><label>允许 TA 申请<select name="ta_allowed"><option value="Y">Y</option><option value="N">N</option></select></label></p>
                 <p><label>允许冲突申请<select name="is_conflict_allowed"><option value="N">N</option><option value="Y">Y</option></select></label></p>
@@ -5422,25 +7197,24 @@ async function courseClassesPage(res, user, notice, filters = {}) {
         <div class="table-wrap list-scroll">
           <table class="wide compact-table fixed-layout">
             <colgroup>
-              <col style="width:56px;" />
-              <col style="width:110px;" />
-              <col style="width:82px;" />
-              <col style="width:124px;" />
-              <col style="width:168px;" />
-              <col style="width:148px;" />
-              <col style="width:92px;" />
-              <col style="width:88px;" />
-              <col style="width:76px;" />
-              <col style="width:64px;" />
-              <col style="width:150px;" />
-              <col style="width:98px;" />
-              <col style="width:98px;" />
-              <col style="width:78px;" />
-              <col style="width:82px;" />
-              <col style="width:86px;" />
-              <col style="width:210px;" />
+            <col style="width:56px;" />
+            <col style="width:110px;" />
+            <col style="width:82px;" />
+            <col style="width:168px;" />
+            <col style="width:72px;" />
+            <col style="width:108px;" />
+            <col style="width:92px;" />
+            <col style="width:88px;" />
+            <col style="width:86px;" />
+            <col style="width:88px;" />
+            <col style="width:84px;" />
+            <col style="width:98px;" />
+            <col style="width:78px;" />
+            <col style="width:82px;" />
+            <col style="width:86px;" />
+              <col style="width:236px;" />
             </colgroup>
-            <tr><th>选择</th><th>${sortableHeader("教学班代码", "class_code", "/course/classes", headerFilters, sortBy, sortOrder)}</th><th>缩写</th><th>课程名</th><th>${sortableHeader("教学班名称", "class_name", "/course/classes", headerFilters, sortBy, sortOrder)}</th><th>${sortableHeader("教授", "teacher_name", "/course/classes", headerFilters, sortBy, sortOrder)}</th><th>学期</th><th>${sortableHeader("开放状态", "status_filter", "/course/classes", headerFilters, sortBy, sortOrder)}</th><th>${sortableHeader("TA已满", "ta_full", "/course/classes", headerFilters, sortBy, sortOrder)}</th><th>排课数</th><th>TA</th><th>排课安排</th><th>${sortableHeader("已通过/上限", "approved_count", "/course/classes", headerFilters, sortBy, sortOrder)}</th><th>${sortableHeader("申请数", "application_count", "/course/classes", headerFilters, sortBy, sortOrder)}</th><th>开放申请</th><th>允许冲突</th><th>单条操作</th></tr>${tableRows}
+            <tr><th>选择</th><th>${sortableHeader("教学班代码", "class_code", "/course/classes", headerFilters, sortBy, sortOrder)}</th><th>缩写</th><th>${sortableHeader("教学班名称", "class_name", "/course/classes", headerFilters, sortBy, sortOrder)}</th><th>学分</th><th>${sortableHeader("教授", "teacher_name", "/course/classes", headerFilters, sortBy, sortOrder)}</th><th>学期</th><th>${sortableHeader("开放状态", "status_filter", "/course/classes", headerFilters, sortBy, sortOrder)}</th><th>${sortableHeader("TA已满", "ta_full", "/course/classes", headerFilters, sortBy, sortOrder)}</th><th>排课数</th><th>TA</th><th>${sortableHeader("已通过/上限", "approved_count", "/course/classes", headerFilters, sortBy, sortOrder)}</th><th>${sortableHeader("申请数", "application_count", "/course/classes", headerFilters, sortBy, sortOrder)}</th><th>开放申请</th><th>允许冲突</th><th>单条操作</th></tr>${tableRows}
           </table>
         </div>
       </div>
@@ -5483,24 +7257,22 @@ async function courseClassesPage(res, user, notice, filters = {}) {
   `, user, notice));
 }
 
-function taAdminAllApplicationsPage(res, user, notice, filters = {}) {
-  const db = getDb();
+async function taAdminAllApplicationsPage(res, user, notice, filters = {}) {
   const studentFilter = String(filters.applier_name || "").trim().toLowerCase();
   const classFilter = String(filters.class_name || "").trim().toLowerCase();
   const teacherFilter = String(filters.teacher_name || "").trim().toLowerCase();
   const statusFilter = String(filters.status || "").trim();
-  const rows = db.prepare("select * from applications order by submitted_at desc").all()
+  const rows = (await dbGateway.getAllApplications())
     .filter((app) => !studentFilter || String(app.applier_name || "").toLowerCase().includes(studentFilter))
     .filter((app) => !classFilter || String(app.class_name || "").toLowerCase().includes(classFilter))
     .filter((app) => !teacherFilter || String(app.teacher_name || "").toLowerCase().includes(teacherFilter))
     .filter((app) => !statusFilter || String(app.status || "") === statusFilter);
-  db.close();
   const tableRows = rows.map((app) => `<tr>
     <td>${app.application_id}</td>
     <td>${escapeHtml(app.applier_name)}</td>
     <td>${escapeHtml(app.class_name)}</td>
     <td>${escapeHtml(app.teacher_name)}</td>
-    <td>${escapeHtml(app.submitted_at)}</td>
+    <td>${escapeHtml(normalizeDisplayDateTime(app.submitted_at))}</td>
     <td>${escapeHtml(statusLabels[app.status] || app.status)}</td>
     <td>${attachmentLink(app)}</td>
     <td class="table-action-cell"><div class="table-action-inner"><a class="button-link secondary action-button" href="/admin/ta/pending/${app.application_id}">详情</a></div></td>
@@ -5541,7 +7313,7 @@ async function courseAdminAllApplicationsPage(res, user, notice) {
       <td>${escapeHtml(app.applier_name)}</td>
       <td>${escapeHtml(app.class_name)}</td>
       <td>${escapeHtml(app.teacher_name)}</td>
-      <td>${escapeHtml(app.submitted_at)}</td>
+      <td>${escapeHtml(normalizeDisplayDateTime(app.submitted_at))}</td>
       <td>${escapeHtml(statusLabels[app.status] || app.status)}</td>
       <td>${attachmentLink(app)}</td>
       <td class="table-action-cell"><div class="table-action-inner"><a class="button-link secondary action-button" href="/course/applications/${app.application_id}">详情</a></div></td>
@@ -5561,7 +7333,7 @@ async function courseAdminAllApplicationsPage(res, user, notice) {
     <td>${escapeHtml(app.applier_name)}</td>
     <td>${escapeHtml(app.class_name)}</td>
     <td>${escapeHtml(app.teacher_name)}</td>
-    <td>${escapeHtml(app.submitted_at)}</td>
+    <td>${escapeHtml(normalizeDisplayDateTime(app.submitted_at))}</td>
     <td>${escapeHtml(statusLabels[app.status] || app.status)}</td>
     <td>${attachmentLink(app)}</td>
     <td class="table-action-cell"><div class="table-action-inner"><a class="button-link secondary action-button" href="/course/applications/${app.application_id}">详情</a></div></td>
@@ -5603,8 +7375,8 @@ async function buildCourseReportData(filters = {}) {
   const allApplications = snapshot.applications;
   const applications = allApplications
     .filter((app) => allowedClassIds.has(app.class_id))
-    .filter((app) => !submittedFrom || String(app.submitted_at || "").slice(0, 10) >= submittedFrom)
-    .filter((app) => !submittedTo || String(app.submitted_at || "").slice(0, 10) <= submittedTo)
+    .filter((app) => !submittedFrom || normalizeDisplayDate(app.submitted_at) >= submittedFrom)
+    .filter((app) => !submittedTo || normalizeDisplayDate(app.submitted_at) <= submittedTo)
     .filter((app) => !teacherFilter || String(app.teacher_name || "").toLowerCase().includes(teacherFilter));
   const semesterOptions = Array.from(new Set(
     classes.map((row) => String(row.semester || "").trim()).filter(Boolean)
@@ -5689,7 +7461,7 @@ async function buildCourseReportData(filters = {}) {
 
   const dayMap = new Map();
   applications.forEach((app) => {
-    const day = String(app.submitted_at || "").slice(0, 10);
+    const day = normalizeDisplayDate(app.submitted_at);
     if (!day) return;
     dayMap.set(day, (dayMap.get(day) || 0) + 1);
   });
@@ -6139,22 +7911,22 @@ async function courseAdminApplicationDetailPage(res, user, applicationId, notice
       <td>${escapeHtml(log.approver_name)}</td>
       <td>${escapeHtml(log.result)}</td>
       <td>${escapeHtml(log.comments || "")}</td>
-      <td>${escapeHtml(log.acted_at)}</td>
+      <td>${escapeHtml(normalizeDisplayDateTime(log.acted_at))}</td>
     </tr>`).join("");
     return sendHtml(res, pageLayout("申请详情", `
       <section class="card">
         <h2>${escapeHtml(app.applier_name)} - ${escapeHtml(app.class_name)}</h2>
         <p>教授：${escapeHtml(app.teacher_name)}</p>
         <p>状态：${escapeHtml(statusLabels[app.status] || app.status)}</p>
-        <p>申请时间：${escapeHtml(app.submitted_at)}</p>
-        <p>申请原因：${escapeHtml(app.application_reason)}</p>
+        <p>申请时间：${escapeHtml(normalizeDisplayDateTime(app.submitted_at))}</p>
+        <p>申请原因：${escapeHtml(app.application_reason || "-")}</p>
         <p>简历：${attachmentLink(app)}</p>
         <p>TAAdmin 备注：${escapeHtml(app.ta_comment || "")}</p>
         <p>Professor 备注：${escapeHtml(app.prof_comment || "")}</p>
       </section>
       <section class="card">
         <h3>审批记录</h3>
-        <table><tr><th>阶段</th><th>审批人</th><th>结果</th><th>备注</th><th>时间</th></tr>${logRows || "<tr><td colspan=\"5\">暂无审批记录</td></tr>"}</table>
+        <div class="detail-table-wrap"><table><tr><th>阶段</th><th>审批人</th><th>结果</th><th>备注</th><th>时间</th></tr>${logRows || "<tr><td colspan=\"5\">暂无审批记录</td></tr>"}</table></div>
       </section>
       ${renderApplicationAuditSection(auditRows)}
       ${adminOverrideSection(`/course/applications/${applicationId}/override-status`, app.status)}
@@ -6179,22 +7951,22 @@ async function courseAdminApplicationDetailPage(res, user, applicationId, notice
     <td>${escapeHtml(log.approver_name)}</td>
     <td>${escapeHtml(log.result)}</td>
     <td>${escapeHtml(log.comments || "")}</td>
-    <td>${escapeHtml(log.acted_at)}</td>
+    <td>${escapeHtml(normalizeDisplayDateTime(log.acted_at))}</td>
   </tr>`).join("");
   sendHtml(res, pageLayout("申请详情", `
     <section class="card">
       <h2>${escapeHtml(app.applier_name)} - ${escapeHtml(app.class_name)}</h2>
       <p>教授：${escapeHtml(app.teacher_name)}</p>
       <p>状态：${escapeHtml(statusLabels[app.status] || app.status)}</p>
-      <p>申请时间：${escapeHtml(app.submitted_at)}</p>
-      <p>申请原因：${escapeHtml(app.application_reason)}</p>
+      <p>申请时间：${escapeHtml(normalizeDisplayDateTime(app.submitted_at))}</p>
+      <p>申请原因：${escapeHtml(app.application_reason || "-")}</p>
       <p>简历：${attachmentLink(app)}</p>
       <p>TAAdmin 备注：${escapeHtml(app.ta_comment || "")}</p>
       <p>Professor 备注：${escapeHtml(app.prof_comment || "")}</p>
     </section>
     <section class="card">
       <h3>审批记录</h3>
-      <table><tr><th>阶段</th><th>审批人</th><th>结果</th><th>备注</th><th>时间</th></tr>${logRows || "<tr><td colspan=\"5\">暂无审批记录</td></tr>"}</table>
+      <div class="detail-table-wrap"><table><tr><th>阶段</th><th>审批人</th><th>结果</th><th>备注</th><th>时间</th></tr>${logRows || "<tr><td colspan=\"5\">暂无审批记录</td></tr>"}</table></div>
     </section>
     ${renderApplicationAuditSection(auditRows)}
     ${adminOverrideSection(`/course/applications/${applicationId}/override-status`, app.status)}
@@ -6315,14 +8087,13 @@ async function taAdminAllClassesPage(res, user, notice, filters = {}) {
     const db = getDb();
     const rowsRaw = loadTaAdminClassRows(db, filters);
     for (const row of rowsRaw) {
-      if (isClassCapacityReached(row, row.approved_count) && row.ta_applications_allowed !== "N") {
+      if (row.published_to_professor === "Y") {
         db.prepare("update classes set ta_applications_allowed = 'N' where class_id = ?").run(row.class_id);
         row.ta_applications_allowed = "N";
       }
-      if (Number(row.pending_taadmin_count || 0) > 0 && row.published_to_professor === "Y") {
-        db.prepare("update classes set published_to_professor = 'N', professor_notified_at = null where class_id = ?").run(row.class_id);
-        row.published_to_professor = "N";
-        row.professor_notified_at = null;
+      if (isClassCapacityReached(row, row.approved_count) && row.ta_applications_allowed !== "N") {
+        db.prepare("update classes set ta_applications_allowed = 'N' where class_id = ?").run(row.class_id);
+        row.ta_applications_allowed = "N";
       }
     }
     const professors = db.prepare("select user_id, email from users where role = 'Professor'").all();
@@ -6351,15 +8122,13 @@ async function taAdminAllClassesPage(res, user, notice, filters = {}) {
       <td><input type="checkbox" class="ta-class-select" value="${row.class_id}" /></td>
       <td>${escapeHtml(row.class_code)}</td>
       <td>${escapeHtml(row.class_abbr || "")}</td>
-      <td>${escapeHtml(row.course_name)}</td>
       <td>${escapeHtml(row.class_name)}</td>
       <td>${escapeHtml(row.teacher_name)}</td>
       <td>${escapeHtml(row.semester)}</td>
       <td>${classOpenStatusPill(row)}</td>
       <td>${classCapacityPill(isFull)}</td>
-      <td>${scheduleRows.length}</td>
+      <td>${scheduleSummary(scheduleRows, `taadmin-count-${row.class_id}`, { showPreview: false, triggerLabel: String(scheduleRows.length) })}</td>
       <td>${namePills(row.approved_ta_names || "-")}</td>
-      <td>${scheduleSummary(scheduleRows, `taadmin-${row.class_id}`, { showPreview: false })}</td>
       <td>${metricPill(`${row.approved_count} / ${row.maximum_number_of_tas_admitted}`, isFull ? "gold" : "ok")}</td>
       <td>${metricPill(row.application_count, "muted")}</td>
       <td>${metricPill(row.pending_taadmin_count, Number(row.pending_taadmin_count || 0) > 0 ? "gold" : "muted")}</td>
@@ -6378,7 +8147,7 @@ async function taAdminAllClassesPage(res, user, notice, filters = {}) {
           <label><input type="checkbox" class="ta-class-select" value="${row.class_id}" /> 选择</label>
           ${ynPill(row.published_to_professor, "已发送", "未发送")}
         </div>
-        <h3>${escapeHtml(row.course_name)} / ${escapeHtml(row.class_name)}</h3>
+        <h3>${escapeHtml(row.class_name)}</h3>
         <div class="mobile-meta">
           <span>${escapeHtml(row.teacher_name)}</span>
           <span>${escapeHtml(row.semester)}</span>
@@ -6415,11 +8184,10 @@ async function taAdminAllClassesPage(res, user, notice, filters = {}) {
           </div>
           <div class="mobile-data-row">
             <div class="mobile-data-label">排课安排</div>
-            <div class="mobile-data-value">${scheduleRows.length} 条</div>
+            <div class="mobile-data-value">${scheduleSummary(scheduleRows, `taadmin-mobile-count-${row.class_id}`, { showPreview: false, triggerLabel: `${scheduleRows.length} 条` })}</div>
           </div>
         </div>
         <div class="actions" style="margin-top:12px;">
-          ${scheduleSummary(scheduleRows, `taadmin-mobile-${row.class_id}`, { showPreview: false })}
           <a class="button-link secondary rect action-button" href="/admin/ta/classes/${row.class_id}/applications">审核</a>
         </div>
       </article>
@@ -6444,11 +8212,45 @@ async function taAdminAllClassesPage(res, user, notice, filters = {}) {
             <option value="N" ${filters.has_pending === "N" ? "selected" : ""}>无</option>
           </select></label></p>
         </div>
-        <div class="actions" style="margin-top:12px;">
+        <div class="actions filters-actions-row" style="margin-top:12px;">
           <button class="secondary action-button" type="submit">筛选</button>
+          <a class="button-link secondary rect action-button" href="/admin/ta/classes/calendar${buildQueryString({ professor_name: filters.professor_name || "", class_name: filters.class_name || "", ta_full: filters.ta_full || "", has_pending: filters.has_pending || "" })}">日历视图</a>
           <a class="button-link secondary rect action-button" href="/admin/ta/classes/ta-export${buildQueryString({ professor_name: filters.professor_name || "", class_name: filters.class_name || "", ta_full: filters.ta_full || "", has_pending: filters.has_pending || "" })}">导出教学班TA</a>
           <a class="button-link secondary rect action-button" href="/admin/ta/classes">重置</a>
         </div>
+        </div>
+      </form>
+    </section>
+    <section class="card">
+      <h2>教学班设置</h2>
+      <form method="post" action="/admin/ta/classes/batch-window" onsubmit="return submitSelectedTaClasses(this);">
+        <input type="hidden" name="class_refs" />
+        <div class="grid">
+          <p><label>开放开始时间<input type="datetime-local" name="apply_start_at" /></label></p>
+          <p><label>开放结束时间<input type="datetime-local" name="apply_end_at" /></label></p>
+        </div>
+        <div class="actions">
+          <button class="secondary rect action-button" type="submit">批量设置开放时间</button>
+        </div>
+      </form>
+      <form method="post" action="/admin/ta/classes/batch-settings" onsubmit="return submitSelectedTaClasses(this);" style="margin-top:16px;">
+        <input type="hidden" name="class_refs" />
+        <div class="grid">
+          <p><label>开放申请
+            <select name="ta_allowed">
+              <option value="Y">Y</option>
+              <option value="N">N</option>
+            </select>
+          </label></p>
+          <p><label>允许冲突
+            <select name="is_conflict_allowed">
+              <option value="N">N</option>
+              <option value="Y">Y</option>
+            </select>
+          </label></p>
+        </div>
+        <div class="actions">
+          <button class="secondary rect action-button" type="submit">批量更新开放设置</button>
         </div>
       </form>
     </section>
@@ -6489,15 +8291,13 @@ async function taAdminAllClassesPage(res, user, notice, filters = {}) {
               <col style="width:56px;" />
               <col style="width:106px;" />
               <col style="width:80px;" />
-              <col style="width:120px;" />
               <col style="width:160px;" />
-              <col style="width:142px;" />
+              <col style="width:118px;" />
               <col style="width:88px;" />
               <col style="width:86px;" />
               <col style="width:74px;" />
-              <col style="width:62px;" />
-              <col style="width:148px;" />
-              <col style="width:96px;" />
+              <col style="width:84px;" />
+              <col style="width:112px;" />
               <col style="width:96px;" />
               <col style="width:76px;" />
               <col style="width:104px;" />
@@ -6506,7 +8306,7 @@ async function taAdminAllClassesPage(res, user, notice, filters = {}) {
               <col style="width:86px;" />
               <col style="width:92px;" />
             </colgroup>
-            <tr><th>选择</th><th>代码</th><th>缩写</th><th>课程名</th><th>教学班</th><th>教授</th><th>学期</th><th>开放状态</th><th>TA已满</th><th>排课数</th><th>TA</th><th>排课安排</th><th>已通过/上限</th><th>申请数</th><th>待TAAdmin审批</th><th>发布至教授</th><th>开放申请</th><th>允许冲突</th><th>操作</th></tr>${tableRows}
+            <tr><th>选择</th><th>代码</th><th>缩写</th><th>教学班</th><th>教授</th><th>学期</th><th>开放状态</th><th>TA已满</th><th>排课数</th><th>TA</th><th>已通过/上限</th><th>申请数</th><th>待TAAdmin审批</th><th>发布至教授</th><th>开放申请</th><th>允许冲突</th><th>操作</th></tr>${tableRows}
           </table>
         </div>
       </div>
@@ -6778,9 +8578,9 @@ async function batchUpdateProfessorPublishStatus(req, res, user) {
     db.close();
     return redirect(res, "/admin/ta/classes?notice=未匹配到任何教学班");
   }
-  const updateStmt = db.prepare("update classes set published_to_professor = ?, professor_notified_at = ? where class_id = ?");
+  const updateStmt = db.prepare("update classes set published_to_professor = ?, professor_notified_at = ?, ta_applications_allowed = case when ? = 'Y' then 'N' else ta_applications_allowed end where class_id = ?");
   for (const row of selectedClasses) {
-    updateStmt.run(nextValue, nextValue === "Y" ? nowStr() : null, row.class_id);
+    updateStmt.run(nextValue, nextValue === "Y" ? nowStr() : null, nextValue, row.class_id);
     createAuditLog(db, {
       actor: user,
       actionType: "CLASS_PUBLISH_STATUS_UPDATE",
@@ -6792,6 +8592,116 @@ async function batchUpdateProfessorPublishStatus(req, res, user) {
   }
   db.close();
   redirect(res, `/admin/ta/classes?notice=已批量更新 ${selectedClasses.length} 个教学班的发布状态`);
+}
+
+async function taAdminBatchUpdateClassWindow(req, res, user) {
+  const body = await readBody(req);
+  const refs = parseBatchClassRefs(body.class_refs);
+  let applyStartAt;
+  let applyEndAt;
+  try {
+    applyStartAt = normalizeDateTimeInput(body.apply_start_at);
+    applyEndAt = normalizeDateTimeInput(body.apply_end_at);
+    validateApplyWindow(applyStartAt, applyEndAt);
+  } catch (error) {
+    return redirect(res, `/admin/ta/classes?notice=${error.message}`);
+  }
+  if (!refs.length) {
+    return redirect(res, "/admin/ta/classes?notice=请先勾选至少一个教学班");
+  }
+  if (DB_CLIENT === "mysql") {
+    const result = await dbGateway.batchUpdateCourseClassWindow(user, refs, applyStartAt, applyEndAt);
+    if (result.changed === 0) {
+      return redirect(res, "/admin/ta/classes?notice=未匹配到任何教学班");
+    }
+    return redirect(res, `/admin/ta/classes?notice=已批量更新 ${result.changed} 个教学班的开放申请时间`);
+  }
+  const db = getDb();
+  const updateStmt = db.prepare(`
+    update classes
+    set apply_start_at = ?, apply_end_at = ?
+    where class_id = ? or class_code = ?
+  `);
+  let changed = 0;
+  for (const ref of refs) {
+    const id = Number(ref);
+    const result = updateStmt.run(applyStartAt, applyEndAt, Number.isInteger(id) && id > 0 ? id : -1, ref);
+    changed += result.changes;
+  }
+  const changedRows = loadClassRowsByRefs(db, refs);
+  for (const row of changedRows) {
+    createAuditLog(db, {
+      actor: user,
+      actionType: "CLASS_APPLY_WINDOW_UPDATE",
+      targetType: "Class",
+      targetId: row.class_id,
+      targetName: `${row.course_name} / ${row.class_name}`,
+      details: `教学班代码：${row.class_code}\n开放开始：${applyStartAt}\n开放结束：${applyEndAt}`
+    });
+  }
+  db.close();
+  if (changed === 0) {
+    return redirect(res, "/admin/ta/classes?notice=未匹配到任何教学班");
+  }
+  redirect(res, `/admin/ta/classes?notice=已批量更新 ${changed} 个教学班的开放申请时间`);
+}
+
+async function taAdminBatchUpdateClassSettings(req, res, user) {
+  const body = await readBody(req);
+  const refs = parseBatchClassRefs(body.class_refs);
+  const taAllowed = String(body.ta_allowed || "Y");
+  const isConflictAllowed = String(body.is_conflict_allowed || "N");
+  if (!["Y", "N"].includes(taAllowed) || !["Y", "N"].includes(isConflictAllowed)) {
+    return redirect(res, "/admin/ta/classes?notice=开放设置取值不合法");
+  }
+  if (!refs.length) {
+    return redirect(res, "/admin/ta/classes?notice=请先勾选至少一个教学班");
+  }
+  if (DB_CLIENT === "mysql") {
+    const selectedClasses = await dbGateway.getClassRowsByRefs(refs);
+    if (!selectedClasses.length) {
+      return redirect(res, "/admin/ta/classes?notice=未匹配到任何教学班");
+    }
+    if (taAllowed === "Y" && selectedClasses.some((row) => row.published_to_professor === "Y")) {
+      return redirect(res, "/admin/ta/classes?notice=已发送至教授的教学班不能重新开放申请，请先将发布状态改为未发送");
+    }
+    const toggleResult = await dbGateway.batchToggleCourseClassApply(user, refs, taAllowed);
+    const conflictResult = await dbGateway.batchUpdateCourseClassConflict(user, refs, isConflictAllowed);
+    return redirect(res, `/admin/ta/classes?notice=已批量更新 ${Math.max(toggleResult.changed, conflictResult.changed)} 个教学班的开放设置`);
+  }
+  const db = getDb();
+  const selectedClasses = loadClassRowsByRefs(db, refs);
+  if (!selectedClasses.length) {
+    db.close();
+    return redirect(res, "/admin/ta/classes?notice=未匹配到任何教学班");
+  }
+  if (taAllowed === "Y" && selectedClasses.some((row) => row.published_to_professor === "Y")) {
+    db.close();
+    return redirect(res, "/admin/ta/classes?notice=已发送至教授的教学班不能重新开放申请，请先将发布状态改为未发送");
+  }
+  const updateStmt = db.prepare(`
+    update classes
+    set ta_applications_allowed = ?, is_conflict_allowed = ?
+    where class_id = ? or class_code = ?
+  `);
+  let changed = 0;
+  for (const ref of refs) {
+    const id = Number(ref);
+    const result = updateStmt.run(taAllowed, isConflictAllowed, Number.isInteger(id) && id > 0 ? id : -1, ref);
+    changed += result.changes;
+  }
+  for (const row of selectedClasses) {
+    createAuditLog(db, {
+      actor: user,
+      actionType: "CLASS_APPLY_TOGGLE",
+      targetType: "Class",
+      targetId: row.class_id,
+      targetName: `${row.course_name} / ${row.class_name}`,
+      details: `教学班代码：${row.class_code}\n新开放申请状态：${taAllowed}\n新允许冲突状态：${isConflictAllowed}`
+    });
+  }
+  db.close();
+  redirect(res, `/admin/ta/classes?notice=已批量更新 ${changed} 个教学班的开放设置`);
 }
 
 async function taAdminClassApplicationsPage(res, user, classId, notice) {
@@ -6834,7 +8744,7 @@ async function taAdminClassApplicationsPage(res, user, classId, notice) {
   const rows = apps.map((app) => `<tr>
     <td>${app.application_id}</td>
     <td>${escapeHtml(app.applier_name)}</td>
-    <td>${escapeHtml(app.submitted_at)}</td>
+    <td>${escapeHtml(normalizeDisplayDateTime(app.submitted_at))}</td>
     <td><span class="${statusPillClass(app.status)}">${escapeHtml(statusLabels[app.status] || app.status)}</span></td>
     <td>${escapeHtml(app.application_reason)}</td>
     <td>${(() => {
@@ -6980,8 +8890,9 @@ async function courseClassDetailPage(res, user, classId, notice) {
           <p><label>课程名<input name="course_name" value="${escapeHtml(row.course_name)}" required /></label></p>
           <p><label>教学班名称<input name="class_name" value="${escapeHtml(row.class_name)}" required /></label></p>
           <p><label>授课语言<select name="teaching_language"><option value="中文" ${row.teaching_language === "中文" ? "selected" : ""}>中文</option><option value="英文" ${row.teaching_language === "英文" ? "selected" : ""}>英文</option></select></label></p>
-          <p><label>Professor（可多选）<select name="teacher_user_id" multiple size="4">${professorOptionsMarkup}</select></label></p>
+          <p><label>Professor（可多选）<select class="multi-select-list" name="teacher_user_id" multiple size="10">${professorOptionsMarkup}</select></label></p>
           <p><label>学期<input name="semester" value="${escapeHtml(row.semester)}" required /></label></p>
+          <p><label>学分<input name="credit" type="number" step="0.1" min="0" value="${escapeHtml(String(row.credit ?? 0))}" required /></label></p>
           <p><label>最大录取人数<input name="maximum_number" type="number" value="${row.maximum_number_of_tas_admitted}" min="1" required /></label></p>
           <p><label>允许 TA 申请<select name="ta_allowed"><option value="Y" ${row.ta_applications_allowed === "Y" ? "selected" : ""}>Y</option><option value="N" ${row.ta_applications_allowed === "N" ? "selected" : ""}>N</option></select></label></p>
           <p><label>允许冲突申请<select name="is_conflict_allowed"><option value="N" ${row.is_conflict_allowed === "N" ? "selected" : ""}>N</option><option value="Y" ${row.is_conflict_allowed === "Y" ? "selected" : ""}>Y</option></select></label></p>
@@ -7010,7 +8921,7 @@ async function courseClassApplicationsPage(res, user, classId, notice) {
   const rows = apps.map((app) => `<tr>
     <td>${app.application_id}</td>
     <td>${escapeHtml(app.applier_name)}</td>
-    <td>${escapeHtml(app.submitted_at)}</td>
+    <td>${escapeHtml(normalizeDisplayDateTime(app.submitted_at))}</td>
     <td>${escapeHtml(statusLabels[app.status] || app.status)}</td>
     <td>${escapeHtml(app.application_reason)}</td>
     <td>${attachmentLink(app)}</td>
@@ -7551,11 +9462,15 @@ async function deleteCourseUser(res, user, userId) {
 async function createClass(req, res, user) {
   const body = await readBody(req);
   const maximumNumber = Number(body.maximum_number || 1);
+  const credit = Number(body.credit || 0);
   const isConflictAllowed = String(body.is_conflict_allowed || "N");
   let applyStartAt;
   let applyEndAt;
   if (!["Y", "N"].includes(isConflictAllowed)) {
     return redirect(res, "/course/classes?notice=允许冲突申请取值不合法");
+  }
+  if (!Number.isFinite(credit) || credit < 0) {
+    return redirect(res, "/course/classes?notice=学分必须是大于等于 0 的数字");
   }
   let professorSelection;
   try {
@@ -7588,6 +9503,7 @@ async function createClass(req, res, user) {
         teacher_name: professorSelection.nameText,
         class_intro: String(body.class_intro || "").trim(),
         memo: String(body.memo || "").trim(),
+        credit,
         maximum_number_of_tas_admitted: maximumNumber,
         ta_applications_allowed: String(body.ta_allowed || "Y"),
         is_conflict_allowed: isConflictAllowed,
@@ -7611,9 +9527,9 @@ async function createClass(req, res, user) {
     const result = db.prepare(`
       insert into classes (
         class_code, class_abbr, class_name, course_name, teaching_language, teacher_user_id,
-        teacher_name, class_intro, memo, maximum_number_of_tas_admitted,
+        teacher_name, class_intro, memo, credit, maximum_number_of_tas_admitted,
         ta_applications_allowed, is_conflict_allowed, apply_start_at, apply_end_at, semester
-      ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       String(body.class_code || "").trim(),
       String(body.class_abbr || body.class_code || "").trim(),
@@ -7624,6 +9540,7 @@ async function createClass(req, res, user) {
       professorSelection.nameText,
       String(body.class_intro || "").trim(),
       String(body.memo || "").trim(),
+      credit,
       maximumNumber,
       String(body.ta_allowed || "Y"),
       isConflictAllowed,
@@ -7651,7 +9568,7 @@ async function createClass(req, res, user) {
       targetType: "Class",
       targetId: result.lastInsertRowid,
       targetName: `${String(body.course_name || "").trim()} / ${String(body.class_name || "").trim()}`,
-      details: `教学班代码：${String(body.class_code || "").trim()}\n教授：${professorSelection.nameText}\n学期：${String(body.semester || "").trim()}\nTA上限：${maximumNumber}\n排课数：${scheduleRows.length}`
+      details: `教学班代码：${String(body.class_code || "").trim()}\n教授：${professorSelection.nameText}\n学期：${String(body.semester || "").trim()}\n学分：${credit}\nTA上限：${maximumNumber}\n排课数：${scheduleRows.length}`
     });
   } catch (error) {
     db.close();
@@ -7778,11 +9695,15 @@ async function importClasses(req, res, user) {
 async function updateClass(req, res, user, classId) {
   const body = await readBody(req);
   const maximumNumber = Number(body.maximum_number || 1);
+  const credit = Number(body.credit || 0);
   const isConflictAllowed = String(body.is_conflict_allowed || "N");
   let applyStartAt;
   let applyEndAt;
   if (!["Y", "N"].includes(isConflictAllowed)) {
     return redirect(res, `/course/classes/${classId}?notice=允许冲突申请取值不合法`);
+  }
+  if (!Number.isFinite(credit) || credit < 0) {
+    return redirect(res, `/course/classes/${classId}?notice=学分必须是大于等于 0 的数字`);
   }
   try {
     applyStartAt = normalizeDateTimeInput(body.apply_start_at);
@@ -7815,6 +9736,7 @@ async function updateClass(req, res, user, classId) {
         teacher_name: professorSelection.nameText,
         class_intro: String(body.class_intro || "").trim(),
         memo: String(body.memo || "").trim(),
+        credit,
         maximum_number_of_tas_admitted: maximumNumber,
         ta_applications_allowed: String(body.ta_allowed || "Y"),
         is_conflict_allowed: isConflictAllowed,
@@ -7847,7 +9769,7 @@ async function updateClass(req, res, user, classId) {
     db.prepare(`
       update classes
       set class_code = ?, class_abbr = ?, class_name = ?, course_name = ?, teaching_language = ?, teacher_user_id = ?,
-          teacher_name = ?, class_intro = ?, memo = ?, maximum_number_of_tas_admitted = ?, ta_applications_allowed = ?, is_conflict_allowed = ?, apply_start_at = ?, apply_end_at = ?, semester = ?
+          teacher_name = ?, class_intro = ?, memo = ?, credit = ?, maximum_number_of_tas_admitted = ?, ta_applications_allowed = ?, is_conflict_allowed = ?, apply_start_at = ?, apply_end_at = ?, semester = ?
       where class_id = ?
     `).run(
       String(body.class_code || "").trim(),
@@ -7859,6 +9781,7 @@ async function updateClass(req, res, user, classId) {
       professorSelection.nameText,
       String(body.class_intro || "").trim(),
       String(body.memo || "").trim(),
+      credit,
       maximumNumber,
       String(body.ta_allowed || "Y"),
       isConflictAllowed,
@@ -7887,7 +9810,7 @@ async function updateClass(req, res, user, classId) {
       targetType: "Class",
       targetId: classId,
       targetName: `${String(body.course_name || "").trim()} / ${String(body.class_name || "").trim()}`,
-      details: `教学班代码：${String(body.class_code || "").trim()}\n教授：${professorSelection.nameText}\n学期：${String(body.semester || "").trim()}\nTA上限：${maximumNumber}\n排课数：${scheduleRows.length}`
+      details: `教学班代码：${String(body.class_code || "").trim()}\n教授：${professorSelection.nameText}\n学期：${String(body.semester || "").trim()}\n学分：${credit}\nTA上限：${maximumNumber}\n排课数：${scheduleRows.length}`
     });
   } catch (error) {
     db.close();
@@ -8125,7 +10048,7 @@ async function handleRequest(req, res) {
   }
 
   if (pathname.startsWith("/uploads/")) {
-    const fileName = path.basename(pathname.replace("/uploads/", ""));
+    const fileName = path.basename(decodeURIComponent(pathname.replace("/uploads/", "")));
     const filePath = path.join(UPLOAD_DIR, fileName);
     if (!fs.existsSync(filePath)) {
       res.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" });
@@ -8156,6 +10079,14 @@ async function handleRequest(req, res) {
     const sid = crypto.randomBytes(16).toString("hex");
     sessions.set(sid, row.user_id);
     return redirect(res, `/?notice=${row.user_name} 已登录`, { "Set-Cookie": `sid=${sid}; Path=/; HttpOnly` });
+  }
+
+  if (pathname === "/login/sso") {
+    return startSsoLogin(req, res);
+  }
+
+  if (pathname === "/login/sso/callback") {
+    return handleSsoCallback(req, res, url);
   }
 
   if (pathname === "/logout") {
@@ -8268,6 +10199,16 @@ async function handleRequest(req, res) {
       has_pending: url.searchParams.get("has_pending") || ""
     });
   }
+  if (pathname === "/admin/ta/classes/calendar") {
+    if (!requireRole(res, user, ["TAAdmin"])) return;
+    return taAdminClassesCalendarPage(res, user, notice, {
+      professor_name: url.searchParams.get("professor_name") || "",
+      class_name: url.searchParams.get("class_name") || "",
+      ta_full: url.searchParams.get("ta_full") || "",
+      has_pending: url.searchParams.get("has_pending") || "",
+      month: url.searchParams.get("month") || ""
+    });
+  }
   if (pathname === "/admin/ta/classes/ta-export") {
     if (!requireRole(res, user, ["TAAdmin"])) return;
     return taAdminClassTaExport(res, {
@@ -8292,6 +10233,14 @@ async function handleRequest(req, res) {
   if (pathname === "/admin/ta/classes/batch-publish" && req.method === "POST") {
     if (!requireRole(res, user, ["TAAdmin"])) return;
     return batchUpdateProfessorPublishStatus(req, res, user);
+  }
+  if (pathname === "/admin/ta/classes/batch-window" && req.method === "POST") {
+    if (!requireRole(res, user, ["TAAdmin"])) return;
+    return taAdminBatchUpdateClassWindow(req, res, user);
+  }
+  if (pathname === "/admin/ta/classes/batch-settings" && req.method === "POST") {
+    if (!requireRole(res, user, ["TAAdmin"])) return;
+    return taAdminBatchUpdateClassSettings(req, res, user);
   }
   if (/^\/admin\/ta\/classes\/\d+\/applications\/approve$/.test(pathname) && req.method === "POST") {
     if (!requireRole(res, user, ["TAAdmin"])) return;
@@ -8345,6 +10294,19 @@ async function handleRequest(req, res) {
       status_filter: url.searchParams.get("status_filter") || "",
       sort_by: url.searchParams.get("sort_by") || "class_code",
       sort_order: url.searchParams.get("sort_order") || "asc"
+    });
+  }
+  if (pathname === "/course/classes/calendar") {
+    if (!requireRole(res, user, ["CourseAdmin"])) return;
+    return courseClassesCalendarPage(res, user, notice, {
+      class_code: url.searchParams.get("class_code") || "",
+      class_name: url.searchParams.get("class_name") || "",
+      teacher_name: url.searchParams.get("teacher_name") || "",
+      ta_full: url.searchParams.get("ta_full") || "",
+      status_filter: url.searchParams.get("status_filter") || "",
+      sort_by: url.searchParams.get("sort_by") || "class_code",
+      sort_order: url.searchParams.get("sort_order") || "asc",
+      month: url.searchParams.get("month") || ""
     });
   }
   if (pathname === "/course/classes/ta-export") {
@@ -8413,6 +10375,7 @@ async function handleRequest(req, res) {
         teaching_language: "中文",
         teacher_login_name: "prof1,prof2",
         semester: "2026Fall",
+        credit: 3.0,
         maximum_number: 2,
         ta_allowed: "Y",
         is_conflict_allowed: "N",
@@ -8434,6 +10397,7 @@ async function handleRequest(req, res) {
         teaching_language: "中文",
         teacher_login_name: "prof1,prof2",
         semester: "2026Fall",
+        credit: 3.0,
         maximum_number: 2,
         ta_allowed: "Y",
         is_conflict_allowed: "N",
