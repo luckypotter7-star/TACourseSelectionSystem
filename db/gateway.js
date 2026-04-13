@@ -1025,8 +1025,12 @@ async function getCourseAdminClassRows(filters = {}) {
 async function getTaAdminClassRows(filters = {}) {
   const professorFilter = String(filters.professor_name || "").trim().toLowerCase();
   const classNameFilter = String(filters.class_name || "").trim().toLowerCase();
+  const semesterFilter = String(filters.semester || "").trim().toLowerCase();
   const taFullFilter = String(filters.ta_full || "").trim();
   const hasPendingFilter = String(filters.has_pending || "").trim();
+  const publishedFilter = String(filters.published_to_professor || "").trim();
+  const taAllowedFilter = String(filters.ta_applications_allowed || "").trim();
+  const conflictAllowedFilter = String(filters.is_conflict_allowed || "").trim();
 
   if (DB_CLIENT === "mysql") {
     const rowsRaw = await mysqlDb.query(`
@@ -1054,11 +1058,15 @@ async function getTaAdminClassRows(filters = {}) {
     return rowsRaw.filter((row) => {
       const matchesProfessor = !professorFilter || String(row.teacher_name || "").toLowerCase().includes(professorFilter);
       const matchesClassName = !classNameFilter || String(row.class_name || "").toLowerCase().includes(classNameFilter);
+      const matchesSemester = !semesterFilter || String(row.semester || "").toLowerCase().includes(semesterFilter);
       const isFull = Number(row.approved_count || 0) >= Number(row.maximum_number_of_tas_admitted || 0);
       const matchesTaFull = !taFullFilter || (taFullFilter === "Y" ? isFull : !isFull);
       const hasPending = Number(row.pending_taadmin_count || 0) > 0;
       const matchesPending = !hasPendingFilter || (hasPendingFilter === "Y" ? hasPending : !hasPending);
-      return matchesProfessor && matchesClassName && matchesTaFull && matchesPending;
+      const matchesPublished = !publishedFilter || String(row.published_to_professor || "N") === publishedFilter;
+      const matchesTaAllowed = !taAllowedFilter || String(row.ta_applications_allowed || "N") === taAllowedFilter;
+      const matchesConflictAllowed = !conflictAllowedFilter || String(row.is_conflict_allowed || "N") === conflictAllowedFilter;
+      return matchesProfessor && matchesClassName && matchesSemester && matchesTaFull && matchesPending && matchesPublished && matchesTaAllowed && matchesConflictAllowed;
     });
   }
 
@@ -1085,11 +1093,15 @@ async function getTaAdminClassRows(filters = {}) {
     return rowsRaw.filter((row) => {
       const matchesProfessor = !professorFilter || String(row.teacher_name || "").toLowerCase().includes(professorFilter);
       const matchesClassName = !classNameFilter || String(row.class_name || "").toLowerCase().includes(classNameFilter);
+      const matchesSemester = !semesterFilter || String(row.semester || "").toLowerCase().includes(semesterFilter);
       const isFull = Number(row.approved_count || 0) >= Number(row.maximum_number_of_tas_admitted || 0);
       const matchesTaFull = !taFullFilter || (taFullFilter === "Y" ? isFull : !isFull);
       const hasPending = Number(row.pending_taadmin_count || 0) > 0;
       const matchesPending = !hasPendingFilter || (hasPendingFilter === "Y" ? hasPending : !hasPending);
-      return matchesProfessor && matchesClassName && matchesTaFull && matchesPending;
+      const matchesPublished = !publishedFilter || String(row.published_to_professor || "N") === publishedFilter;
+      const matchesTaAllowed = !taAllowedFilter || String(row.ta_applications_allowed || "N") === taAllowedFilter;
+      const matchesConflictAllowed = !conflictAllowedFilter || String(row.is_conflict_allowed || "N") === conflictAllowedFilter;
+      return matchesProfessor && matchesClassName && matchesSemester && matchesTaFull && matchesPending && matchesPublished && matchesTaAllowed && matchesConflictAllowed;
     });
   } finally {
     db.close();

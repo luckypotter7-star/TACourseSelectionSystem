@@ -1541,11 +1541,13 @@ async function pageLayout(title, body, user, notice) {
   if (user) {
     const links = ['<a href="/">首页</a>', '<a href="/logout" onclick="return confirm(\'确认退出当前账号吗？\')">退出</a>'];
     const unreadCount = await unreadNotificationCount(user.user_id);
-    links.splice(1, 0, `<a href="/notifications">通知${unreadCount ? `(${unreadCount})` : ""}</a>`);
+    const isNotificationPage = String(title || "").includes("通知");
+    const notificationLabel = isNotificationPage ? "通知" : `通知${unreadCount ? `(${unreadCount})` : ""}`;
+    links.splice(1, 0, `<a href="/notifications">${notificationLabel}</a>`);
     if (user.role === "TA") {
       links.splice(1, 0, '<a href="/ta/classes">可申请教学班</a>', '<a href="/ta/applications">我的申请</a>', '<a href="/ta/profile">个人资料</a>');
     } else if (user.role === "TAAdmin") {
-      links.splice(1, 0, '<a href="/admin/ta/pending">待初审申请</a>', '<a href="/admin/ta/applications">全部申请</a>', '<a href="/admin/ta/application-logs">申请日志</a>', '<a href="/admin/ta/classes">全部教学班</a>', '<a href="/admin/ta/users">TA 管理</a>');
+      links.splice(1, 0, '<a href="/course/reports">报表视图</a>', '<a href="/admin/ta/pending">待初审申请</a>', '<a href="/admin/ta/applications">全部申请</a>', '<a href="/admin/ta/application-logs">申请日志</a>', '<a href="/admin/ta/classes">全部教学班</a>', '<a href="/admin/ta/users">TA 管理</a>');
     } else if (user.role === "Professor") {
       links.splice(1, 0, '<a href="/professor/pending">待教授审批</a>');
     } else if (user.role === "CourseAdmin") {
@@ -1811,6 +1813,71 @@ async function pageLayout(title, body, user, notice) {
         background: linear-gradient(180deg, #f8efe4, #f6f0e8);
         box-shadow: inset 0 -1px 0 #d8c9b1;
       }
+      .course-classes-table.freeze-to-tafull th:nth-child(-n+9),
+      .course-classes-table.freeze-to-tafull td:nth-child(-n+9),
+      .taadmin-classes-table.freeze-to-tafull th:nth-child(-n+8),
+      .taadmin-classes-table.freeze-to-tafull td:nth-child(-n+8) {
+        position: sticky;
+        background: var(--panel);
+        z-index: 3;
+      }
+      .course-classes-table.freeze-to-tafull th:nth-child(-n+9),
+      .taadmin-classes-table.freeze-to-tafull th:nth-child(-n+8) {
+        z-index: 7;
+        background: linear-gradient(180deg, #f8efe4, #f6f0e8);
+      }
+      .course-classes-table.freeze-to-tafull th:nth-child(1),
+      .course-classes-table.freeze-to-tafull td:nth-child(1),
+      .taadmin-classes-table.freeze-to-tafull th:nth-child(1),
+      .taadmin-classes-table.freeze-to-tafull td:nth-child(1) { left: 0; }
+      .course-classes-table.freeze-to-tafull th:nth-child(2),
+      .course-classes-table.freeze-to-tafull td:nth-child(2),
+      .taadmin-classes-table.freeze-to-tafull th:nth-child(2),
+      .taadmin-classes-table.freeze-to-tafull td:nth-child(2) { left: 56px; }
+      .course-classes-table.freeze-to-tafull th:nth-child(3),
+      .course-classes-table.freeze-to-tafull td:nth-child(3) { left: 166px; }
+      .course-classes-table.freeze-to-tafull th:nth-child(4),
+      .course-classes-table.freeze-to-tafull td:nth-child(4) { left: 248px; }
+      .course-classes-table.freeze-to-tafull th:nth-child(5),
+      .course-classes-table.freeze-to-tafull td:nth-child(5) { left: 416px; }
+      .course-classes-table.freeze-to-tafull th:nth-child(6),
+      .course-classes-table.freeze-to-tafull td:nth-child(6) { left: 488px; }
+      .course-classes-table.freeze-to-tafull th:nth-child(7),
+      .course-classes-table.freeze-to-tafull td:nth-child(7) { left: 596px; }
+      .course-classes-table.freeze-to-tafull th:nth-child(8),
+      .course-classes-table.freeze-to-tafull td:nth-child(8) { left: 688px; }
+      .course-classes-table.freeze-to-tafull th:nth-child(9),
+      .course-classes-table.freeze-to-tafull td:nth-child(9) {
+        left: 776px;
+        box-shadow: 8px 0 12px -12px rgba(46, 37, 24, 0.45), inset 0 -1px 0 var(--line);
+      }
+      .taadmin-classes-table.freeze-to-tafull th:nth-child(3),
+      .taadmin-classes-table.freeze-to-tafull td:nth-child(3) { left: 162px; }
+      .taadmin-classes-table.freeze-to-tafull th:nth-child(4),
+      .taadmin-classes-table.freeze-to-tafull td:nth-child(4) { left: 242px; }
+      .taadmin-classes-table.freeze-to-tafull th:nth-child(5),
+      .taadmin-classes-table.freeze-to-tafull td:nth-child(5) { left: 402px; }
+      .taadmin-classes-table.freeze-to-tafull th:nth-child(6),
+      .taadmin-classes-table.freeze-to-tafull td:nth-child(6) { left: 520px; }
+      .taadmin-classes-table.freeze-to-tafull th:nth-child(7),
+      .taadmin-classes-table.freeze-to-tafull td:nth-child(7) { left: 608px; }
+      .taadmin-classes-table.freeze-to-tafull th:nth-child(8),
+      .taadmin-classes-table.freeze-to-tafull td:nth-child(8) {
+        left: 694px;
+        box-shadow: 8px 0 12px -12px rgba(46, 37, 24, 0.45), inset 0 -1px 0 var(--line);
+      }
+      .course-classes-table.freeze-to-tafull tr:hover td:nth-child(-n+9),
+      .taadmin-classes-table.freeze-to-tafull tr:hover td:nth-child(-n+8) {
+        background: #fcfaf5;
+      }
+      .course-classes-table.freeze-to-tafull tr.row-soft-purple td:nth-child(-n+9),
+      .taadmin-classes-table.freeze-to-tafull tr.row-soft-purple td:nth-child(-n+8) {
+        background: #edf2ff;
+      }
+      .course-classes-table.freeze-to-tafull tr.row-soft-purple:hover td:nth-child(-n+9),
+      .taadmin-classes-table.freeze-to-tafull tr.row-soft-purple:hover td:nth-child(-n+8) {
+        background: #e3ebff;
+      }
       .detail-table-wrap {
         overflow-x: auto;
         overflow-y: visible;
@@ -1920,6 +1987,14 @@ async function pageLayout(title, body, user, notice) {
         margin-top: 6px;
         font-size: 12px;
         color: var(--muted);
+      }
+      @media (min-width: 721px) {
+        #ta-class-filters {
+          position: sticky;
+          top: 86px;
+          z-index: 6;
+          box-shadow: 0 10px 22px rgba(80, 62, 42, 0.08);
+        }
       }
       .calendar-toolbar {
         display: flex;
@@ -2118,13 +2193,53 @@ async function pageLayout(title, body, user, notice) {
       .filters-grid.pending-filters .actions {
         white-space: nowrap;
       }
+      .filters-shell.ta-compact-filters {
+        padding: 12px 14px;
+        border-radius: 16px;
+      }
+      .filters-grid.ta-compact-filters-grid {
+        gap: 8px 10px;
+        grid-template-columns: repeat(5, minmax(0, 1fr)) auto;
+      }
+      .filters-grid.ta-compact-filters-grid p {
+        margin: 0;
+      }
+      .filters-grid.ta-compact-filters-grid label {
+        font-size: 12px;
+      }
+      .filters-grid.ta-compact-filters-grid input,
+      .filters-grid.ta-compact-filters-grid select {
+        min-height: 42px;
+        padding: 10px 12px;
+        font-size: 13px;
+      }
+      .filters-grid.ta-compact-filters-grid .actions {
+        align-self: end;
+        white-space: nowrap;
+        gap: 8px;
+      }
+      .filters-grid.ta-compact-filters-grid .actions .action-button {
+        min-width: 88px;
+        min-height: 42px;
+        padding: 10px 14px;
+      }
+      .filters-grid.settings-inline {
+        grid-template-columns: minmax(0, 1.2fr) minmax(0, 1.2fr) auto;
+      }
+      .filters-grid.settings-inline .actions {
+        white-space: nowrap;
+      }
       @media (max-width: 1100px) {
         .filters-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
         .filters-grid.pending-filters { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+        .filters-grid.ta-compact-filters-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+        .filters-grid.settings-inline { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       }
       @media (max-width: 720px) {
         .filters-grid { grid-template-columns: 1fr; }
         .filters-grid.pending-filters { grid-template-columns: 1fr; }
+        .filters-grid.ta-compact-filters-grid { grid-template-columns: 1fr; }
+        .filters-grid.settings-inline { grid-template-columns: 1fr; }
         .class-card-grid { grid-template-columns: 1fr; }
         .report-grid { grid-template-columns: 1fr; }
         .report-row { grid-template-columns: 1fr; }
@@ -2174,6 +2289,9 @@ async function pageLayout(title, body, user, notice) {
         color: var(--accent);
         font-size: 13px;
         font-weight: 600;
+      }
+      .pill.nowrap {
+        white-space: nowrap;
       }
       .pill.ok {
         background: rgba(26, 34, 135, 0.1);
@@ -2609,6 +2727,12 @@ async function pageLayout(title, body, user, notice) {
       button.rect {
         border-radius: 12px;
       }
+      .button-link.tertiary,
+      button.tertiary {
+        background: #6c4dd6;
+        color: #fff;
+        box-shadow: none;
+      }
       .action-button {
         min-width: 88px;
       }
@@ -2616,6 +2740,7 @@ async function pageLayout(title, body, user, notice) {
         display: flex;
         gap: 6px;
         flex-wrap: nowrap;
+        justify-content: center;
       }
       .cell-compact {
         font-size: 13px;
@@ -2625,8 +2750,8 @@ async function pageLayout(title, body, user, notice) {
         gap: 4px;
       }
       .table-actions-compact .action-button {
-        min-width: 64px;
-        padding: 7px 10px;
+        min-width: 58px;
+        padding: 7px 9px;
         font-size: 12px;
         border-radius: 9px;
       }
@@ -2649,12 +2774,33 @@ async function pageLayout(title, body, user, notice) {
         flex-wrap: wrap;
         min-height: 100%;
       }
+      .table-action-cell .table-action-inner.table-actions-compact {
+        flex-wrap: nowrap !important;
+      }
+      .taadmin-classes-table .table-action-cell {
+        min-width: 138px;
+      }
+      .taadmin-classes-table .table-actions-compact {
+        width: 100%;
+      }
       .table-action-inner.notifications-actions {
         display: inline-grid;
         grid-template-columns: repeat(2, minmax(84px, max-content));
         gap: 8px;
         align-items: center;
         justify-content: center;
+      }
+      .notification-table th,
+      .notification-table td {
+        white-space: nowrap;
+      }
+      .notification-table th:nth-child(3),
+      .notification-table td:nth-child(3) {
+        white-space: normal;
+      }
+      .notification-table .table-action-inner.notifications-actions button,
+      .notification-table .table-action-inner.notifications-actions a {
+        white-space: nowrap;
       }
       .table-action-inner.application-actions {
         display: inline-grid;
@@ -2676,7 +2822,8 @@ async function pageLayout(title, body, user, notice) {
       .compact-note.reapply-note {
         color: #8a4b0f;
       }
-      .mobile-only { display: none; }
+      .mobile-only { display: none !important; }
+      .notification-mobile-only { display: none !important; }
       .mobile-fab {
         position: fixed;
         right: 16px;
@@ -2769,7 +2916,8 @@ async function pageLayout(title, body, user, notice) {
         display: block;
         min-height: 36px;
       }
-      .desktop-only { display: block; }
+      .desktop-only { display: block !important; }
+      .notification-desktop-only { display: block !important; }
       .mobile-card-list {
         display: flex;
         flex-direction: column;
@@ -3130,6 +3278,9 @@ async function pageLayout(title, body, user, notice) {
         body {
           font-size: 14px;
         }
+        #ta-class-filters {
+          display: none !important;
+        }
         .site-header {
           position: sticky;
           top: 0;
@@ -3381,6 +3532,9 @@ async function pageLayout(title, body, user, notice) {
         .filters-card {
           padding: 14px;
         }
+        .filters-shell.ta-compact-filters {
+          padding: 10px 12px;
+        }
         .filters-actions-row,
         .filters-actions {
           width: 100%;
@@ -3393,6 +3547,15 @@ async function pageLayout(title, body, user, notice) {
         .filters-actions button,
         .filters-actions a {
           flex: 1 1 calc(50% - 4px);
+          min-width: 0;
+        }
+        .filters-grid.ta-compact-filters-grid {
+          gap: 8px;
+        }
+        .filters-grid.ta-compact-filters-grid .actions {
+          width: 100%;
+        }
+        .filters-grid.ta-compact-filters-grid .actions .action-button {
           min-width: 0;
         }
         .actions {
@@ -3414,7 +3577,13 @@ async function pageLayout(title, body, user, notice) {
           display: none !important;
         }
         .mobile-only {
-          display: block;
+          display: block !important;
+        }
+        .notification-desktop-only {
+          display: none !important;
+        }
+        .notification-mobile-only {
+          display: block !important;
         }
         .mobile-data-card {
           padding: 12px;
@@ -3615,14 +3784,14 @@ async function pageLayout(title, body, user, notice) {
         }
         .page-login .hero-panel {
           border-radius: 18px;
-          min-height: 600px;
-          padding: 14px 14px 120px;
+          min-height: 540px;
+          padding: 14px 14px 104px;
         }
         .page-login .login-card {
           position: absolute;
           left: 12px;
           right: 12px;
-          top: 96px;
+          top: 74px;
           margin: 0 auto;
           padding-top: 12px;
           border-radius: 18px;
@@ -3633,7 +3802,7 @@ async function pageLayout(title, body, user, notice) {
         .page-login .mobile-login-copy {
           left: 12px;
           right: 12px;
-          bottom: 14px;
+          bottom: 12px;
           padding: 0;
           border-radius: 0;
         }
@@ -3954,6 +4123,25 @@ function compactConflictList(conflicts) {
   `).join("")}</div>`;
 }
 
+function renderAppliedConflictSection(appliedConflicts, isConflictAllowed) {
+  if (!appliedConflicts.length) {
+    return "";
+  }
+  const noticeStyle = isConflictAllowed === "Y"
+    ? "margin: 0 0 16px; background: #fff6e8; border-color: #ead0a0; color: #8b5b00;"
+    : "margin: 0 0 16px; background: #fce8e6; border-color: #f7c8c3; color: #a50e0e;";
+  const noticeText = isConflictAllowed === "Y"
+    ? "检测到你已申请的教学班与当前教学班存在时间冲突，但本教学班已设置为允许冲突申请，因此你仍可继续提交申请。"
+    : "检测到你已申请的教学班与当前教学班存在时间冲突，且本教学班未设置为允许冲突申请，因此当前不能提交申请。";
+  const rows = appliedConflicts.map((app) => `<tr><td>${escapeHtml(app.class_name)}</td><td>${escapeHtml(statusLabels[app.status] || app.status)}</td><td>${escapeHtml(app.is_conflict_allowed || "N")}</td><td>${app.matches.map(escapeHtml).join("<br>")}</td></tr>`).join("");
+  return `
+    <div class="notice" style="${noticeStyle}">
+      ${noticeText}
+    </div>
+    <table><tr><th>已申请冲突教学班</th><th>当前状态</th><th>是否允许冲突申请</th><th>冲突时间</th></tr>${rows}</table>
+  `;
+}
+
 function requireRole(res, user, roles) {
   if (!user) {
     redirect(res, "/?notice=请先登录");
@@ -3992,6 +4180,7 @@ function homePage(res, user, notice) {
     </section>`;
   } else if (user.role === "TAAdmin") {
     body += `<section class="dashboard-grid">
+      <article class="card card-brand feature-card"><h3>报表视图</h3><p>集中查看申请、审批、教学班开放与名额使用情况。</p><div class="actions"><a class="button-link" href="/course/reports">进入</a></div></article>
       <article class="card card-brand feature-card"><h3>待初审申请</h3><p>集中处理当前待 TAAdmin 审批的学生申请。</p><div class="actions"><a class="button-link" href="/admin/ta/pending">进入</a></div></article>
       <article class="card card-brand feature-card"><h3>全部申请</h3><p>查看所有 TA 申请状态并追踪历史审批情况。</p><div class="actions"><a class="button-link" href="/admin/ta/applications">进入</a></div></article>
       <article class="card card-brand feature-card"><h3>全部教学班</h3><p>按教学班查看申请、发布至教授并发送邮件。</p><div class="actions"><a class="button-link" href="/admin/ta/classes">进入</a></div></article>
@@ -4096,8 +4285,12 @@ function loadCourseAdminClassRows(db, filters = {}) {
 function loadTaAdminClassRows(db, filters = {}) {
   const professorFilter = String(filters.professor_name || "").trim().toLowerCase();
   const classNameFilter = String(filters.class_name || "").trim().toLowerCase();
+  const semesterFilter = String(filters.semester || "").trim().toLowerCase();
   const taFullFilter = String(filters.ta_full || "").trim();
   const hasPendingFilter = String(filters.has_pending || "").trim();
+  const publishedFilter = String(filters.published_to_professor || "").trim();
+  const taAllowedFilter = String(filters.ta_applications_allowed || "").trim();
+  const conflictAllowedFilter = String(filters.is_conflict_allowed || "").trim();
   const rowsRaw = db.prepare(`
     select c.*,
       (select count(*) from applications a where a.class_id = c.class_id) as application_count,
@@ -4120,11 +4313,15 @@ function loadTaAdminClassRows(db, filters = {}) {
   return rowsRaw.filter((row) => {
     const matchesProfessor = !professorFilter || String(row.teacher_name || "").toLowerCase().includes(professorFilter);
     const matchesClassName = !classNameFilter || String(row.class_name || "").toLowerCase().includes(classNameFilter);
+    const matchesSemester = !semesterFilter || String(row.semester || "").toLowerCase().includes(semesterFilter);
     const isFull = isClassCapacityReached(row, row.approved_count);
     const matchesTaFull = !taFullFilter || (taFullFilter === "Y" ? isFull : !isFull);
     const hasPending = Number(row.pending_taadmin_count || 0) > 0;
     const matchesPending = !hasPendingFilter || (hasPendingFilter === "Y" ? hasPending : !hasPending);
-    return matchesProfessor && matchesClassName && matchesTaFull && matchesPending;
+    const matchesPublished = !publishedFilter || String(row.published_to_professor || "N") === publishedFilter;
+    const matchesTaAllowed = !taAllowedFilter || String(row.ta_applications_allowed || "N") === taAllowedFilter;
+    const matchesConflictAllowed = !conflictAllowedFilter || String(row.is_conflict_allowed || "N") === conflictAllowedFilter;
+    return matchesProfessor && matchesClassName && matchesSemester && matchesTaFull && matchesPending && matchesPublished && matchesTaAllowed && matchesConflictAllowed;
   });
 }
 
@@ -4267,10 +4464,11 @@ function parseScheduleLines(scheduleText) {
   }
   return lines.map((line, index) => {
     const parts = line.split(",").map((part) => part.trim());
-    if (parts.length < 4 || parts.length > 5) {
-      throw new Error(`第 ${index + 1} 条排课格式错误，应为 日期,开始时间,结束时间,节次[,考试类型]`);
+    if (parts.length < 3 || parts.length > 5) {
+      throw new Error(`第 ${index + 1} 条排课格式错误，应为 日期,开始时间,结束时间[,节次][,考试类型]`);
     }
-    const [lessonDate, startTime, endTime, section, examValue] = parts;
+    const [lessonDate, startTime, endTime, rawSection = "", examValue = ""] = parts;
+    const section = String(rawSection || "").trim();
     if (!/^\d{4}-\d{2}-\d{2}$/.test(lessonDate)) {
       throw new Error(`第 ${index + 1} 条排课日期格式错误`);
     }
@@ -4280,7 +4478,7 @@ function parseScheduleLines(scheduleText) {
     if (endTime <= startTime) {
       throw new Error(`第 ${index + 1} 条排课结束时间必须晚于开始时间`);
     }
-    if (!["上午", "下午", "晚上"].includes(section)) {
+    if (section && !["上午", "下午", "晚上"].includes(section)) {
       throw new Error(`第 ${index + 1} 条排课节次仅支持 上午/下午/晚上`);
     }
     return {
@@ -4961,8 +5159,8 @@ function renderTaClassesFilterForm(filters, options = {}) {
           <button class="secondary rect" type="button" onclick="this.closest('dialog').close()">关闭</button>
         </div>
       ` : ""}
-      <div class="filters-shell">
-        <div class="filters-grid pending-filters">
+      <div class="filters-shell ta-compact-filters">
+        <div class="filters-grid ta-compact-filters-grid">
           <p><label>是否可申请<select name="apply_status">
             <option value="" ${!filters.apply_status ? "selected" : ""}>全部</option>
             <option value="可申请" ${filters.apply_status === "可申请" ? "selected" : ""}>可申请</option>
@@ -5004,18 +5202,19 @@ async function taClassesPage(res, user, notice, filters = {}) {
       .map((row) => {
         const schedules = scheduleMap.get(row.class_id) || [];
         const conflicts = getOpenClassConflictsFromData(snapshot.classes, snapshot.applications, scheduleMap, row.class_id);
-        const blockingConflicts = getAppliedConflictsFromData(snapshot.applications, classMap, scheduleMap, row.class_id);
+        const appliedConflicts = getAppliedConflictsFromData(snapshot.applications, classMap, scheduleMap, row.class_id);
         const latestApplication = latestApplicationMap.get(row.class_id) || null;
         const activeApplication = latestApplication && isActiveApplicationStatus(latestApplication.status) ? latestApplication : null;
         const cardStatus = activeApplication
           ? "已申请"
           : (latestApplication && ["RejectedByTAAdmin", "RejectedByProfessor"].includes(latestApplication.status)
             ? "被拒绝"
-            : (blockingConflicts.length && row.is_conflict_allowed !== "Y" ? "有冲突" : "可申请"));
+            : (appliedConflicts.length && row.is_conflict_allowed !== "Y" ? "有冲突" : "可申请"));
         return {
           ...row,
           schedules,
           conflicts,
+          appliedConflicts,
           latestApplication,
           activeApplication,
           cardStatus
@@ -5038,7 +5237,13 @@ async function taClassesPage(res, user, notice, filters = {}) {
       const dialogId = `ta-conflicts-${row.class_id}`;
       const actionHint = row.activeApplication
         ? `<p class="compact-note">已提交申请，请到“我的申请”查看；若仍处于 TAAdmin 审批前，可在“我的申请”中撤销。</p>`
-        : (row.cardStatus === "被拒绝" ? `<p class="compact-note reapply-note">该教学班上一条申请已被拒绝，你可以重新申请。</p>` : "")
+        : (row.cardStatus === "被拒绝"
+          ? `<p class="compact-note reapply-note">该教学班上一条申请已被拒绝，你可以重新申请。</p>`
+          : (row.appliedConflicts?.length
+            ? (row.is_conflict_allowed === "Y"
+              ? `<p class="compact-note" style="color:#8b5b00;">存在时间冲突，但本教学班允许冲突申请，可继续提交。</p>`
+              : `<p class="compact-note bad">存在时间冲突，当前不可提交申请。</p>`)
+            : ""))
       ;
       return `<article class="card class-card ${cardClass}">
         <h3>${escapeHtml(row.course_name)} / ${escapeHtml(row.class_name)}</h3>
@@ -5110,18 +5315,19 @@ async function taClassesPage(res, user, notice, filters = {}) {
       .map((row) => {
         const schedules = fetchSchedules(db, row.class_id);
         const conflicts = getOpenClassConflicts(db, user.user_id, row.class_id);
-        const blockingConflicts = getAppliedConflicts(db, user.user_id, row.class_id);
+        const appliedConflicts = getAppliedConflicts(db, user.user_id, row.class_id);
         const latestApplication = latestApplicationMap.get(row.class_id) || null;
         const activeApplication = latestApplication && isActiveApplicationStatus(latestApplication.status) ? latestApplication : null;
       const cardStatus = activeApplication
         ? "已申请"
         : (latestApplication && ["RejectedByTAAdmin", "RejectedByProfessor"].includes(latestApplication.status)
           ? "被拒绝"
-          : (blockingConflicts.length && row.is_conflict_allowed !== "Y" ? "有冲突" : "可申请"));
+          : (appliedConflicts.length && row.is_conflict_allowed !== "Y" ? "有冲突" : "可申请"));
       return {
         ...row,
         schedules,
         conflicts,
+        appliedConflicts,
         latestApplication,
         activeApplication,
         cardStatus
@@ -5144,7 +5350,13 @@ async function taClassesPage(res, user, notice, filters = {}) {
     const dialogId = `ta-conflicts-${row.class_id}`;
     const actionHint = row.activeApplication
       ? `<p class="compact-note">已提交申请，请到“我的申请”查看；若仍处于 TAAdmin 审批前，可在“我的申请”中撤销。</p>`
-      : (row.cardStatus === "被拒绝" ? `<p class="compact-note reapply-note">该教学班上一条申请已被拒绝，你可以重新申请。</p>` : "");
+      : (row.cardStatus === "被拒绝"
+        ? `<p class="compact-note reapply-note">该教学班上一条申请已被拒绝，你可以重新申请。</p>`
+        : (row.appliedConflicts?.length
+          ? (row.is_conflict_allowed === "Y"
+            ? `<p class="compact-note" style="color:#8b5b00;">存在时间冲突，但本教学班允许冲突申请，可继续提交。</p>`
+            : `<p class="compact-note bad">存在时间冲突，当前不可提交申请。</p>`)
+          : ""));
     return `<article class="card class-card ${cardClass}">
       <h3>${escapeHtml(row.course_name)} / ${escapeHtml(row.class_name)}</h3>
       <p><span class="${labelClass}">${escapeHtml(row.cardStatus)}</span></p>
@@ -5225,14 +5437,7 @@ async function taClassDetailPage(res, user, classId, notice) {
           ${existingApplication.status === "PendingTAAdmin" ? `在 TAAdmin 审批前，你可以进入 <a href="/ta/applications">我的申请</a> 模块撤销申请。` : `请进入 <a href="/ta/applications">我的申请</a> 模块查看当前状态。`}
         </div>`
       : "";
-    const submitGuardSection = hasBlockingConflicts
-      ? `<div class="notice" style="margin: 0 0 16px; background: #fce8e6; border-color: #f7c8c3; color: #a50e0e;">
-          检测到你已申请的教学班与当前教学班存在时间冲突，且本教学班未设置为允许冲突申请，因此当前不能提交申请。
-        </div>
-        <table><tr><th>已申请冲突教学班</th><th>当前状态</th><th>是否允许冲突申请</th><th>冲突时间</th></tr>${
-          appliedConflicts.map((app) => `<tr><td>${escapeHtml(app.class_name)}</td><td>${escapeHtml(statusLabels[app.status] || app.status)}</td><td>${escapeHtml(app.is_conflict_allowed || "N")}</td><td>${app.matches.map(escapeHtml).join("<br>")}</td></tr>`).join("")
-        }</table>`
-      : "";
+    const appliedConflictSection = renderAppliedConflictSection(appliedConflicts, row.is_conflict_allowed || "N");
     const conflictSection = `
         <div style="margin: 0 0 16px;">
           <h3 style="margin-bottom:8px;">冲突信息</h3>
@@ -5259,8 +5464,8 @@ async function taClassDetailPage(res, user, classId, notice) {
         <h3>提交申请</h3>
         ${existingApplicationSection}
         ${resumeSection}
+        ${appliedConflictSection}
         ${conflictSection}
-        ${submitGuardSection}
         <form method="post" action="/ta/applications" data-disable-on-submit="1" data-submit-hint-target="ta-submit-hint">
           <input type="hidden" name="class_id" value="${row.class_id}" />
           <p><label>申请原因<textarea name="application_reason"></textarea></label></p>
@@ -5300,14 +5505,10 @@ async function taClassDetailPage(res, user, classId, notice) {
         ${existingApplication.status === "PendingTAAdmin" ? `在 TAAdmin 审批前，你可以进入 <a href="/ta/applications">我的申请</a> 模块撤销申请。` : `请进入 <a href="/ta/applications">我的申请</a> 模块查看当前状态。`}
       </div>`
     : "";
-  const submitGuardSection = hasBlockingConflicts
-    ? `<div class="notice" style="margin: 0 0 16px; background: #fce8e6; border-color: #f7c8c3; color: #a50e0e;">
-        检测到你已申请的教学班与当前教学班存在时间冲突，且本教学班未设置为允许冲突申请，因此当前不能提交申请。
-      </div>
-      <table><tr><th>已申请冲突教学班</th><th>当前状态</th><th>是否允许冲突申请</th><th>冲突时间</th></tr>${
-        appliedConflicts.map(({ app, matches }) => `<tr><td>${escapeHtml(app.class_name)}</td><td>${escapeHtml(statusLabels[app.status] || app.status)}</td><td>${escapeHtml(app.is_conflict_allowed || "N")}</td><td>${matches.map(escapeHtml).join("<br>")}</td></tr>`).join("")
-      }</table>`
-    : "";
+  const appliedConflictSection = renderAppliedConflictSection(
+    appliedConflicts.map(({ app, matches }) => ({ ...app, matches })),
+    row.is_conflict_allowed || "N"
+  );
   const conflictSection = `
       <div style="margin: 0 0 16px;">
         <h3 style="margin-bottom:8px;">冲突信息</h3>
@@ -5335,8 +5536,8 @@ async function taClassDetailPage(res, user, classId, notice) {
       <h3>提交申请</h3>
       ${existingApplicationSection}
       ${resumeSection}
+      ${appliedConflictSection}
       ${conflictSection}
-      ${submitGuardSection}
       <form method="post" action="/ta/applications" data-disable-on-submit="1" data-submit-hint-target="ta-submit-hint">
         <input type="hidden" name="class_id" value="${row.class_id}" />
         <p><label>申请原因<textarea name="application_reason"></textarea></label></p>
@@ -5851,7 +6052,11 @@ async function taAdminDetailPage(res, user, applicationId, notice) {
     ? `<section class="card">
         <h3>该学生已申请的冲突教学班</h3>
         <table><tr><th>教学班</th><th>当前状态</th><th>是否允许冲突申请</th><th>冲突时间</th></tr>${
-          conflictApps.map(({ app: conflictApp, matches }) => `<tr><td>${escapeHtml(conflictApp.class_name)}</td><td>${escapeHtml(statusLabels[conflictApp.status] || conflictApp.status)}</td><td>${escapeHtml(conflictApp.is_conflict_allowed || "N")}</td><td>${matches.map(escapeHtml).join("<br>")}</td></tr>`).join("")
+          conflictApps.map((item) => {
+            const conflictApp = item.app || item;
+            const matches = item.matches || [];
+            return `<tr><td>${escapeHtml(conflictApp.class_name || "-")}</td><td>${escapeHtml(statusLabels[conflictApp.status] || conflictApp.status || "-")}</td><td>${escapeHtml(conflictApp.is_conflict_allowed || "N")}</td><td>${matches.map(escapeHtml).join("<br>")}</td></tr>`;
+          }).join("")
         }</table>
       </section>`
     : `<section class="card"><h3>该学生已申请的冲突教学班</h3><p class="muted">当前未发现该学生已申请的冲突教学班。</p></section>`;
@@ -6177,8 +6382,8 @@ async function notificationsPage(res, user, notice) {
   sendHtml(res, pageLayout("通知中心", `
     <section class="card">
       <h2>通知中心</h2>
-      <div class="table-wrap list-scroll desktop-only"><table><tr><th>ID</th><th>标题</th><th>内容</th><th>时间</th><th>状态</th><th>操作</th></tr>${tableRows}</table></div>
-      <div class="mobile-only notification-card-list">${mobileCards || `<p class="muted">当前没有通知。</p>`}</div>
+      <div class="table-wrap list-scroll desktop-only notification-desktop-only"><table class="notification-table"><tr><th>ID</th><th>标题</th><th>内容</th><th>时间</th><th>状态</th><th>操作</th></tr>${tableRows}</table></div>
+      <div class="mobile-only notification-mobile-only notification-card-list">${mobileCards || `<p class="muted">当前没有通知。</p>`}</div>
     </section>
   `, user, notice));
 }
@@ -7075,7 +7280,7 @@ async function courseClassesPage(res, user, notice, filters = {}) {
                 <a class="button-link secondary" href="/course/classes/import/template">下载模板</a>
               </div>
             </form>
-            <p class="muted">当前导入格式为 Excel。同一个 class_code 可出现多行，每行代表一条排课。导入时按 class_code 覆盖教学班基础信息并重建该教学班的全部排课。</p>
+            <p class="muted">当前导入格式为 Excel。同一个 class_code 可出现多行，每行代表一条排课。导入时按 class_code 覆盖教学班基础信息并重建该教学班的全部排课。排课节次可留空。</p>
             <div class="field-order">
               字段顺序：<br>
               class_code, class_abbr, course_name, class_name, teaching_language, teacher_login_name, semester, credit, maximum_number, ta_allowed, is_conflict_allowed<br>
@@ -7180,7 +7385,7 @@ async function courseClassesPage(res, user, notice, filters = {}) {
               <p><label>备注<textarea name="memo"></textarea></label></p>
               <p><label>排课记录<textarea name="schedule_lines" required>2026-09-15,18:30,20:30,晚上
 2026-09-22,18:30,20:30,晚上</textarea></label></p>
-              <p class="muted">一行一条排课，格式：YYYY-MM-DD,HH:MM,HH:MM,节次[,考试类型]。节次仅支持“上午/下午/晚上”，考试类型可留空或填写“期中考试/期末考试”。</p>
+              <p class="muted">一行一条排课，格式：YYYY-MM-DD,HH:MM,HH:MM[,节次][,考试类型]。节次可留空；如填写，仅支持“上午/下午/晚上”。考试类型可留空或填写“期中考试/期末考试”。</p>
               <button type="submit">创建教学班</button>
             </form>
           </section>
@@ -7195,7 +7400,7 @@ async function courseClassesPage(res, user, notice, filters = {}) {
       </div>
       <div class="desktop-only">
         <div class="table-wrap list-scroll">
-          <table class="wide compact-table fixed-layout">
+          <table class="wide compact-table fixed-layout course-classes-table freeze-to-tafull">
             <colgroup>
             <col style="width:56px;" />
             <col style="width:110px;" />
@@ -7760,7 +7965,7 @@ async function courseReportsPage(res, user, notice, filters = {}) {
 
   sendHtml(res, pageLayout("报表视图", `
     <section class="card card-brand">
-      <h2>CourseAdmin 报表视图</h2>
+      <h2>${user.role === "TAAdmin" ? "TAAdmin 报表视图" : "CourseAdmin 报表视图"}</h2>
       <p class="muted">集中查看申请、审批、教学班开放与名额使用情况。当前报表按申请提交时间统计。</p>
       <form method="get" action="/course/reports">
         <div class="filters-shell">
@@ -8135,7 +8340,7 @@ async function taAdminAllClassesPage(res, user, notice, filters = {}) {
       <td>${ynPill(row.published_to_professor, "已发送", "否")}</td>
       <td>${ynPill(row.ta_applications_allowed, "Y", "N")}</td>
       <td>${ynPill(row.is_conflict_allowed || "N", "Y", "N")}</td>
-      <td class="table-action-cell"><div class="table-action-inner table-actions-compact"><a class="button-link secondary rect action-button" href="/admin/ta/classes/${row.class_id}/applications">审核</a></div></td>
+      <td class="table-action-cell"><div class="table-action-inner table-actions-compact"><a class="button-link tertiary rect action-button" href="/admin/ta/classes/${row.class_id}">修改</a><a class="button-link secondary rect action-button" href="/admin/ta/classes/${row.class_id}/applications">审核</a></div></td>
     </tr>`;
   }).join("");
   const mobileCards = rows.map((row) => {
@@ -8188,11 +8393,22 @@ async function taAdminAllClassesPage(res, user, notice, filters = {}) {
           </div>
         </div>
         <div class="actions" style="margin-top:12px;">
+          <a class="button-link tertiary rect action-button" href="/admin/ta/classes/${row.class_id}">修改</a>
           <a class="button-link secondary rect action-button" href="/admin/ta/classes/${row.class_id}/applications">审核</a>
         </div>
       </article>
     `;
   }).join("");
+  const filterQuery = buildQueryString({
+    professor_name: filters.professor_name || "",
+    class_name: filters.class_name || "",
+    semester: filters.semester || "",
+    ta_full: filters.ta_full || "",
+    has_pending: filters.has_pending || "",
+    published_to_professor: filters.published_to_professor || "",
+    ta_applications_allowed: filters.ta_applications_allowed || "",
+    is_conflict_allowed: filters.is_conflict_allowed || ""
+  });
   sendHtml(res, pageLayout("全部教学班", `
     <section class="card">
       <h2>筛选教学班</h2>
@@ -8201,6 +8417,7 @@ async function taAdminAllClassesPage(res, user, notice, filters = {}) {
         <div class="filters-grid">
           <p><label>教授名<input name="professor_name" value="${escapeHtml(filters.professor_name || "")}" /></label></p>
           <p><label>教学班名称<input name="class_name" value="${escapeHtml(filters.class_name || "")}" /></label></p>
+          <p><label>学期<input name="semester" value="${escapeHtml(filters.semester || "")}" /></label></p>
           <p><label>TA 已满<select name="ta_full">
             <option value="" ${!filters.ta_full ? "selected" : ""}>全部</option>
             <option value="Y" ${filters.ta_full === "Y" ? "selected" : ""}>已满</option>
@@ -8211,31 +8428,44 @@ async function taAdminAllClassesPage(res, user, notice, filters = {}) {
             <option value="Y" ${filters.has_pending === "Y" ? "selected" : ""}>有</option>
             <option value="N" ${filters.has_pending === "N" ? "selected" : ""}>无</option>
           </select></label></p>
+          <p><label>发送至教授<select name="published_to_professor">
+            <option value="" ${!filters.published_to_professor ? "selected" : ""}>全部</option>
+            <option value="Y" ${filters.published_to_professor === "Y" ? "selected" : ""}>已发送</option>
+            <option value="N" ${filters.published_to_professor === "N" ? "selected" : ""}>未发送</option>
+          </select></label></p>
+          <p><label>开放申请<select name="ta_applications_allowed">
+            <option value="" ${!filters.ta_applications_allowed ? "selected" : ""}>全部</option>
+            <option value="Y" ${filters.ta_applications_allowed === "Y" ? "selected" : ""}>Y</option>
+            <option value="N" ${filters.ta_applications_allowed === "N" ? "selected" : ""}>N</option>
+          </select></label></p>
+          <p><label>允许冲突<select name="is_conflict_allowed">
+            <option value="" ${!filters.is_conflict_allowed ? "selected" : ""}>全部</option>
+            <option value="Y" ${filters.is_conflict_allowed === "Y" ? "selected" : ""}>Y</option>
+            <option value="N" ${filters.is_conflict_allowed === "N" ? "selected" : ""}>N</option>
+          </select></label></p>
         </div>
         <div class="actions filters-actions-row" style="margin-top:12px;">
           <button class="secondary action-button" type="submit">筛选</button>
-          <a class="button-link secondary rect action-button" href="/admin/ta/classes/calendar${buildQueryString({ professor_name: filters.professor_name || "", class_name: filters.class_name || "", ta_full: filters.ta_full || "", has_pending: filters.has_pending || "" })}">日历视图</a>
-          <a class="button-link secondary rect action-button" href="/admin/ta/classes/ta-export${buildQueryString({ professor_name: filters.professor_name || "", class_name: filters.class_name || "", ta_full: filters.ta_full || "", has_pending: filters.has_pending || "" })}">导出教学班TA</a>
+          <a class="button-link secondary rect action-button" href="/admin/ta/classes/calendar${filterQuery}">日历视图</a>
+          <a class="button-link secondary rect action-button" href="/admin/ta/classes/ta-export${filterQuery}">导出教学班TA</a>
           <a class="button-link secondary rect action-button" href="/admin/ta/classes">重置</a>
         </div>
         </div>
       </form>
     </section>
-    <section class="card">
-      <h2>教学班设置</h2>
+    <details class="card">
+      <summary style="cursor:pointer; font-weight:600; color:#174ea6;">展开教学班设置</summary>
       <form method="post" action="/admin/ta/classes/batch-window" onsubmit="return submitSelectedTaClasses(this);">
         <input type="hidden" name="class_refs" />
-        <div class="grid">
+        <div class="filters-grid settings-inline">
           <p><label>开放开始时间<input type="datetime-local" name="apply_start_at" /></label></p>
           <p><label>开放结束时间<input type="datetime-local" name="apply_end_at" /></label></p>
-        </div>
-        <div class="actions">
-          <button class="secondary rect action-button" type="submit">批量设置开放时间</button>
+          <div class="actions"><button class="secondary rect action-button" type="submit">批量设置开放时间</button></div>
         </div>
       </form>
       <form method="post" action="/admin/ta/classes/batch-settings" onsubmit="return submitSelectedTaClasses(this);" style="margin-top:16px;">
         <input type="hidden" name="class_refs" />
-        <div class="grid">
+        <div class="filters-grid settings-inline">
           <p><label>开放申请
             <select name="ta_allowed">
               <option value="Y">Y</option>
@@ -8248,14 +8478,12 @@ async function taAdminAllClassesPage(res, user, notice, filters = {}) {
               <option value="Y">Y</option>
             </select>
           </label></p>
-        </div>
-        <div class="actions">
-          <button class="secondary rect action-button" type="submit">批量更新开放设置</button>
+          <div class="actions"><button class="secondary rect action-button" type="submit">批量更新开放设置</button></div>
         </div>
       </form>
-    </section>
-    <section class="card">
-      <h2>发布至教授</h2>
+    </details>
+    <details class="card">
+      <summary style="cursor:pointer; font-weight:600; color:#174ea6;">展开发布至教授</summary>
       <form method="post" action="/admin/ta/classes/email-preview" onsubmit="return submitSelectedTaClasses(this);">
         <input type="hidden" name="class_refs" />
         <p class="muted">勾选一个或多个教学班后，先生成发给 Professor 的邮件预览。检查无误后，可在预览页点击“发送邮件”。系统会按教授分别发送，并 CC 当前 TAAdmin。</p>
@@ -8277,7 +8505,7 @@ async function taAdminAllClassesPage(res, user, notice, filters = {}) {
           <button class="secondary rect" type="submit">批量修改发布状态</button>
         </div>
       </form>
-    </section>
+    </details>
     <section class="card">
       <h2>全部教学班与排课安排</h2>
       <div class="actions" style="margin-bottom:12px;">
@@ -8286,7 +8514,7 @@ async function taAdminAllClassesPage(res, user, notice, filters = {}) {
       </div>
       <div class="desktop-only">
         <div class="table-wrap list-scroll">
-          <table class="wide compact-table fixed-layout">
+          <table class="wide compact-table fixed-layout taadmin-classes-table freeze-to-tafull">
             <colgroup>
               <col style="width:56px;" />
               <col style="width:106px;" />
@@ -8301,10 +8529,10 @@ async function taAdminAllClassesPage(res, user, notice, filters = {}) {
               <col style="width:96px;" />
               <col style="width:76px;" />
               <col style="width:104px;" />
-              <col style="width:92px;" />
+              <col style="width:110px;" />
               <col style="width:82px;" />
               <col style="width:86px;" />
-              <col style="width:92px;" />
+              <col style="width:146px;" />
             </colgroup>
             <tr><th>选择</th><th>代码</th><th>缩写</th><th>教学班</th><th>教授</th><th>学期</th><th>开放状态</th><th>TA已满</th><th>排课数</th><th>TA</th><th>已通过/上限</th><th>申请数</th><th>待TAAdmin审批</th><th>发布至教授</th><th>开放申请</th><th>允许冲突</th><th>操作</th></tr>${tableRows}
           </table>
@@ -8745,7 +8973,7 @@ async function taAdminClassApplicationsPage(res, user, classId, notice) {
     <td>${app.application_id}</td>
     <td>${escapeHtml(app.applier_name)}</td>
     <td>${escapeHtml(normalizeDisplayDateTime(app.submitted_at))}</td>
-    <td><span class="${statusPillClass(app.status)}">${escapeHtml(statusLabels[app.status] || app.status)}</span></td>
+    <td><span class="${statusPillClass(app.status)} nowrap">${escapeHtml(statusLabels[app.status] || app.status)}</span></td>
     <td>${escapeHtml(app.application_reason)}</td>
     <td>${(() => {
       const conflicts = DB_CLIENT === "mysql"
@@ -8759,7 +8987,11 @@ async function taAdminClassApplicationsPage(res, user, classId, notice) {
       if (!conflicts.length) {
         return "<span class='muted'>无冲突</span>";
       }
-      return conflicts.map(({ app: conflictApp, matches }) => `${escapeHtml(conflictApp.class_name)}（${escapeHtml(statusLabels[conflictApp.status] || conflictApp.status)} / 允许冲突:${escapeHtml(conflictApp.is_conflict_allowed || "N")}）<br>${matches.map(escapeHtml).join("<br>")}`).join("<br><br>");
+      return conflicts.map((item) => {
+        const conflictApp = item.app || item;
+        const matches = item.matches || [];
+        return `${escapeHtml(conflictApp.class_name || "-")}（${escapeHtml(statusLabels[conflictApp.status] || conflictApp.status || "-")} / 允许冲突:${escapeHtml(conflictApp.is_conflict_allowed || "N")}）<br>${matches.map(escapeHtml).join("<br>")}`;
+      }).join("<br><br>");
     })()}</td>
     <td>${attachmentLink(app)}</td>
     <td>${escapeHtml(app.ta_comment || "")}</td>
@@ -8792,7 +9024,7 @@ async function taAdminClassApplicationsPage(res, user, classId, notice) {
             <col style="width:68px;" />
             <col style="width:96px;" />
             <col style="width:160px;" />
-            <col style="width:110px;" />
+            <col style="width:132px;" />
             <col style="width:240px;" />
             <col style="width:360px;" />
             <col style="width:190px;" />
@@ -8866,7 +9098,12 @@ async function taAdminBatchApproveByClass(req, res, user, classId) {
   redirect(res, `/admin/ta/classes/${classId}/applications?notice=${emailErrors.length ? "批量审批已完成，部分邮件发送失败" : "批量审批已完成，站内通知和邮件已发送"}`);
 }
 
-async function courseClassDetailPage(res, user, classId, notice) {
+async function renderCourseClassEditPage(res, user, classId, notice, options = {}) {
+  const listPath = options.listPath || "/course/classes";
+  const applicationsPath = options.applicationsPath || `/course/classes/${classId}/applications`;
+  const deletePath = options.deletePath || `/course/classes/${classId}/delete`;
+  const submitPath = options.submitPath || `/course/classes/${classId}/update`;
+  const showDelete = options.showDelete !== false;
   const { classRow: row, schedules, applicationCount, approvedCount } = await dbGateway.getCourseClassDetail(classId);
   if (!row) {
     return sendHtml(res, pageLayout("未找到", '<section class="card">教学班不存在。</section>', user, notice), {}, 404);
@@ -8879,11 +9116,11 @@ async function courseClassDetailPage(res, user, classId, notice) {
       <h2>编辑教学班</h2>
       <p class="muted">申请数：${applicationCount}，已通过：${approvedCount} / ${row.maximum_number_of_tas_admitted}</p>
       <div class="actions">
-        <a class="button-link secondary" href="/course/classes">返回教学班列表</a>
-        <a class="button-link secondary" href="/course/classes/${classId}/applications">查看关联申请</a>
-        <a class="button-link danger" href="/course/classes/${classId}/delete">删除教学班</a>
+        <a class="button-link secondary" href="${listPath}">返回教学班列表</a>
+        <a class="button-link secondary" href="${applicationsPath}">查看关联申请</a>
+        ${showDelete ? `<a class="button-link danger" href="${deletePath}">删除教学班</a>` : ""}
       </div>
-      <form method="post" action="/course/classes/${classId}/update">
+      <form method="post" action="${submitPath}">
         <div class="grid">
           <p><label>ClassCode<input name="class_code" value="${escapeHtml(row.class_code)}" required /></label></p>
           <p><label>教学班缩写<input name="class_abbr" value="${escapeHtml(row.class_abbr || row.class_code)}" required /></label></p>
@@ -8902,7 +9139,7 @@ async function courseClassDetailPage(res, user, classId, notice) {
         <p><label>课程介绍<textarea name="class_intro">${escapeHtml(row.class_intro || "")}</textarea></label></p>
         <p><label>备注<textarea name="memo">${escapeHtml(row.memo || "")}</textarea></label></p>
         <p><label>排课记录<textarea name="schedule_lines" required>${escapeHtml(scheduleLinesValue(schedules))}</textarea></label></p>
-        <p class="muted">一行一条排课，格式：YYYY-MM-DD,HH:MM,HH:MM,节次[,考试类型]。</p>
+        <p class="muted">一行一条排课，格式：YYYY-MM-DD,HH:MM,HH:MM[,节次][,考试类型]。节次可留空。</p>
         <button type="submit">保存教学班</button>
       </form>
     </section>
@@ -8911,6 +9148,25 @@ async function courseClassDetailPage(res, user, classId, notice) {
       ${schedulesTable(schedules)}
     </section>
   `, user, notice));
+}
+
+async function courseClassDetailPage(res, user, classId, notice) {
+  return renderCourseClassEditPage(res, user, classId, notice, {
+    listPath: "/course/classes",
+    applicationsPath: `/course/classes/${classId}/applications`,
+    deletePath: `/course/classes/${classId}/delete`,
+    submitPath: `/course/classes/${classId}/update`,
+    showDelete: true
+  });
+}
+
+async function taAdminClassEditPage(res, user, classId, notice) {
+  return renderCourseClassEditPage(res, user, classId, notice, {
+    listPath: "/admin/ta/classes",
+    applicationsPath: `/admin/ta/classes/${classId}/applications`,
+    submitPath: `/admin/ta/classes/${classId}/update`,
+    showDelete: false
+  });
 }
 
 async function courseClassApplicationsPage(res, user, classId, notice) {
@@ -9692,7 +9948,9 @@ async function importClasses(req, res, user) {
   }
 }
 
-async function updateClass(req, res, user, classId) {
+async function updateClass(req, res, user, classId, options = {}) {
+  const basePath = options.basePath || "/course/classes";
+  const detailPath = `${basePath}/${classId}`;
   const body = await readBody(req);
   const maximumNumber = Number(body.maximum_number || 1);
   const credit = Number(body.credit || 0);
@@ -9700,30 +9958,30 @@ async function updateClass(req, res, user, classId) {
   let applyStartAt;
   let applyEndAt;
   if (!["Y", "N"].includes(isConflictAllowed)) {
-    return redirect(res, `/course/classes/${classId}?notice=允许冲突申请取值不合法`);
+    return redirect(res, `${detailPath}?notice=允许冲突申请取值不合法`);
   }
   if (!Number.isFinite(credit) || credit < 0) {
-    return redirect(res, `/course/classes/${classId}?notice=学分必须是大于等于 0 的数字`);
+    return redirect(res, `${detailPath}?notice=学分必须是大于等于 0 的数字`);
   }
   try {
     applyStartAt = normalizeDateTimeInput(body.apply_start_at);
     applyEndAt = normalizeDateTimeInput(body.apply_end_at);
     validateApplyWindow(applyStartAt, applyEndAt);
   } catch (error) {
-    return redirect(res, `/course/classes/${classId}?notice=${error.message}`);
+    return redirect(res, `${detailPath}?notice=${error.message}`);
   }
   let scheduleRows;
   try {
     scheduleRows = parseScheduleLines(body.schedule_lines);
   } catch (error) {
-    return redirect(res, `/course/classes/${classId}?notice=${error.message}`);
+    return redirect(res, `${detailPath}?notice=${error.message}`);
   }
   if (DB_CLIENT === "mysql") {
     let professorSelection;
     try {
       professorSelection = await resolveProfessorSelectionGateway(body.teacher_user_id);
     } catch (error) {
-      return redirect(res, `/course/classes/${classId}?notice=${error.message}`);
+      return redirect(res, `${detailPath}?notice=${error.message}`);
     }
     try {
       const result = await dbGateway.updateCourseClass(user, classId, {
@@ -9745,25 +10003,25 @@ async function updateClass(req, res, user, classId) {
         semester: String(body.semester || "").trim()
       }, scheduleRows);
       if (result?.notFound) {
-        return redirect(res, "/course/classes?notice=教学班不存在");
+        return redirect(res, `${basePath}?notice=教学班不存在`);
       }
     } catch (error) {
-      return redirect(res, `/course/classes/${classId}?notice=更新失败，ClassCode 可能已存在`);
+      return redirect(res, `${detailPath}?notice=更新失败，ClassCode 可能已存在`);
     }
-    return redirect(res, `/course/classes/${classId}?notice=教学班已更新`);
+    return redirect(res, `${detailPath}?notice=教学班已更新`);
   }
   const db = getDb();
   const currentClass = db.prepare("select * from classes where class_id = ?").get(classId);
   if (!currentClass) {
     db.close();
-    return redirect(res, "/course/classes?notice=教学班不存在");
+    return redirect(res, `${basePath}?notice=教学班不存在`);
   }
   let professorSelection;
   try {
     professorSelection = resolveProfessorSelection(db, body.teacher_user_id);
   } catch (error) {
     db.close();
-    return redirect(res, `/course/classes/${classId}?notice=${error.message}`);
+    return redirect(res, `${detailPath}?notice=${error.message}`);
   }
   try {
     db.prepare(`
@@ -9814,10 +10072,10 @@ async function updateClass(req, res, user, classId) {
     });
   } catch (error) {
     db.close();
-    return redirect(res, `/course/classes/${classId}?notice=更新失败，ClassCode 可能已存在`);
+    return redirect(res, `${detailPath}?notice=更新失败，ClassCode 可能已存在`);
   }
   db.close();
-  redirect(res, `/course/classes/${classId}?notice=教学班已更新`);
+  redirect(res, `${detailPath}?notice=教学班已更新`);
 }
 
 async function batchUpdateClassWindow(req, res, user) {
@@ -10195,8 +10453,12 @@ async function handleRequest(req, res) {
     return taAdminAllClassesPage(res, user, notice, {
       professor_name: url.searchParams.get("professor_name") || "",
       class_name: url.searchParams.get("class_name") || "",
+      semester: url.searchParams.get("semester") || "",
       ta_full: url.searchParams.get("ta_full") || "",
-      has_pending: url.searchParams.get("has_pending") || ""
+      has_pending: url.searchParams.get("has_pending") || "",
+      published_to_professor: url.searchParams.get("published_to_professor") || "",
+      ta_applications_allowed: url.searchParams.get("ta_applications_allowed") || "",
+      is_conflict_allowed: url.searchParams.get("is_conflict_allowed") || ""
     });
   }
   if (pathname === "/admin/ta/classes/calendar") {
@@ -10204,8 +10466,12 @@ async function handleRequest(req, res) {
     return taAdminClassesCalendarPage(res, user, notice, {
       professor_name: url.searchParams.get("professor_name") || "",
       class_name: url.searchParams.get("class_name") || "",
+      semester: url.searchParams.get("semester") || "",
       ta_full: url.searchParams.get("ta_full") || "",
       has_pending: url.searchParams.get("has_pending") || "",
+      published_to_professor: url.searchParams.get("published_to_professor") || "",
+      ta_applications_allowed: url.searchParams.get("ta_applications_allowed") || "",
+      is_conflict_allowed: url.searchParams.get("is_conflict_allowed") || "",
       month: url.searchParams.get("month") || ""
     });
   }
@@ -10214,13 +10480,25 @@ async function handleRequest(req, res) {
     return taAdminClassTaExport(res, {
       professor_name: url.searchParams.get("professor_name") || "",
       class_name: url.searchParams.get("class_name") || "",
+      semester: url.searchParams.get("semester") || "",
       ta_full: url.searchParams.get("ta_full") || "",
-      has_pending: url.searchParams.get("has_pending") || ""
+      has_pending: url.searchParams.get("has_pending") || "",
+      published_to_professor: url.searchParams.get("published_to_professor") || "",
+      ta_applications_allowed: url.searchParams.get("ta_applications_allowed") || "",
+      is_conflict_allowed: url.searchParams.get("is_conflict_allowed") || ""
     });
+  }
+  if (/^\/admin\/ta\/classes\/\d+$/.test(pathname)) {
+    if (!requireRole(res, user, ["TAAdmin"])) return;
+    return taAdminClassEditPage(res, user, Number(pathname.split("/").pop()), notice);
   }
   if (/^\/admin\/ta\/classes\/\d+\/applications$/.test(pathname)) {
     if (!requireRole(res, user, ["TAAdmin"])) return;
     return taAdminClassApplicationsPage(res, user, Number(pathname.split("/")[4]), notice);
+  }
+  if (/^\/admin\/ta\/classes\/\d+\/update$/.test(pathname) && req.method === "POST") {
+    if (!requireRole(res, user, ["TAAdmin"])) return;
+    return updateClass(req, res, user, Number(pathname.split("/")[4]), { basePath: "/admin/ta/classes" });
   }
   if (pathname === "/admin/ta/classes/email-preview" && req.method === "POST") {
     if (!requireRole(res, user, ["TAAdmin"])) return;
@@ -10285,7 +10563,7 @@ async function handleRequest(req, res) {
   }
 
   if (pathname === "/course/classes") {
-    if (!requireRole(res, user, ["CourseAdmin"])) return;
+    if (!requireRole(res, user, ["CourseAdmin", "TAAdmin"])) return;
     return courseClassesPage(res, user, notice, {
       class_code: url.searchParams.get("class_code") || "",
       class_name: url.searchParams.get("class_name") || "",
@@ -10297,7 +10575,7 @@ async function handleRequest(req, res) {
     });
   }
   if (pathname === "/course/classes/calendar") {
-    if (!requireRole(res, user, ["CourseAdmin"])) return;
+    if (!requireRole(res, user, ["CourseAdmin", "TAAdmin"])) return;
     return courseClassesCalendarPage(res, user, notice, {
       class_code: url.searchParams.get("class_code") || "",
       class_name: url.searchParams.get("class_name") || "",
@@ -10310,7 +10588,7 @@ async function handleRequest(req, res) {
     });
   }
   if (pathname === "/course/classes/ta-export") {
-    if (!requireRole(res, user, ["CourseAdmin"])) return;
+    if (!requireRole(res, user, ["CourseAdmin", "TAAdmin"])) return;
     return courseClassTaExport(res, {
       class_code: url.searchParams.get("class_code") || "",
       class_name: url.searchParams.get("class_name") || "",
@@ -10322,7 +10600,7 @@ async function handleRequest(req, res) {
     });
   }
   if (pathname === "/course/reports") {
-    if (!requireRole(res, user, ["CourseAdmin"])) return;
+    if (!requireRole(res, user, ["CourseAdmin", "TAAdmin"])) return;
     return courseReportsPage(res, user, notice, {
       submitted_from: url.searchParams.get("submitted_from") || "",
       submitted_to: url.searchParams.get("submitted_to") || "",
@@ -10331,7 +10609,7 @@ async function handleRequest(req, res) {
     });
   }
   if (pathname === "/course/reports/export") {
-    if (!requireRole(res, user, ["CourseAdmin"])) return;
+    if (!requireRole(res, user, ["CourseAdmin", "TAAdmin"])) return;
     return courseReportsExport(res, {
       submitted_from: url.searchParams.get("submitted_from") || "",
       submitted_to: url.searchParams.get("submitted_to") || "",
@@ -10349,7 +10627,7 @@ async function handleRequest(req, res) {
     });
   }
   if (pathname === "/course/application-logs") {
-    if (!requireRole(res, user, ["CourseAdmin"])) return;
+    if (!requireRole(res, user, ["CourseAdmin", "TAAdmin"])) return;
     return courseAdminApplicationLogsPage(res, user, notice, {
       applier_name: url.searchParams.get("applier_name") || "",
       class_name: url.searchParams.get("class_name") || "",
@@ -10458,11 +10736,11 @@ async function handleRequest(req, res) {
     return batchDeleteClasses(req, res, user);
   }
   if (/^\/course\/classes\/\d+$/.test(pathname)) {
-    if (!requireRole(res, user, ["CourseAdmin"])) return;
+    if (!requireRole(res, user, ["CourseAdmin", "TAAdmin"])) return;
     return courseClassDetailPage(res, user, Number(pathname.split("/").pop()), notice);
   }
   if (/^\/course\/classes\/\d+\/applications$/.test(pathname)) {
-    if (!requireRole(res, user, ["CourseAdmin"])) return;
+    if (!requireRole(res, user, ["CourseAdmin", "TAAdmin"])) return;
     return courseClassApplicationsPage(res, user, Number(pathname.split("/")[3]), notice);
   }
   if (/^\/course\/classes\/\d+\/delete$/.test(pathname)) {
